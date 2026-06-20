@@ -1,0 +1,35 @@
+# Local datasets and model checkpoints
+/data/
+/models/
+/checkpoints/
+
+# Experiment/runtime outputs
+**/wandb/
+**/outputs/
+**/checkpoints/
+math_eval/eval_outputs/
+math_eval/cod_phase1_outputs/
+math_eval/cod_phase1_mistakes/
+math_eval/cod_phase1_logs/
+logs/
+log/
+.history/
+
+# Downloaded wheels and installer artifacts
+*.whl
+*.whl.*
+wget-log*
+
+# Python/cache artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.cache/
+.ipynb_checkpoints/
+
+# OS/editor artifacts
+.DS_Store
+*.swp
+*~
+.vscode/
+.idea/
