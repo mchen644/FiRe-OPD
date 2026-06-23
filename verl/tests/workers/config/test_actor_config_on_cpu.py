@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 import unittest
+from pathlib import Path
 
 from verl.utils.config import omega_conf_to_dataclass
 from verl.workers.config import (
@@ -22,6 +22,8 @@ from verl.workers.config import (
     McoreActorConfig,
     OptimizerConfig,
 )
+
+_ACTOR_CONFIG_DIR = Path(__file__).resolve().parents[3] / "verl" / "trainer" / "config" / "actor"
 
 
 class TestActorConfig(unittest.TestCase):
@@ -65,7 +67,7 @@ class TestActorConfig(unittest.TestCase):
         """Test creating ActorConfig from YAML file."""
         from hydra import compose, initialize_config_dir
 
-        with initialize_config_dir(config_dir=os.path.abspath("verl/trainer/config/actor")):
+        with initialize_config_dir(config_dir=str(_ACTOR_CONFIG_DIR)):
             cfg = compose(config_name="actor", overrides=["strategy=fsdp", "ppo_micro_batch_size_per_gpu=128"])
 
         config = omega_conf_to_dataclass(cfg)
@@ -77,7 +79,7 @@ class TestActorConfig(unittest.TestCase):
         """Test creating FSDPActorConfig from YAML file."""
         from hydra import compose, initialize_config_dir
 
-        with initialize_config_dir(config_dir=os.path.abspath("verl/trainer/config/actor")):
+        with initialize_config_dir(config_dir=str(_ACTOR_CONFIG_DIR)):
             cfg = compose(config_name="dp_actor", overrides=["strategy=fsdp2", "ppo_micro_batch_size_per_gpu=128"])
 
         config = omega_conf_to_dataclass(cfg)
@@ -89,7 +91,7 @@ class TestActorConfig(unittest.TestCase):
         """Test creating McoreActorConfig from YAML file."""
         from hydra import compose, initialize_config_dir
 
-        with initialize_config_dir(config_dir=os.path.abspath("verl/trainer/config/actor")):
+        with initialize_config_dir(config_dir=str(_ACTOR_CONFIG_DIR)):
             cfg = compose(config_name="megatron_actor", overrides=["ppo_micro_batch_size_per_gpu=128"])
 
         config = omega_conf_to_dataclass(cfg)
