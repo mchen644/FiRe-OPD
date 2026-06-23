@@ -46,6 +46,129 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+_LENGTH_PENALTY_TYPES = {"log_batch_median"}
+_LENGTH_PENALTY_GATES = {"incorrect", "low_teacher", "incorrect_or_low_teacher"}
+
+
+def _policy_loss_get(policy_loss_config, name: str, default):
+    if hasattr(policy_loss_config, "get"):
+        return policy_loss_config.get(name, default)
+    return getattr(policy_loss_config, name, default)
+
+
+def _compute_length_aware_opd_tensors(
+    response_mask: torch.Tensor,
+    ref_log_prob: torch.Tensor,
+    token_level_scores: torch.Tensor | None,
+    policy_loss_config,
+) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
+    """Compute mini-batch-scoped gated length penalties for original OPD."""
+    penalty_type = _policy_loss_get(policy_loss_config, "length_penalty_type", "log_batch_median")
+    if penalty_type not in _LENGTH_PENALTY_TYPES:
+        raise ValueError(
+            f"Invalid length_penalty_type: {penalty_type}. Supported values: {sorted(_LENGTH_PENALTY_TYPES)}"
+        )
+
+    penalty_gate = _policy_loss_get(policy_loss_config, "length_penalty_gate", "incorrect_or_low_teacher")
+    if penalty_gate not in _LENGTH_PENALTY_GATES:
+        raise ValueError(
+            f"Invalid length_penalty_gate: {penalty_gate}. Supported values: {sorted(_LENGTH_PENALTY_GATES)}"
+        )
+
+    needs_scores = penalty_gate in {"incorrect", "incorrect_or_low_teacher"}
+    if needs_scores and token_level_scores is None:
+        raise ValueError("token_level_scores is required when length_penalty_gate uses correctness")
+
+    response_mask = response_mask.float()
+    response_len = response_mask.sum(dim=-1).clamp(min=1.0)
+    reference_len = response_len.median().clamp(min=1.0)
+    base_penalty = torch.log(response_len / reference_len).clamp(min=0.0)
+
+    normalized_teacher_logprob = (ref_log_prob * response_mask).sum(dim=-1) / response_len
+    teacher_reject_percentile = float(_policy_loss_get(policy_loss_config, "length_teacher_reject_percentile", 20.0))
+    if teacher_reject_percentile < 0.0 or teacher_reject_percentile > 100.0:
+        raise ValueError("length_teacher_reject_percentile must be between 0.0 and 100.0")
+
+    if teacher_reject_percentile == 0.0:
+        teacher_reject = torch.zeros_like(response_len, dtype=torch.bool)
+        teacher_threshold = torch.tensor(float("nan"), device=response_mask.device)
+    else:
+        teacher_threshold = torch.quantile(normalized_teacher_logprob.float(), teacher_reject_percentile / 100.0)
+        teacher_reject = normalized_teacher_logprob <= teacher_threshold
+
+    if token_level_scores is not None:
+        seq_reward = (token_level_scores.float() * response_mask).sum(dim=-1)
+    else:
+        seq_reward = torch.zeros_like(response_len)
+    correct_threshold = float(_policy_loss_get(policy_loss_config, "length_correct_reward_threshold", 0.5))
+    incorrect = seq_reward <= correct_threshold
+    correct = ~incorrect
+
+    if penalty_gate == "incorrect":
+        gate = incorrect
+    elif penalty_gate == "low_teacher":
+        gate = teacher_reject
+    else:
+        gate = incorrect | teacher_reject
+
+    applied_penalty = base_penalty * gate.float()
+    coef = float(_policy_loss_get(policy_loss_config, "length_penalty_coef", 0.0))
+    scaled_penalty = applied_penalty * coef
+
+    tensors = {
+        "length_aware_opd_penalty": scaled_penalty.detach(),
+        "length_aware_opd_base_penalty": base_penalty.detach(),
+        "length_aware_opd_applied_penalty": applied_penalty.detach(),
+        "length_aware_opd_penalty_gate": gate.float().detach(),
+        "length_aware_opd_correct_mask": correct.float().detach(),
+        "length_aware_opd_teacher_reject": teacher_reject.float().detach(),
+        "length_aware_opd_response_len": response_len.detach(),
+        "length_aware_opd_reference_len": reference_len.detach().expand_as(response_len),
+        "length_aware_opd_teacher_threshold": teacher_threshold.detach().expand_as(response_len),
+    }
+    metrics = _summarize_length_aware_opd_tensors(tensors, coef=coef)
+    return tensors, metrics
+
+
+def _summarize_length_aware_opd_tensors(tensors: dict[str, torch.Tensor], coef: float) -> dict[str, float]:
+    response_len = tensors["length_aware_opd_response_len"]
+    reference_len = tensors["length_aware_opd_reference_len"]
+    base_penalty = tensors["length_aware_opd_base_penalty"]
+    applied_penalty = tensors["length_aware_opd_applied_penalty"]
+    penalty_gate = tensors["length_aware_opd_penalty_gate"]
+    correct_mask = tensors["length_aware_opd_correct_mask"]
+    teacher_reject = tensors["length_aware_opd_teacher_reject"]
+    return {
+        "length_aware_opd/mean_response_len": response_len.float().mean().item(),
+        "length_aware_opd/median_response_len": reference_len.float().median().item(),
+        "length_aware_opd/mean_base_penalty": base_penalty.float().mean().item(),
+        "length_aware_opd/mean_applied_penalty": applied_penalty.float().mean().item(),
+        "length_aware_opd/max_applied_penalty": applied_penalty.float().max().item(),
+        "length_aware_opd/penalty_gate_ratio": penalty_gate.float().mean().item(),
+        "length_aware_opd/correct_skip_ratio": ((1.0 - penalty_gate) * correct_mask).float().mean().item(),
+        "length_aware_opd/teacher_reject_ratio": teacher_reject.float().mean().item(),
+        "length_aware_opd/coef": float(coef),
+    }
+
+
+def _add_length_aware_opd_tensors(mini_batch: DataProto, policy_loss_config) -> dict[str, float]:
+    token_level_scores = None
+    if "token_level_scores" in mini_batch.batch.keys():
+        token_level_scores = mini_batch.batch["token_level_scores"]
+    elif "token_level_rewards" in mini_batch.batch.keys():
+        token_level_scores = mini_batch.batch["token_level_rewards"]
+
+    tensors, metrics = _compute_length_aware_opd_tensors(
+        response_mask=mini_batch.batch["response_mask"],
+        ref_log_prob=mini_batch.batch["ref_log_prob"],
+        token_level_scores=token_level_scores,
+        policy_loss_config=policy_loss_config,
+    )
+    for key, value in tensors.items():
+        mini_batch.batch[key] = value
+    return metrics
+
+
 class DataParallelPPOActor(BasePPOActor):
     """FSDP DataParallel PPO Actor or Ref worker
 
