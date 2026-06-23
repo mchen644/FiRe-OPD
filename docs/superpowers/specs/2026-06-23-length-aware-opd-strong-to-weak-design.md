@@ -35,7 +35,7 @@ Add an optional gated sequence-level length penalty before the PPO policy loss:
 
 ```text
 response_len_i = sum(response_mask_i)
-reference_len = median(response_len over the actor micro-batch)
+reference_len = median(response_len over the actor mini-batch before micro-batch splitting)
 base_length_penalty_i = max(log(response_len_i / reference_len), 0)
 
 seq_reward_i = sum(token_level_scores_i)
@@ -57,7 +57,33 @@ Design choices:
 - Gate the penalty so long correct responses are protected unless the teacher gives the trajectory very low normalized likelihood.
 - Apply only when `policy_loss.only_reverse_kl_advantages=True` and `policy_loss.length_aware_opd=True`.
 - Keep the implementation detached from gradients because it depends only on response masks, rule-based reward, and teacher log-probabilities.
+- Compute `reference_len`, `base_length_penalty`, and `penalty_gate` at actor mini-batch scope before splitting into actor micro-batches. This is required because the strong-to-weak scripts use `ppo_micro_batch_size_per_gpu=1`; computing a median inside each actor micro-batch would make `reference_len=response_len_i` and the penalty would always be zero.
 - Keep FiRe-OPD entropy-aware loss unchanged.
+
+### Loss aggregation and λ interpretation
+
+For the current strong-to-weak OPD scripts, `actor_rollout_ref.actor.loss_agg_mode` is not overridden, so it defaults to `token-mean` in `ActorConfig` and `verl/trainer/config/actor/actor.yaml`. However, the scripts also set `actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1`. In `dp_actor.update_policy`, `agg_loss(...)` is applied inside each actor micro-batch and then scaled by `1 / gradient_accumulation` before gradient accumulation.
+
+Therefore, in the intended first experiment, the effective full-minibatch aggregation is:
+
+```text
+L_total ≈ mean_i token_mean_t(loss_i,t)
+```
+
+not a full-minibatch token-sum and not a full-minibatch token-weighted mean. With the length penalty broadcast to all valid tokens of a sequence, the added loss contribution is approximately:
+
+```text
+ΔL_length ≈ λ * mean_i(applied_length_penalty_i)
+```
+
+because each single-sequence micro-batch takes a token mean before gradient accumulation. Thus `λ` is interpreted as a sequence-level margin coefficient for this script configuration. This calibration assumes:
+
+```text
+actor_rollout_ref.actor.loss_agg_mode=token-mean
+actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1
+```
+
+If either setting changes, the penalty strength must be recalibrated before comparing experiments.
 
 Initial settings:
 
@@ -97,6 +123,8 @@ actor_rollout_ref.actor.policy_loss.length_penalty_type=log_batch_median
 actor_rollout_ref.actor.policy_loss.length_penalty_gate=incorrect_or_low_teacher
 actor_rollout_ref.actor.policy_loss.length_correct_reward_threshold=0.5
 actor_rollout_ref.actor.policy_loss.length_teacher_reject_percentile=20.0
+actor_rollout_ref.actor.loss_agg_mode=token-mean
+actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1
 ```
 
 When `length_aware_opd=False`, current OPD behavior must be unchanged.
@@ -111,13 +139,15 @@ Add the length-aware OPD config fields to `PolicyLossConfig`.
 
 When length-aware OPD is enabled, retain `token_level_scores` or `token_level_rewards` in the actor input selection so the actor can identify correct vs incorrect trajectories.
 
+Before splitting each actor mini-batch into actor micro-batches, precompute per-sequence length-penalty tensors using the mini-batch response lengths, rewards, and teacher log-probs. Store the result in the mini-batch so each single-sequence micro-batch receives the already calibrated penalty. Do not compute the batch median inside a `ppo_micro_batch_size_per_gpu=1` micro-batch.
+
 In the non-entropy-aware OPD fallback path, after computing:
 
 ```python
 advantages = -(old_log_prob - model_inputs["ref_log_prob"])
 ```
 
-optionally apply the gated length-aware adjustment. Add actor metrics such as:
+optionally apply the precomputed gated length-aware adjustment. Add actor metrics such as:
 
 - `length_aware_opd/mean_response_len`
 - `length_aware_opd/median_response_len`
@@ -153,8 +183,8 @@ It should retain the original OPD settings and not enable FiRe-OPD entropy-aware
 3. Actor computes old student log-probs.
 4. Teacher computes `ref_log_prob` on the same generated response.
 5. Original OPD computes reverse-KL advantages.
-6. If enabled, length-aware OPD computes each trajectory's valid response length from `response_mask`, computes a batch-median-relative base penalty, then applies it only when the trajectory is incorrect or in the teacher low-confidence set.
-7. Existing PPO policy loss consumes the adjusted advantages.
+6. If enabled, length-aware OPD computes each trajectory's valid response length from `response_mask` at actor mini-batch scope before actor micro-batch splitting, computes a mini-batch-median-relative base penalty, then applies it only when the trajectory is incorrect or in the teacher low-confidence set.
+7. Existing PPO policy loss consumes the adjusted advantages. For the first experiment, effective λ calibration assumes `loss_agg_mode=token-mean` and `ppo_micro_batch_size_per_gpu=1`, which makes the accumulated full-minibatch effect sequence-mean over per-sequence token means.
 
 ## 7. Testing and Verification
 
@@ -166,6 +196,8 @@ Unit-level verification:
 - Verify long correct responses get zero applied penalty when teacher confidence is not in the low-confidence set.
 - Verify long correct responses can still be penalized if `length_penalty_gate=incorrect_or_low_teacher` and teacher normalized log-probability is in the bottom configured percentile.
 - Verify invalid `length_penalty_type` or `length_penalty_gate` raises a clear error.
+- Verify that when `ppo_micro_batch_size_per_gpu=1`, the reference length is still computed from the actor mini-batch rather than the one-sample actor micro-batch.
+- Verify the documented λ contribution under the intended aggregation: with single-sequence micro-batches, a constant broadcast penalty contributes `λ * applied_penalty_i` to that sequence's token-mean loss before gradient-accumulation scaling.
 
 Integration smoke test:
 
@@ -186,12 +218,12 @@ The first module is considered worth keeping if it achieves one of the following
 - At least 10% average response-length reduction with no more than about 2 absolute macro Avg@8 points degradation.
 - Or a stronger length reduction with an acceptable performance tradeoff that motivates tuning `λ`.
 
-If length does not decrease meaningfully at `λ=0.02`, try `λ=0.05`. If performance drops too much, try `λ=0.01`.
+If length does not decrease meaningfully at `λ=0.02`, try `λ=0.05`. If performance drops too much, try `λ=0.01`. These values are calibrated only for the documented `token-mean` plus `ppo_micro_batch_size_per_gpu=1` aggregation path.
 
 ## 9. Risks
 
 - Penalizing length at the sequence level may suppress useful long reasoning on hard problems. This is why the first penalty is median-relative, one-sided, and gated by correctness/teacher confidence rather than applied to every long response.
-- Batch-median length can be noisy for small micro-batches. The initial implementation uses the actor micro-batch for simplicity because that is where advantages are adjusted; if unstable, later versions can compute the reference length at mini-batch level before splitting.
+- Batch-median length can be noisy if computed at too small a scope. The initial implementation must compute it at actor mini-batch scope before micro-batch splitting; computing it inside the one-sample actor micro-batches used by the strong-to-weak scripts would silently disable the penalty.
 - Rule-based correctness is available for the math setting, but it may be imperfect due to answer parsing. The teacher low-confidence branch provides a second quality signal, and metrics should report how often each branch activates.
 
 ## 10. Future Modules After This Works
