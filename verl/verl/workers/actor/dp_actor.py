@@ -169,6 +169,13 @@ def _add_length_aware_opd_tensors(mini_batch: DataProto, policy_loss_config) -> 
     return metrics
 
 
+def _apply_length_aware_opd_penalty(advantages: torch.Tensor, model_inputs: dict) -> torch.Tensor:
+    if "length_aware_opd_penalty" not in model_inputs:
+        raise ValueError("length_aware_opd_penalty missing from actor micro-batch")
+    penalty = model_inputs["length_aware_opd_penalty"].to(device=advantages.device, dtype=advantages.dtype)
+    return advantages - penalty.unsqueeze(-1)
+
+
 class DataParallelPPOActor(BasePPOActor):
     """FSDP DataParallel PPO Actor or Ref worker
 
@@ -715,6 +722,16 @@ class DataParallelPPOActor(BasePPOActor):
 
         # Include entropy tensors for entropy-aware distillation
         entropy_aware = getattr(self.config.policy_loss, "entropy_aware_distill", False)
+        length_aware_opd = (
+            getattr(self.config.policy_loss, "length_aware_opd", False)
+            and self.config.policy_loss.only_reverse_kl_advantages
+            and not entropy_aware
+        )
+        if length_aware_opd:
+            if "token_level_scores" in data.batch.keys() and "token_level_scores" not in select_keys:
+                select_keys.append("token_level_scores")
+            elif "token_level_rewards" in data.batch.keys() and "token_level_rewards" not in select_keys:
+                select_keys.append("token_level_rewards")
         if entropy_aware:
             if "student_entropys" in data.batch.keys():
                 select_keys.append("student_entropys")
@@ -742,6 +759,13 @@ class DataParallelPPOActor(BasePPOActor):
         metrics = {}
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
+                if length_aware_opd:
+                    length_aware_metrics = _add_length_aware_opd_tensors(
+                        mini_batch=mini_batch,
+                        policy_loss_config=self.config.policy_loss,
+                    )
+                    append_to_dict(metrics, length_aware_metrics)
+
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
@@ -820,6 +844,8 @@ class DataParallelPPOActor(BasePPOActor):
                         # Vanilla OPD fallback (no entropy-aware weighting)
                         if self.config.policy_loss.only_reverse_kl_advantages and "ref_log_prob" in model_inputs:
                             advantages = -(old_log_prob - model_inputs["ref_log_prob"])
+                            if length_aware_opd:
+                                advantages = _apply_length_aware_opd_penalty(advantages, model_inputs)
 
                         policy_loss_fn = get_policy_loss_fn(loss_mode)
                         pg_loss, pg_metrics = policy_loss_fn(

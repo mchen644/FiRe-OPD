@@ -4,8 +4,10 @@ import pytest
 import torch
 
 from verl import DataProto
+from verl.trainer.ppo.core_algos import compute_policy_loss_vanilla
 from verl.workers.actor.dp_actor import (
     _add_length_aware_opd_tensors,
+    _apply_length_aware_opd_penalty,
     _compute_length_aware_opd_tensors,
 )
 
@@ -21,6 +23,11 @@ def _policy_loss_config(**overrides):
     }
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+class _ActorLossConfig(SimpleNamespace):
+    def get(self, name, default=None):
+        return getattr(self, name, default)
 
 
 def test_length_penalty_penalizes_long_incorrect_response_only():
@@ -182,3 +189,34 @@ def test_minibatch_precompute_survives_single_sequence_microbatch_split():
     assert metrics["length_aware_opd/median_response_len"] == 4.0
     assert micro_batches[1].batch["length_aware_opd_applied_penalty"].item() > 0.0
     assert micro_batches[1].batch["length_aware_opd_penalty"].item() > 0.0
+
+
+def test_broadcast_penalty_adds_sequence_margin_under_single_sequence_token_mean():
+    response_mask = torch.tensor([[1, 1, 1, 1]], dtype=torch.float32)
+    old_log_prob = torch.zeros_like(response_mask)
+    log_prob = torch.zeros_like(response_mask)
+    advantages = torch.zeros_like(response_mask)
+    scaled_penalty = torch.tensor([0.03], dtype=torch.float32)
+
+    adjusted_advantages = _apply_length_aware_opd_penalty(
+        advantages=advantages,
+        model_inputs={"length_aware_opd_penalty": scaled_penalty},
+    )
+    pg_loss, _ = compute_policy_loss_vanilla(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        advantages=adjusted_advantages,
+        response_mask=response_mask,
+        loss_agg_mode="token-mean",
+        config=_ActorLossConfig(clip_ratio=0.2, clip_ratio_low=0.2, clip_ratio_high=0.2, clip_ratio_c=3.0),
+    )
+
+    assert torch.isclose(pg_loss, scaled_penalty[0])
+
+
+def test_apply_length_penalty_requires_precomputed_microbatch_tensor():
+    with pytest.raises(ValueError, match="length_aware_opd_penalty missing"):
+        _apply_length_aware_opd_penalty(
+            advantages=torch.zeros((1, 4), dtype=torch.float32),
+            model_inputs={},
+        )
