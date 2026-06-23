@@ -240,6 +240,48 @@ class TestActorConfig(unittest.TestCase):
             config.validate(n_gpus=16, train_batch_size=512)
         self.assertIn("must be >= n_gpus", str(cm.exception))
 
+    def test_policy_loss_length_aware_opd_defaults_and_overrides(self):
+        """Test length-aware OPD fields in PolicyLossConfig."""
+        config_dict = {
+            "_target_": "verl.workers.config.ActorConfig",
+            "strategy": "fsdp",
+            "ppo_mini_batch_size": 256,
+            "ppo_micro_batch_size_per_gpu": 1,
+            "policy_loss": {
+                "_target_": "verl.workers.config.PolicyLossConfig",
+                "length_aware_opd": True,
+                "length_penalty_coef": 0.02,
+                "length_penalty_type": "log_batch_median",
+                "length_penalty_gate": "incorrect_or_low_teacher",
+                "length_correct_reward_threshold": 0.5,
+                "length_teacher_reject_percentile": 20.0,
+            },
+            "optim": {
+                "_target_": "verl.workers.config.OptimizerConfig",
+                "lr": 0.1,
+            },
+        }
+        config = omega_conf_to_dataclass(config_dict)
+
+        self.assertTrue(config.policy_loss.length_aware_opd)
+        self.assertEqual(config.policy_loss.length_penalty_coef, 0.02)
+        self.assertEqual(config.policy_loss.length_penalty_type, "log_batch_median")
+        self.assertEqual(config.policy_loss.length_penalty_gate, "incorrect_or_low_teacher")
+        self.assertEqual(config.policy_loss.length_correct_reward_threshold, 0.5)
+        self.assertEqual(config.policy_loss.length_teacher_reject_percentile, 20.0)
+
+        default_config = ActorConfig(
+            strategy="fsdp",
+            ppo_micro_batch_size_per_gpu=1,
+            optim=OptimizerConfig(lr=0.1),
+        )
+        self.assertFalse(default_config.policy_loss.length_aware_opd)
+        self.assertEqual(default_config.policy_loss.length_penalty_coef, 0.0)
+        self.assertEqual(default_config.policy_loss.length_penalty_type, "log_batch_median")
+        self.assertEqual(default_config.policy_loss.length_penalty_gate, "incorrect_or_low_teacher")
+        self.assertEqual(default_config.policy_loss.length_correct_reward_threshold, 0.5)
+        self.assertEqual(default_config.policy_loss.length_teacher_reject_percentile, 20.0)
+
 
 if __name__ == "__main__":
     unittest.main()

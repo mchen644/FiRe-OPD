@@ -50,6 +50,13 @@ class PolicyLossConfig(BaseConfig):
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
     only_reverse_kl_advantages: bool = False
+    # TokenSqueeze-inspired length-aware OPD config
+    length_aware_opd: bool = False
+    length_penalty_coef: float = 0.0
+    length_penalty_type: str = "log_batch_median"
+    length_penalty_gate: str = "incorrect_or_low_teacher"
+    length_correct_reward_threshold: float = 0.5
+    length_teacher_reject_percentile: float = 20.0
     multi_teacher_distill: bool = False
     # FiRe-OPD: Entropy-aware distillation config
     entropy_aware_distill: bool = False

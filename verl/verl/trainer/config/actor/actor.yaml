@@ -68,6 +68,24 @@ policy_loss:
   # Whether to use on-policy distillation. If true, only use reverse KL for advantages
   only_reverse_kl_advantages: false
 
+  # Enable gated length-aware OPD penalty in original OPD mode
+  length_aware_opd: false
+
+  # Coefficient for the broadcast sequence-level length penalty
+  length_penalty_coef: 0.0
+
+  # Length penalty shape; currently supports log_batch_median
+  length_penalty_type: log_batch_median
+
+  # Length penalty gate: incorrect, low_teacher, or incorrect_or_low_teacher
+  length_penalty_gate: incorrect_or_low_teacher
+
+  # Sequence reward threshold for marking a rollout incorrect
+  length_correct_reward_threshold: 0.5
+
+  # Bottom percentile of normalized teacher log-prob to reject
+  length_teacher_reject_percentile: 20.0
+
   # Whether to use multi-teacher distillation
   # If false, uses single-teacher distillation path
   # If true, uses multi-teacher distillation path (requires opd_teacher field in data)
