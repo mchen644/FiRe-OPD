@@ -31,12 +31,20 @@ advantage_t = -(old_log_prob_t - ref_log_prob_t)
             = ref_log_prob_t - old_log_prob_t
 ```
 
-Add an optional sequence-level length penalty before the PPO policy loss:
+Add an optional gated sequence-level length penalty before the PPO policy loss:
 
 ```text
 response_len_i = sum(response_mask_i)
 reference_len = median(response_len over the actor micro-batch)
-length_penalty_i = max(log(response_len_i / reference_len), 0)
+base_length_penalty_i = max(log(response_len_i / reference_len), 0)
+
+seq_reward_i = sum(token_level_scores_i)
+normalized_teacher_logprob_i = sum(ref_log_prob_i * response_mask_i) / response_len_i
+teacher_reject_i = normalized_teacher_logprob_i <= bottom_percentile(normalized_teacher_logprob, teacher_reject_percentile)
+incorrect_i = seq_reward_i <= correct_reward_threshold
+penalty_gate_i = incorrect_i OR teacher_reject_i
+
+length_penalty_i = base_length_penalty_i * penalty_gate_i
 advantage'_i,t = advantage_i,t - λ * length_penalty_i
 ```
 
@@ -45,15 +53,19 @@ The penalty is broadcast across valid response tokens for each trajectory.
 Design choices:
 
 - Use `log_batch_median` as the first penalty type.
-- Clamp at zero so responses shorter than or equal to the batch median are not rewarded directly; only long responses are penalized.
+- Clamp at zero so responses shorter than or equal to the batch median are not rewarded directly; only long responses are candidates for penalty.
+- Gate the penalty so long correct responses are protected unless the teacher gives the trajectory very low normalized likelihood.
 - Apply only when `policy_loss.only_reverse_kl_advantages=True` and `policy_loss.length_aware_opd=True`.
-- Keep the implementation detached from gradients because it depends only on response masks, not model outputs.
+- Keep the implementation detached from gradients because it depends only on response masks, rule-based reward, and teacher log-probabilities.
 - Keep FiRe-OPD entropy-aware loss unchanged.
 
-Initial coefficient:
+Initial settings:
 
 ```text
 length_penalty_coef = 0.02
+length_penalty_gate = "incorrect_or_low_teacher"
+length_correct_reward_threshold = 0.5
+length_teacher_reject_percentile = 20.0
 ```
 
 Follow-up sweep if needed:
@@ -71,6 +83,9 @@ Add fields to `PolicyLossConfig`:
 length_aware_opd: bool = False
 length_penalty_coef: float = 0.0
 length_penalty_type: str = "log_batch_median"
+length_penalty_gate: str = "incorrect_or_low_teacher"
+length_correct_reward_threshold: float = 0.5
+length_teacher_reject_percentile: float = 20.0
 ```
 
 Expected script flags for the first experiment:
@@ -79,6 +94,9 @@ Expected script flags for the first experiment:
 actor_rollout_ref.actor.policy_loss.length_aware_opd=True
 actor_rollout_ref.actor.policy_loss.length_penalty_coef=0.02
 actor_rollout_ref.actor.policy_loss.length_penalty_type=log_batch_median
+actor_rollout_ref.actor.policy_loss.length_penalty_gate=incorrect_or_low_teacher
+actor_rollout_ref.actor.policy_loss.length_correct_reward_threshold=0.5
+actor_rollout_ref.actor.policy_loss.length_teacher_reject_percentile=20.0
 ```
 
 When `length_aware_opd=False`, current OPD behavior must be unchanged.
@@ -87,9 +105,11 @@ When `length_aware_opd=False`, current OPD behavior must be unchanged.
 
 ### `verl/verl/workers/config/actor.py`
 
-Add the three config fields to `PolicyLossConfig`.
+Add the length-aware OPD config fields to `PolicyLossConfig`.
 
 ### `verl/verl/workers/actor/dp_actor.py`
+
+When length-aware OPD is enabled, retain `token_level_scores` or `token_level_rewards` in the actor input selection so the actor can identify correct vs incorrect trajectories.
 
 In the non-entropy-aware OPD fallback path, after computing:
 
@@ -97,12 +117,16 @@ In the non-entropy-aware OPD fallback path, after computing:
 advantages = -(old_log_prob - model_inputs["ref_log_prob"])
 ```
 
-optionally apply the length-aware adjustment. Add actor metrics such as:
+optionally apply the gated length-aware adjustment. Add actor metrics such as:
 
 - `length_aware_opd/mean_response_len`
 - `length_aware_opd/median_response_len`
-- `length_aware_opd/mean_penalty`
-- `length_aware_opd/max_penalty`
+- `length_aware_opd/mean_base_penalty`
+- `length_aware_opd/mean_applied_penalty`
+- `length_aware_opd/max_applied_penalty`
+- `length_aware_opd/penalty_gate_ratio`
+- `length_aware_opd/correct_skip_ratio`
+- `length_aware_opd/teacher_reject_ratio`
 - `length_aware_opd/coef`
 
 ### New run script
@@ -129,7 +153,7 @@ It should retain the original OPD settings and not enable FiRe-OPD entropy-aware
 3. Actor computes old student log-probs.
 4. Teacher computes `ref_log_prob` on the same generated response.
 5. Original OPD computes reverse-KL advantages.
-6. If enabled, length-aware OPD computes each trajectory's valid response length from `response_mask`, computes a batch-median-relative penalty, and subtracts it from all valid token advantages for that trajectory.
+6. If enabled, length-aware OPD computes each trajectory's valid response length from `response_mask`, computes a batch-median-relative base penalty, then applies it only when the trajectory is incorrect or in the teacher low-confidence set.
 7. Existing PPO policy loss consumes the adjusted advantages.
 
 ## 7. Testing and Verification
@@ -138,8 +162,10 @@ Unit-level verification:
 
 - Add a CPU test for the length-penalty helper or path.
 - Verify no change when `length_aware_opd=False` or `length_penalty_coef=0`.
-- Verify long responses get a positive penalty and short/batch-median responses get zero penalty.
-- Verify invalid `length_penalty_type` raises a clear error.
+- Verify long incorrect responses get a positive applied penalty and short/batch-median responses get zero applied penalty.
+- Verify long correct responses get zero applied penalty when teacher confidence is not in the low-confidence set.
+- Verify long correct responses can still be penalized if `length_penalty_gate=incorrect_or_low_teacher` and teacher normalized log-probability is in the bottom configured percentile.
+- Verify invalid `length_penalty_type` or `length_penalty_gate` raises a clear error.
 
 Integration smoke test:
 
@@ -164,9 +190,9 @@ If length does not decrease meaningfully at `λ=0.02`, try `λ=0.05`. If perform
 
 ## 9. Risks
 
-- Penalizing length at the sequence level may suppress useful long reasoning on hard problems. This is why the first penalty is median-relative and one-sided rather than a direct per-token length reward.
+- Penalizing length at the sequence level may suppress useful long reasoning on hard problems. This is why the first penalty is median-relative, one-sided, and gated by correctness/teacher confidence rather than applied to every long response.
 - Batch-median length can be noisy for small micro-batches. The initial implementation uses the actor micro-batch for simplicity because that is where advantages are adjusted; if unstable, later versions can compute the reference length at mini-batch level before splitting.
-- Length-aware OPD can reduce advantage magnitude for long correct responses even when the teacher strongly prefers them. Adaptive reasoning-depth selection should address this later, but it is intentionally out of scope for the first module.
+- Rule-based correctness is available for the math setting, but it may be imperfect due to answer parsing. The teacher low-confidence branch provides a second quality signal, and metrics should report how often each branch activates.
 
 ## 10. Future Modules After This Works
 
