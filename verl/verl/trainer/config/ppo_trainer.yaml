@@ -116,6 +116,24 @@ algorithm:
     # Power used for weight scaling in "pow" method
     weight_pow: 2.0
 
+  # Optional OPD multi-candidate response selection after reward/ref scoring
+  candidate_selection:
+
+    # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+    _target_: verl.trainer.config.CandidateSelectionConfig
+
+    # Whether to enable OPD candidate selection
+    enabled: False
+
+    # Selection method
+    method: shortest_correct_else_teacher
+
+    # Sequence reward threshold above which a candidate is considered correct
+    correct_reward_threshold: 0.5
+
+    # Number of candidates to keep per uid
+    keep_per_uid: 1
+
 # config for the trainer
 trainer:
 

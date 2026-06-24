@@ -17,7 +17,7 @@ from typing import Any, Optional
 
 from verl.base_config import BaseConfig
 
-__all__ = ["AlgoConfig", "FilterGroupsConfig", "KLControlConfig", "RolloutCorrectionConfig"]
+__all__ = ["AlgoConfig", "CandidateSelectionConfig", "FilterGroupsConfig", "KLControlConfig", "RolloutCorrectionConfig"]
 
 
 @dataclass
@@ -331,6 +331,16 @@ class RolloutCorrectionConfig(BaseConfig):
 
 
 @dataclass
+class CandidateSelectionConfig(BaseConfig):
+    """Configuration for OPD multi-candidate response selection."""
+
+    enabled: bool = False
+    method: str = "shortest_correct_else_teacher"
+    correct_reward_threshold: float = 0.5
+    keep_per_uid: int = 1
+
+
+@dataclass
 class AlgoConfig(BaseConfig):
     """Configuration for the algorithm.
 
@@ -373,6 +383,7 @@ class AlgoConfig(BaseConfig):
     use_pf_ppo: bool = False
     pf_ppo: dict[str, Any] = field(default_factory=dict)
     filter_groups: Optional[FilterGroupsConfig] = None
+    candidate_selection: Optional[CandidateSelectionConfig] = field(default_factory=CandidateSelectionConfig)
     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None
