@@ -42,6 +42,7 @@ from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, Ra
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
+from verl.trainer.ppo.candidate_selection import select_short_correct_candidates
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
@@ -1236,6 +1237,14 @@ class RayPPOTrainer:
                             metrics.update(kl_metrics)
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+                        candidate_selection_config = self.config.algorithm.get("candidate_selection", None)
+                        if candidate_selection_config is not None and candidate_selection_config.get("enabled", False):
+                            batch, candidate_selection_metrics = select_short_correct_candidates(
+                                batch=batch,
+                                selection_config=candidate_selection_config,
+                            )
+                            metrics.update(candidate_selection_metrics)
 
                         # Compute rollout correction: IS weights, rejection sampling, and metrics
                         # Only runs in decoupled mode (computes once per batch using stable π_old)

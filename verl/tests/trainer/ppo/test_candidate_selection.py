@@ -139,3 +139,13 @@ def test_selection_handles_single_candidate_groups():
     assert len(selected) == 2
     assert metrics["candidate_selection/keep_ratio"] == 1.0
     assert metrics["candidate_selection/groups"] == 2.0
+
+
+def test_selection_reduces_rollout_n_two_batch_to_one_per_uid():
+    batch = _batch_for_selection()
+    selected, metrics = select_short_correct_candidates(batch, _cfg())
+
+    assert len(batch) == 4
+    assert len(selected) == 2
+    assert selected.non_tensor_batch["uid"].tolist() == ["uid-a", "uid-b"]
+    assert metrics["candidate_selection/keep_ratio"] == 0.5
