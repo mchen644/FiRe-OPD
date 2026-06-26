@@ -14,6 +14,8 @@ def _cfg(**overrides):
         "method": "shortest_correct_else_teacher",
         "correct_reward_threshold": 0.5,
         "keep_per_uid": 1,
+        "teacher_reject_percentile": 20.0,
+        "drop_rejected_no_correct": True,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -57,6 +59,48 @@ def _batch_for_selection():
     return batch
 
 
+def _batch_for_quality_gated_selection():
+    response_mask = torch.tensor(
+        [
+            [1, 1, 1, 1, 1, 1],  # uid-a, correct but long
+            [1, 1, 1, 0, 0, 0],  # uid-a, correct and short -> select
+            [1, 1, 0, 0, 0, 0],  # uid-b, wrong, teacher accepted and short -> select
+            [1, 1, 1, 1, 1, 0],  # uid-b, wrong, teacher accepted and longer
+            [1, 1, 1, 0, 0, 0],  # uid-c, wrong, teacher rejected
+            [1, 1, 1, 1, 0, 0],  # uid-c, wrong, teacher rejected -> group dropped
+        ],
+        dtype=torch.float32,
+    )
+    ref_log_prob = torch.tensor(
+        [
+            [-0.2, -0.2, -0.2, -0.2, -0.2, -0.2],
+            [-0.5, -0.5, -0.5, 0.0, 0.0, 0.0],
+            [-0.2, -0.2, 0.0, 0.0, 0.0, 0.0],
+            [-0.1, -0.1, -0.1, -0.1, -0.1, 0.0],
+            [-10.0, -10.0, -10.0, 0.0, 0.0, 0.0],
+            [-9.0, -9.0, -9.0, -9.0, 0.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    token_level_scores = torch.zeros_like(response_mask)
+    token_level_scores[0, 5] = 1.0
+    token_level_scores[1, 2] = 1.0
+    input_ids = torch.arange(6 * 6, dtype=torch.long).view(6, 6)
+    batch = DataProto.from_dict(
+        tensors={
+            "input_ids": input_ids,
+            "response_mask": response_mask,
+            "ref_log_prob": ref_log_prob,
+            "token_level_scores": token_level_scores,
+        },
+        non_tensors={
+            "uid": np.array(["uid-a", "uid-a", "uid-b", "uid-b", "uid-c", "uid-c"], dtype=object),
+            "source": np.array(["a0", "a1", "b0", "b1", "c0", "c1"], dtype=object),
+        },
+    )
+    return batch
+
+
 def test_selects_shortest_correct_candidate_and_teacher_best_fallback():
     batch = _batch_for_selection()
 
@@ -77,6 +121,61 @@ def test_selects_shortest_correct_candidate_and_teacher_best_fallback():
     assert metrics["candidate_selection/fallback_teacher_ratio"] == 0.5
     assert metrics["candidate_selection/selected_response_len_mean"] == 3.5
     assert metrics["candidate_selection/candidate_response_len_mean"] == 3.75
+
+
+def test_quality_gated_correct_compression_selects_correct_compresses_wrong_fallback_and_drops_rejected():
+    batch = _batch_for_quality_gated_selection()
+
+    selected, metrics = select_short_correct_candidates(
+        batch,
+        _cfg(method="quality_gated_correct_compression", teacher_reject_percentile=20.0),
+    )
+
+    assert selected.batch["input_ids"].tolist() == [
+        [6, 7, 8, 9, 10, 11],
+        [12, 13, 14, 15, 16, 17],
+    ]
+    assert selected.non_tensor_batch["uid"].tolist() == ["uid-a", "uid-b"]
+    assert selected.non_tensor_batch["source"].tolist() == ["a1", "b0"]
+
+    assert metrics["candidate_selection/enabled"] == 1.0
+    assert metrics["candidate_selection/groups"] == 3.0
+    assert metrics["candidate_selection/selected_groups"] == 2.0
+    assert metrics["candidate_selection/candidates"] == 6.0
+    assert metrics["candidate_selection/keep_ratio"] == pytest.approx(2.0 / 6.0)
+    assert metrics["candidate_selection/any_correct_ratio"] == pytest.approx(1.0 / 3.0)
+    assert metrics["candidate_selection/no_correct_ratio"] == pytest.approx(2.0 / 3.0)
+    assert metrics["candidate_selection/selected_correct_ratio"] == 0.5
+    assert metrics["candidate_selection/fallback_teacher_ratio"] == pytest.approx(1.0 / 3.0)
+    assert metrics["candidate_selection/no_correct_teacher_accept_ratio"] == pytest.approx(1.0 / 3.0)
+    assert metrics["candidate_selection/dropped_uid_ratio"] == pytest.approx(1.0 / 3.0)
+    assert metrics["candidate_selection/selected_response_len_mean"] == 2.5
+    assert metrics["candidate_selection/selected_correct_len_mean"] == 3.0
+    assert metrics["candidate_selection/selected_wrong_len_mean"] == 2.0
+    assert metrics["candidate_selection/correct_candidate_len_mean"] == 4.5
+    assert metrics["candidate_selection/wrong_candidate_len_mean"] == 3.5
+    assert metrics["candidate_selection/teacher_accept_ratio"] == pytest.approx(4.0 / 6.0)
+    assert metrics["candidate_selection/teacher_reject_threshold"] < -1.0
+
+
+def test_quality_gated_correct_compression_can_keep_teacher_best_when_drop_disabled():
+    batch = _batch_for_quality_gated_selection()
+
+    selected, metrics = select_short_correct_candidates(
+        batch,
+        _cfg(
+            method="quality_gated_correct_compression",
+            teacher_reject_percentile=20.0,
+            drop_rejected_no_correct=False,
+        ),
+    )
+
+    assert selected.non_tensor_batch["uid"].tolist() == ["uid-a", "uid-b", "uid-c"]
+    assert selected.non_tensor_batch["source"].tolist() == ["a1", "b0", "c1"]
+    assert metrics["candidate_selection/groups"] == 3.0
+    assert metrics["candidate_selection/selected_groups"] == 3.0
+    assert metrics["candidate_selection/dropped_uid_ratio"] == 0.0
+    assert metrics["candidate_selection/fallback_teacher_ratio"] == pytest.approx(2.0 / 3.0)
 
 
 def test_disabled_selection_returns_original_batch_and_disabled_metric():
