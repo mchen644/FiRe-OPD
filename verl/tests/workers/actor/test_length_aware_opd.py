@@ -160,6 +160,54 @@ def test_length_penalty_requires_scores_for_incorrect_gate():
         )
 
 
+def test_length_penalty_correct_gate_penalizes_long_correct_response_only():
+    response_mask = torch.tensor(
+        [
+            [1, 1, 1, 1, 0, 0, 0, 0],
+            [1, 1, 1, 1, 1, 1, 1, 1],
+            [1, 1, 0, 0, 0, 0, 0, 0],
+        ],
+        dtype=torch.float32,
+    )
+    ref_log_prob = torch.full_like(response_mask, -0.2)
+    token_level_scores = torch.zeros_like(response_mask)
+    token_level_scores[0, 3] = 0.0
+    token_level_scores[1, 7] = 1.0
+    token_level_scores[2, 1] = 0.0
+
+    tensors, metrics = _compute_length_aware_opd_tensors(
+        response_mask=response_mask,
+        ref_log_prob=ref_log_prob,
+        token_level_scores=token_level_scores,
+        policy_loss_config=_policy_loss_config(
+            length_penalty_gate="correct",
+            length_teacher_reject_percentile=0.0,
+        ),
+    )
+
+    expected_base_penalty = torch.log(torch.tensor(8.0 / 4.0))
+    assert torch.isclose(tensors["length_aware_opd_base_penalty"][1], expected_base_penalty)
+    assert torch.isclose(tensors["length_aware_opd_applied_penalty"][1], expected_base_penalty)
+    assert torch.isclose(tensors["length_aware_opd_penalty"][1], expected_base_penalty * 0.02)
+    assert tensors["length_aware_opd_applied_penalty"][0].item() == 0.0
+    assert tensors["length_aware_opd_applied_penalty"][2].item() == 0.0
+    assert metrics["length_aware_opd/penalty_gate_ratio"] == pytest.approx(1.0 / 3.0)
+    assert metrics["length_aware_opd/correct_penalty_ratio"] == pytest.approx(1.0 / 3.0)
+
+
+def test_length_penalty_correct_gate_requires_scores():
+    response_mask = torch.ones((2, 4), dtype=torch.float32)
+    ref_log_prob = torch.full_like(response_mask, -0.2)
+
+    with pytest.raises(ValueError, match="token_level_scores is required"):
+        _compute_length_aware_opd_tensors(
+            response_mask=response_mask,
+            ref_log_prob=ref_log_prob,
+            token_level_scores=None,
+            policy_loss_config=_policy_loss_config(length_penalty_gate="correct"),
+        )
+
+
 def test_minibatch_precompute_survives_single_sequence_microbatch_split():
     response_mask = torch.tensor(
         [

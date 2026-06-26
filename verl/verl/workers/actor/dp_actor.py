@@ -47,7 +47,7 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 _LENGTH_PENALTY_TYPES = {"log_batch_median"}
-_LENGTH_PENALTY_GATES = {"incorrect", "low_teacher", "incorrect_or_low_teacher"}
+_LENGTH_PENALTY_GATES = {"incorrect", "low_teacher", "incorrect_or_low_teacher", "correct"}
 
 
 def _policy_loss_get(policy_loss_config, name: str, default):
@@ -75,7 +75,7 @@ def _compute_length_aware_opd_tensors(
             f"Invalid length_penalty_gate: {penalty_gate}. Supported values: {sorted(_LENGTH_PENALTY_GATES)}"
         )
 
-    needs_scores = penalty_gate in {"incorrect", "incorrect_or_low_teacher"}
+    needs_scores = penalty_gate in {"incorrect", "incorrect_or_low_teacher", "correct"}
     if needs_scores and token_level_scores is None:
         raise ValueError("token_level_scores is required when length_penalty_gate uses correctness")
 
@@ -108,6 +108,8 @@ def _compute_length_aware_opd_tensors(
         gate = incorrect
     elif penalty_gate == "low_teacher":
         gate = teacher_reject
+    elif penalty_gate == "correct":
+        gate = correct
     else:
         gate = incorrect | teacher_reject
 
@@ -146,6 +148,7 @@ def _summarize_length_aware_opd_tensors(tensors: dict[str, torch.Tensor], coef: 
         "length_aware_opd/max_applied_penalty": applied_penalty.float().max().item(),
         "length_aware_opd/penalty_gate_ratio": penalty_gate.float().mean().item(),
         "length_aware_opd/correct_skip_ratio": ((1.0 - penalty_gate) * correct_mask).float().mean().item(),
+        "length_aware_opd/correct_penalty_ratio": (penalty_gate * correct_mask).float().mean().item(),
         "length_aware_opd/teacher_reject_ratio": teacher_reject.float().mean().item(),
         "length_aware_opd/coef": float(coef),
     }
