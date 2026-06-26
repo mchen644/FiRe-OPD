@@ -15,7 +15,7 @@ import torch
 
 from verl import DataProto
 
-_SUPPORTED_METHODS = {"shortest_correct_else_teacher"}
+_SUPPORTED_METHODS = {"shortest_correct_else_teacher", "quality_gated_correct_compression"}
 
 
 def _config_get(config: Any, name: str, default: Any) -> Any:
@@ -44,30 +44,79 @@ def _candidate_selection_scores(batch: DataProto, correct_reward_threshold: floa
     return response_len, correct, normalized_teacher_logprob
 
 
-def _select_index_for_uid(
+def _teacher_accept_mask(normalized_teacher_logprob: torch.Tensor, teacher_reject_percentile: float):
+    if teacher_reject_percentile < 0.0 or teacher_reject_percentile > 100.0:
+        raise ValueError("candidate_selection.teacher_reject_percentile must be between 0.0 and 100.0")
+    if teacher_reject_percentile == 0.0:
+        threshold = torch.tensor(float("nan"), device=normalized_teacher_logprob.device)
+        return torch.ones_like(normalized_teacher_logprob, dtype=torch.bool), threshold
+    threshold = torch.quantile(normalized_teacher_logprob.float(), teacher_reject_percentile / 100.0)
+    return normalized_teacher_logprob > threshold, threshold
+
+
+def _select_shortest_with_teacher_tiebreak(
+    candidate_indices: list[int],
+    response_len: torch.Tensor,
+    normalized_teacher_logprob: torch.Tensor,
+) -> int:
+    return max(
+        candidate_indices,
+        key=lambda idx: (-float(response_len[idx].item()), float(normalized_teacher_logprob[idx].item())),
+    )
+
+
+def _select_index_shortest_correct_else_teacher(
     candidate_indices: list[int],
     response_len: torch.Tensor,
     correct: torch.Tensor,
     normalized_teacher_logprob: torch.Tensor,
-) -> tuple[int, bool]:
+) -> tuple[int, bool, bool]:
     correct_indices = [idx for idx in candidate_indices if bool(correct[idx].item())]
     if correct_indices:
-        selected = max(
-            correct_indices,
-            key=lambda idx: (-float(response_len[idx].item()), float(normalized_teacher_logprob[idx].item())),
-        )
-        return selected, False
+        return _select_shortest_with_teacher_tiebreak(correct_indices, response_len, normalized_teacher_logprob), False, False
 
     selected = max(candidate_indices, key=lambda idx: float(normalized_teacher_logprob[idx].item()))
-    return selected, True
+    return selected, True, False
+
+
+def _select_index_quality_gated_correct_compression(
+    candidate_indices: list[int],
+    response_len: torch.Tensor,
+    correct: torch.Tensor,
+    normalized_teacher_logprob: torch.Tensor,
+    teacher_accepted: torch.Tensor,
+    drop_rejected_no_correct: bool,
+) -> tuple[int | None, bool, bool]:
+    correct_indices = [idx for idx in candidate_indices if bool(correct[idx].item())]
+    if correct_indices:
+        selected = _select_shortest_with_teacher_tiebreak(correct_indices, response_len, normalized_teacher_logprob)
+        return selected, False, False
+
+    accepted_indices = [idx for idx in candidate_indices if bool(teacher_accepted[idx].item())]
+    if accepted_indices:
+        selected = _select_shortest_with_teacher_tiebreak(accepted_indices, response_len, normalized_teacher_logprob)
+        return selected, True, False
+
+    if drop_rejected_no_correct:
+        return None, False, True
+
+    selected = max(candidate_indices, key=lambda idx: float(normalized_teacher_logprob[idx].item()))
+    return selected, True, False
+
+
+def _safe_mean(values: torch.Tensor) -> float:
+    if values.numel() == 0:
+        return 0.0
+    return values.float().mean().item()
 
 
 def select_short_correct_candidates(batch: DataProto, selection_config) -> tuple[DataProto, dict[str, float]]:
     """Select one candidate per prompt uid for OPD training.
 
-    The initial method keeps the shortest correct candidate when a group has any
-    correct response, otherwise it falls back to the candidate with highest
-    normalized teacher log-probability.
+    Supported methods:
+    - shortest_correct_else_teacher: legacy behavior; shortest correct if any, otherwise teacher-best.
+    - quality_gated_correct_compression: shortest correct if any; otherwise shortest teacher-accepted;
+      optionally drop no-correct groups where all candidates are teacher-rejected.
     """
     enabled = bool(_config_get(selection_config, "enabled", False))
     if not enabled:
@@ -88,6 +137,10 @@ def select_short_correct_candidates(batch: DataProto, selection_config) -> tuple
         batch=batch,
         correct_reward_threshold=float(_config_get(selection_config, "correct_reward_threshold", 0.5)),
     )
+    teacher_accepted, teacher_reject_threshold = _teacher_accept_mask(
+        normalized_teacher_logprob=normalized_teacher_logprob,
+        teacher_reject_percentile=float(_config_get(selection_config, "teacher_reject_percentile", 20.0)),
+    )
 
     uid_to_indices: OrderedDict[str, list[int]] = OrderedDict()
     for idx, uid in enumerate(batch.non_tensor_batch["uid"]):
@@ -96,17 +149,42 @@ def select_short_correct_candidates(batch: DataProto, selection_config) -> tuple
     selected_indices: list[int] = []
     fallback_teacher_count = 0
     any_correct_count = 0
+    no_correct_count = 0
+    no_correct_teacher_accept_count = 0
+    dropped_uid_count = 0
+    drop_rejected_no_correct = bool(_config_get(selection_config, "drop_rejected_no_correct", True))
+
     for indices in uid_to_indices.values():
-        if any(bool(correct[idx].item()) for idx in indices):
+        has_correct = any(bool(correct[idx].item()) for idx in indices)
+        if has_correct:
             any_correct_count += 1
-        selected, used_teacher_fallback = _select_index_for_uid(
-            candidate_indices=indices,
-            response_len=response_len,
-            correct=correct,
-            normalized_teacher_logprob=normalized_teacher_logprob,
-        )
-        selected_indices.append(selected)
+        else:
+            no_correct_count += 1
+
+        if method == "shortest_correct_else_teacher":
+            selected, used_teacher_fallback, dropped = _select_index_shortest_correct_else_teacher(
+                candidate_indices=indices,
+                response_len=response_len,
+                correct=correct,
+                normalized_teacher_logprob=normalized_teacher_logprob,
+            )
+        else:
+            has_teacher_accept = any(bool(teacher_accepted[idx].item()) for idx in indices)
+            if (not has_correct) and has_teacher_accept:
+                no_correct_teacher_accept_count += 1
+            selected, used_teacher_fallback, dropped = _select_index_quality_gated_correct_compression(
+                candidate_indices=indices,
+                response_len=response_len,
+                correct=correct,
+                normalized_teacher_logprob=normalized_teacher_logprob,
+                teacher_accepted=teacher_accepted,
+                drop_rejected_no_correct=drop_rejected_no_correct,
+            )
+
         fallback_teacher_count += int(used_teacher_fallback)
+        dropped_uid_count += int(dropped)
+        if selected is not None:
+            selected_indices.append(selected)
 
     selected_index_tensor = torch.tensor(selected_indices, dtype=torch.long)
     selected = batch.select_idxs(selected_index_tensor)
@@ -114,21 +192,35 @@ def select_short_correct_candidates(batch: DataProto, selection_config) -> tuple
     selected_response_len = response_len[selected_index_tensor]
     selected_correct = correct[selected_index_tensor].float()
     selected_teacher_logprob = normalized_teacher_logprob[selected_index_tensor]
-    groups = len(selected_indices)
+    selected_correct_len = selected_response_len[selected_correct.bool()]
+    selected_wrong_len = selected_response_len[~selected_correct.bool()]
+    correct_candidate_len = response_len[correct]
+    wrong_candidate_len = response_len[~correct]
+
+    groups = len(uid_to_indices)
+    selected_groups = len(selected_indices)
     candidates = len(batch)
 
     metrics = {
         "candidate_selection/enabled": 1.0,
         "candidate_selection/groups": float(groups),
+        "candidate_selection/selected_groups": float(selected_groups),
         "candidate_selection/candidates": float(candidates),
-        "candidate_selection/keep_ratio": float(groups / max(candidates, 1)),
+        "candidate_selection/keep_ratio": float(selected_groups / max(candidates, 1)),
         "candidate_selection/any_correct_ratio": float(any_correct_count / max(groups, 1)),
-        "candidate_selection/selected_correct_ratio": selected_correct.mean().item() if groups else 0.0,
+        "candidate_selection/no_correct_ratio": float(no_correct_count / max(groups, 1)),
+        "candidate_selection/selected_correct_ratio": _safe_mean(selected_correct),
         "candidate_selection/candidate_response_len_mean": response_len.float().mean().item(),
-        "candidate_selection/selected_response_len_mean": selected_response_len.float().mean().item() if groups else 0.0,
+        "candidate_selection/selected_response_len_mean": _safe_mean(selected_response_len),
         "candidate_selection/fallback_teacher_ratio": float(fallback_teacher_count / max(groups, 1)),
-        "candidate_selection/selected_teacher_logprob_mean": selected_teacher_logprob.float().mean().item()
-        if groups
-        else 0.0,
+        "candidate_selection/selected_teacher_logprob_mean": _safe_mean(selected_teacher_logprob),
+        "candidate_selection/teacher_accept_ratio": teacher_accepted.float().mean().item(),
+        "candidate_selection/no_correct_teacher_accept_ratio": float(no_correct_teacher_accept_count / max(groups, 1)),
+        "candidate_selection/dropped_uid_ratio": float(dropped_uid_count / max(groups, 1)),
+        "candidate_selection/selected_correct_len_mean": _safe_mean(selected_correct_len),
+        "candidate_selection/selected_wrong_len_mean": _safe_mean(selected_wrong_len),
+        "candidate_selection/correct_candidate_len_mean": _safe_mean(correct_candidate_len),
+        "candidate_selection/wrong_candidate_len_mean": _safe_mean(wrong_candidate_len),
+        "candidate_selection/teacher_reject_threshold": float(teacher_reject_threshold.item()),
     }
     return selected, metrics
