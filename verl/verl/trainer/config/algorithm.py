@@ -338,6 +338,8 @@ class CandidateSelectionConfig(BaseConfig):
     method: str = "shortest_correct_else_teacher"
     correct_reward_threshold: float = 0.5
     keep_per_uid: int = 1
+    teacher_reject_percentile: float = 20.0
+    drop_rejected_no_correct: bool = True
 
 
 @dataclass

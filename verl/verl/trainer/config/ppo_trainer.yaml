@@ -134,6 +134,12 @@ algorithm:
     # Number of candidates to keep per uid
     keep_per_uid: 1
 
+    # Bottom teacher normalized-logprob percentile used to reject low-quality no-correct candidates
+    teacher_reject_percentile: 20.0
+
+    # Whether no-correct groups with only teacher-rejected candidates are dropped from actor update
+    drop_rejected_no_correct: True
+
 # config for the trainer
 trainer:
 
