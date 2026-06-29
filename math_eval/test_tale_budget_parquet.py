@@ -7,9 +7,11 @@ from math_eval.tale_budget_parquet import (
     build_budget_estimation_prompt,
     build_budgeted_teacher_messages,
     convert_dataframe_with_budget_estimates,
+    load_budget_records,
     extract_single_user_question,
     normalize_budget,
     parse_budget,
+    save_budget_records,
 )
 
 
@@ -114,3 +116,15 @@ def test_convert_dataframe_with_budget_estimates_preserves_student_prompt_and_ad
     assert teacher_prompt[0]["role"] == "user"
     assert "use less than 256 tokens" in teacher_prompt[0]["content"]
     assert "Please reason step by step" not in teacher_prompt[0]["content"]
+
+
+def test_budget_record_jsonl_roundtrip(tmp_path: Path):
+    path = tmp_path / "budgets.jsonl"
+    records = [
+        {"index": 0, "estimate_text": "Budget: [[128]]", "raw_budget": 128},
+        {"index": 1, "estimate_text": "Budget: [[256]]", "raw_budget": 256},
+    ]
+
+    save_budget_records(records, path)
+
+    assert load_budget_records(path) == records
