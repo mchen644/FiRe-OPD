@@ -439,6 +439,107 @@ def run_repetition(args: argparse.Namespace) -> None:
     print(f"wrote {out_dir / 'repetition_metrics.csv'}")
 
 
+def compute_topk_alignment_metrics(student_logits, teacher_logits, mask=None, k: int = 16) -> dict[str, float]:
+    """Compute 2604.13016-style top-k alignment metrics.
+
+    Inputs are tensors with shape [batch, seq, vocab]. Mask, when provided,
+    has shape [batch, seq] with 1 for valid response positions.
+    """
+
+    import torch
+    import torch.nn.functional as F
+
+    if student_logits.shape != teacher_logits.shape:
+        raise ValueError(
+            f"student_logits and teacher_logits must have the same shape, got {student_logits.shape} and {teacher_logits.shape}"
+        )
+    if student_logits.ndim != 3:
+        raise ValueError("logits must have shape [batch, seq, vocab]")
+    vocab = student_logits.shape[-1]
+    if k <= 0 or k > vocab:
+        raise ValueError(f"k must be in [1, vocab], got k={k}, vocab={vocab}")
+    if mask is None:
+        valid = torch.ones(student_logits.shape[:2], dtype=torch.bool, device=student_logits.device)
+    else:
+        valid = mask.to(device=student_logits.device).bool()
+    if valid.sum().item() == 0:
+        return {
+            "num_positions": 0.0,
+            "topk_overlap_ratio": float("nan"),
+            "overlap_student_mass": float("nan"),
+            "overlap_teacher_mass": float("nan"),
+            "student_entropy": float("nan"),
+            "teacher_entropy": float("nan"),
+            "entropy_gap": float("nan"),
+            "overlap_token_advantage": float("nan"),
+        }
+
+    s_logits = student_logits[valid]
+    t_logits = teacher_logits[valid]
+    s_logp = F.log_softmax(s_logits, dim=-1)
+    t_logp = F.log_softmax(t_logits, dim=-1)
+    s_prob = s_logp.exp()
+    t_prob = t_logp.exp()
+    s_top = torch.topk(s_prob, k=k, dim=-1).indices
+    t_top = torch.topk(t_prob, k=k, dim=-1).indices
+    s_mask = torch.zeros_like(s_prob, dtype=torch.bool).scatter_(dim=-1, index=s_top, value=True)
+    t_mask = torch.zeros_like(t_prob, dtype=torch.bool).scatter_(dim=-1, index=t_top, value=True)
+    overlap = s_mask & t_mask
+    overlap_count = overlap.sum(dim=-1).float()
+    overlap_ratio = overlap_count / float(k)
+    s_mass = (s_prob * overlap.float()).sum(dim=-1)
+    t_mass = (t_prob * overlap.float()).sum(dim=-1)
+    s_entropy = -(s_prob * s_logp).sum(dim=-1)
+    t_entropy = -(t_prob * t_logp).sum(dim=-1)
+    nonempty = overlap_count > 0
+    if nonempty.any():
+        p_overlap = torch.where(overlap, s_prob, torch.zeros_like(s_prob))[nonempty]
+        q_overlap = torch.where(overlap, t_prob, torch.zeros_like(t_prob))[nonempty]
+        p_norm = p_overlap / p_overlap.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        q_norm = q_overlap / q_overlap.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        adv = (p_norm * (q_norm.clamp_min(1e-12).log() - p_norm.clamp_min(1e-12).log())).sum(dim=-1)
+        overlap_advantage = adv.mean().item()
+    else:
+        overlap_advantage = float("nan")
+    return {
+        "num_positions": float(valid.sum().item()),
+        "topk_overlap_ratio": overlap_ratio.mean().item(),
+        "overlap_student_mass": s_mass.mean().item(),
+        "overlap_teacher_mass": t_mass.mean().item(),
+        "student_entropy": s_entropy.mean().item(),
+        "teacher_entropy": t_entropy.mean().item(),
+        "entropy_gap": (t_entropy - s_entropy).abs().mean().item(),
+        "overlap_token_advantage": overlap_advantage,
+    }
+
+
+def compute_position_binned_alignment(student_logits, teacher_logits, mask=None, k: int = 16, num_bins: int = 8) -> list[dict[str, float]]:
+    import torch
+
+    if num_bins <= 0:
+        raise ValueError("num_bins must be positive")
+    seq_len = student_logits.shape[1]
+    if mask is None:
+        mask = torch.ones(student_logits.shape[:2], dtype=torch.bool, device=student_logits.device)
+    out: list[dict[str, float]] = []
+    for bin_idx in range(num_bins):
+        start = int(round(seq_len * bin_idx / num_bins))
+        end = int(round(seq_len * (bin_idx + 1) / num_bins))
+        if end <= start:
+            end = min(seq_len, start + 1)
+        metrics = compute_topk_alignment_metrics(
+            student_logits[:, start:end, :],
+            teacher_logits[:, start:end, :],
+            mask=mask[:, start:end],
+            k=k,
+        )
+        metrics["position_bin"] = float(bin_idx)
+        metrics["position_start"] = float(start)
+        metrics["position_end"] = float(end)
+        out.append(metrics)
+    return out
+
+
 def run_macro(args: argparse.Namespace) -> None:
     repo_dir = Path(args.repo_dir).resolve()
     out_dir = Path(args.output_dir)

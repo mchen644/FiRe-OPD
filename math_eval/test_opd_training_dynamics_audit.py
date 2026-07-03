@@ -1,6 +1,9 @@
 import json
 from pathlib import Path
 
+import pytest
+import torch
+
 from math_eval.opd_training_dynamics_audit import (
     parse_metric_line,
     parse_wandb_output_log,
@@ -182,3 +185,46 @@ def test_compute_repetition_metrics_flags_truncated_length():
     assert metrics[0]["num_responses"] == 2.0
     assert metrics[0]["truncation_rate"] == 0.5
     assert metrics[0]["mean_compression_repetition_ratio"] > 0.0
+
+
+from math_eval.opd_training_dynamics_audit import (
+    compute_topk_alignment_metrics,
+    compute_position_binned_alignment,
+)
+
+
+def test_compute_topk_alignment_metrics_identical_logits_have_full_overlap():
+    logits = torch.tensor([[[4.0, 3.0, 1.0, 0.0], [0.0, 1.0, 3.0, 4.0]]])
+    metrics = compute_topk_alignment_metrics(logits, logits.clone(), k=2)
+    assert metrics["num_positions"] == 2.0
+    assert metrics["topk_overlap_ratio"] == 1.0
+    assert metrics["entropy_gap"] == pytest.approx(0.0, abs=1e-7)
+    assert metrics["overlap_student_mass"] > 0.8
+    assert metrics["overlap_teacher_mass"] > 0.8
+
+
+def test_compute_topk_alignment_metrics_disjoint_top1_has_zero_overlap():
+    student = torch.tensor([[[10.0, 0.0, 0.0]]])
+    teacher = torch.tensor([[[0.0, 10.0, 0.0]]])
+    metrics = compute_topk_alignment_metrics(student, teacher, k=1)
+    assert metrics["topk_overlap_ratio"] == 0.0
+    assert metrics["overlap_student_mass"] == 0.0
+    assert metrics["overlap_teacher_mass"] == 0.0
+
+
+def test_compute_topk_alignment_metrics_respects_mask():
+    student = torch.tensor([[[4.0, 3.0, 0.0], [10.0, 0.0, 0.0]]])
+    teacher = torch.tensor([[[4.0, 3.0, 0.0], [0.0, 10.0, 0.0]]])
+    mask = torch.tensor([[1, 0]])
+    metrics = compute_topk_alignment_metrics(student, teacher, mask=mask, k=1)
+    assert metrics["num_positions"] == 1.0
+    assert metrics["topk_overlap_ratio"] == 1.0
+
+
+def test_compute_position_binned_alignment_returns_requested_bins():
+    logits = torch.randn(1, 8, 6)
+    bins = compute_position_binned_alignment(logits, logits.clone(), k=2, num_bins=4)
+    assert len(bins) == 4
+    assert bins[0]["position_bin"] == 0.0
+    assert bins[-1]["position_bin"] == 3.0
+    assert all(row["topk_overlap_ratio"] == pytest.approx(1.0) for row in bins)
