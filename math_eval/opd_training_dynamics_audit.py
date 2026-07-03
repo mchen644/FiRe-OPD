@@ -585,28 +585,43 @@ def _apply_chat_template(tokenizer, messages: list[dict[str, str]]) -> str:
         return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
 
-def score_response_logits(model, tokenizer, messages: list[dict[str, str]], response: str, max_score_tokens: int):
-    """Return logits for response-token positions under prompt+response.
+def score_response_logits(
+    model,
+    tokenizer,
+    messages: list[dict[str, str]],
+    response: str,
+    max_score_tokens: int,
+    window_start: int = 0,
+):
+    """Return logits for a response-token window under prompt+response.
 
-    This is lazy-heavy and intended for small diagnostic subsets. It returns a
-    tensor with shape [1, scored_response_tokens, vocab].
+    `window_start` is measured in response tokens. The model receives the full
+    response prefix through `window_start + max_score_tokens` so later windows
+    are scored under their true preceding context.
     """
 
     import torch
 
+    if window_start < 0:
+        raise ValueError("window_start must be non-negative")
     prompt_text = _apply_chat_template(tokenizer, messages)
     prompt_ids = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False).input_ids.to(model.device)
-    response_ids = tokenizer(response, return_tensors="pt", add_special_tokens=False).input_ids.to(model.device)
-    if max_score_tokens > 0:
-        response_ids = response_ids[:, :max_score_tokens]
+    full_response_ids = tokenizer(response, return_tensors="pt", add_special_tokens=False).input_ids.to(model.device)
+    response_len_total = full_response_ids.shape[1]
+    if window_start >= response_len_total:
+        return torch.empty((1, 0, 0), device=model.device)
+    window_end = response_len_total if max_score_tokens <= 0 else min(response_len_total, window_start + max_score_tokens)
+    response_ids = full_response_ids[:, :window_end]
     input_ids = torch.cat([prompt_ids, response_ids], dim=1)
     with torch.no_grad():
         output = model(input_ids=input_ids)
     prompt_len = prompt_ids.shape[1]
-    response_len = response_ids.shape[1]
-    if response_len == 0:
+    scored_len = window_end - window_start
+    if scored_len == 0:
         return output.logits[:, :0, :]
-    return output.logits[:, prompt_len - 1 : prompt_len - 1 + response_len, :]
+    start = prompt_len + window_start - 1
+    end = start + scored_len
+    return output.logits[:, start:end, :]
 
 
 def _load_transformers_model(model_path: str, dtype: str, device_map: str):
@@ -658,42 +673,50 @@ def run_alignment(args: argparse.Namespace) -> None:
     rows: list[dict[str, float | str]] = []
     for item in _iter_alignment_eval_rows(Path(args.responses_jsonl), args.max_prompts, args.max_responses_per_prompt):
         student_messages = [{"role": "user", "content": item["question"]}]
-        student_logits = score_response_logits(
-            student_model,
-            student_tokenizer,
-            student_messages,
-            item["response"],
-            max_score_tokens=args.max_score_tokens,
-        )
-        for style in args.teacher_prompt_style:
-            teacher_messages = build_teacher_messages_for_audit(
-                question=item["question"],
-                raw_messages=student_messages,
-                style=style,
-                budget=item["budget"],
-            )
-            teacher_logits = score_response_logits(
-                teacher_model,
-                teacher_tokenizer,
-                teacher_messages,
+        for window_start in args.window_start:
+            student_logits = score_response_logits(
+                student_model,
+                student_tokenizer,
+                student_messages,
                 item["response"],
                 max_score_tokens=args.max_score_tokens,
+                window_start=window_start,
             )
-            seq = min(student_logits.shape[1], teacher_logits.shape[1])
-            metrics = compute_topk_alignment_metrics(
-                student_logits[:, :seq, :].to(dtype=torch.float32),
-                teacher_logits[:, :seq, :].to(dtype=torch.float32),
-                k=args.top_k,
-            )
-            metrics.update(
-                {
-                    "teacher_prompt_style": style,
-                    "problem_index": float(item["problem_index"]),
-                    "sample_index": float(item["sample_index"]),
-                    "scored_tokens": float(seq),
-                }
-            )
-            rows.append(metrics)
+            if student_logits.shape[1] == 0:
+                continue
+            for style in args.teacher_prompt_style:
+                teacher_messages = build_teacher_messages_for_audit(
+                    question=item["question"],
+                    raw_messages=student_messages,
+                    style=style,
+                    budget=item["budget"],
+                )
+                teacher_logits = score_response_logits(
+                    teacher_model,
+                    teacher_tokenizer,
+                    teacher_messages,
+                    item["response"],
+                    max_score_tokens=args.max_score_tokens,
+                    window_start=window_start,
+                )
+                seq = min(student_logits.shape[1], teacher_logits.shape[1])
+                if seq == 0:
+                    continue
+                metrics = compute_topk_alignment_metrics(
+                    student_logits[:, :seq, :].to(dtype=torch.float32),
+                    teacher_logits[:, :seq, :].to(dtype=torch.float32),
+                    k=args.top_k,
+                )
+                metrics.update(
+                    {
+                        "teacher_prompt_style": style,
+                        "problem_index": float(item["problem_index"]),
+                        "sample_index": float(item["sample_index"]),
+                        "window_start": float(window_start),
+                        "scored_tokens": float(seq),
+                    }
+                )
+                rows.append(metrics)
     write_csv(rows, out_dir / "alignment_metrics.csv")
     print(f"wrote {out_dir / 'alignment_metrics.csv'}")
 
@@ -790,6 +813,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     alignment.add_argument("--max-prompts", type=int, default=4)
     alignment.add_argument("--max-responses-per-prompt", type=int, default=1)
     alignment.add_argument("--max-score-tokens", type=int, default=512)
+    alignment.add_argument(
+        "--window-start",
+        action="append",
+        type=int,
+        default=[0],
+        help="Response-token window start to score. Can be repeated for depth-binned alignment.",
+    )
     alignment.add_argument("--dtype", choices=["auto", "bfloat16", "float16", "float32"], default="bfloat16")
     alignment.add_argument("--device-map", default="auto")
     alignment.set_defaults(func=run_alignment)

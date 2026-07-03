@@ -230,7 +230,7 @@ def test_compute_position_binned_alignment_returns_requested_bins():
     assert all(row["topk_overlap_ratio"] == pytest.approx(1.0) for row in bins)
 
 
-from math_eval.opd_training_dynamics_audit import build_teacher_messages_for_audit
+from math_eval.opd_training_dynamics_audit import build_teacher_messages_for_audit, score_response_logits
 
 
 def test_build_teacher_messages_for_audit_normal_uses_raw_messages():
@@ -263,6 +263,44 @@ def test_build_teacher_messages_for_audit_rejects_unknown_style():
 
 
 from math_eval.opd_training_dynamics_audit import render_alignment_svg, render_single_run_svg
+
+
+def test_score_response_logits_supports_response_window():
+    class Encoded:
+        def __init__(self, ids):
+            self.input_ids = torch.tensor([ids])
+
+    class FakeTokenizer:
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, **kwargs):
+            return "P0 P1"
+
+        def __call__(self, text, return_tensors="pt", add_special_tokens=False):
+            ids = list(range(len(text.split())))
+            return Encoded(ids)
+
+    class FakeOutput:
+        def __init__(self, logits):
+            self.logits = logits
+
+    class FakeModel:
+        device = torch.device("cpu")
+
+        def __call__(self, input_ids):
+            seq_len = input_ids.shape[1]
+            logits = torch.arange(seq_len, dtype=torch.float32).view(1, seq_len, 1).expand(1, seq_len, 3)
+            return FakeOutput(logits)
+
+    logits = score_response_logits(
+        FakeModel(),
+        FakeTokenizer(),
+        [{"role": "user", "content": "ignored"}],
+        "R0 R1 R2 R3",
+        max_score_tokens=2,
+        window_start=1,
+    )
+    assert logits.shape == (1, 2, 3)
+    # prompt length is 2. Response token 1 is predicted at absolute position 2.
+    assert logits[0, :, 0].tolist() == [2.0, 3.0]
 
 
 def test_render_alignment_svg_writes_prompt_styles(tmp_path):
