@@ -143,3 +143,232 @@ def parse_wandb_output_log(text: str, run_name: str, source_path: str) -> list[d
         rows.append(normalize_record(record))
     rows.sort(key=lambda row: (str(row.get("run_name", "")), float(row.get("step", 0.0))))
     return rows
+
+
+RUN_COLORS = {
+    "raw_opd": "#1f77b4",
+    "hardtrunc_budget": "#d62728",
+    "hardtrunc_budget_resume75": "#e377c2",
+    "hardtrunc_concise": "#ff7f0e",
+    "hardtrunc_normal": "#2ca02c",
+}
+
+
+def load_default_log_metrics(repo_dir: Path) -> list[dict[str, float | str]]:
+    rows: list[dict[str, float | str]] = []
+    for spec in default_run_specs():
+        path = repo_dir / spec.log_path
+        if not path.exists():
+            continue
+        parsed = parse_wandb_output_log(path.read_text(errors="ignore"), run_name=spec.name, source_path=str(path))
+        for row in parsed:
+            row["run_group"] = spec.group
+        rows.extend(parsed)
+    rows.sort(key=lambda row: (str(row.get("run_name", "")), float(row.get("step", 0.0))))
+    return rows
+
+
+def write_csv(rows: list[dict[str, float | str]], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    preferred = [
+        "run_name",
+        "step",
+        "run_group",
+        "wandb_step",
+        "source_path",
+        "original_rollout_length_mean",
+        "supervised_length_mean",
+        "has_tale_original_length",
+        "response_length/max",
+        "response_length/clip_ratio",
+        "response/aborted_ratio",
+        "tale_budget/esr_tokens_mean",
+        "tale_budget/esr_supervised_fraction_mean",
+        "critic/score/mean",
+        "actor/entropy",
+        "actor/grad_norm",
+        "rollout_corr/chi2_seq",
+        "rollout_corr/log_ppl_abs_diff",
+        "rollout_corr/skipped_no_valid_tokens",
+    ]
+    keys = list(preferred)
+    for row in rows:
+        for key in row:
+            if key not in keys:
+                keys.append(key)
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def _group_rows(rows: list[dict[str, float | str]]) -> dict[str, list[dict[str, float | str]]]:
+    grouped: dict[str, list[dict[str, float | str]]] = {}
+    for row in rows:
+        grouped.setdefault(str(row.get("run_name", "unknown")), []).append(row)
+    for group_rows in grouped.values():
+        group_rows.sort(key=lambda row: float(row.get("step", 0.0)))
+    return grouped
+
+
+def _polyline(points: list[tuple[float, float]], color: str, width: float = 2.0) -> str:
+    if not points:
+        return ""
+    encoded = " ".join(f"{x:.1f},{y:.1f}" for x, y in points)
+    return f'<polyline points="{encoded}" fill="none" stroke="{color}" stroke-width="{width}"/>'
+
+
+def render_macro_svg(rows: list[dict[str, float | str]], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    grouped = _group_rows(rows)
+    width, height = 1180, 760
+    margin_left, margin_top = 70, 70
+    panel_w, panel_h = 470, 245
+    gap_x, gap_y = 70, 75
+    panels = [
+        ("Original rollout length", "original_rollout_length_mean", 0.0, None),
+        ("Supervised/training length", "supervised_length_mean", 0.0, None),
+        ("Score", "critic/score/mean", 0.0, 1.0),
+        ("Actor entropy", "actor/entropy", 0.0, None),
+    ]
+    max_step = max(float(row.get("step", 0.0)) for row in rows) if rows else 1.0
+    lines = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="white"/>',
+        '<style>text{font-family:Arial,Helvetica,sans-serif;fill:#1f2933}.title{font-size:22px;font-weight:700}.axis{font-size:12px;fill:#52616b}.label{font-size:13px}</style>',
+        '<text x="590" y="34" text-anchor="middle" class="title">AIME-independent training dynamics</text>',
+        '<text x="590" y="55" text-anchor="middle" class="axis">Hardtrunc original rollout length uses tale_budget/response_length_mean when available</text>',
+    ]
+    for idx, (title, key, ymin_fixed, ymax_fixed) in enumerate(panels):
+        col = idx % 2
+        row_idx = idx // 2
+        x0 = margin_left + col * (panel_w + gap_x)
+        y0 = margin_top + row_idx * (panel_h + gap_y)
+        vals = [float(row[key]) for row in rows if key in row and not math.isnan(float(row[key]))]
+        ymin = ymin_fixed
+        ymax = ymax_fixed if ymax_fixed is not None else (max(vals) * 1.08 if vals else 1.0)
+        if ymax <= ymin:
+            ymax = ymin + 1.0
+        lines.append(f'<text x="{x0 + panel_w / 2:.1f}" y="{y0 - 14:.1f}" text-anchor="middle" class="label">{title}</text>')
+        lines.append(f'<rect x="{x0}" y="{y0}" width="{panel_w}" height="{panel_h}" fill="#fbfcfd" stroke="#d9e2ec"/>')
+        for tick in range(0, 6):
+            gx = x0 + panel_w * tick / 5
+            gy = y0 + panel_h * tick / 5
+            lines.append(f'<line x1="{gx:.1f}" y1="{y0}" x2="{gx:.1f}" y2="{y0 + panel_h}" stroke="#edf2f7"/>')
+            lines.append(f'<line x1="{x0}" y1="{gy:.1f}" x2="{x0 + panel_w}" y2="{gy:.1f}" stroke="#edf2f7"/>')
+        for run_name, group_rows in grouped.items():
+            pts: list[tuple[float, float]] = []
+            for rec in group_rows:
+                if key not in rec:
+                    continue
+                value = float(rec[key])
+                if math.isnan(value):
+                    continue
+                sx = x0 + panel_w * float(rec.get("step", 0.0)) / max_step
+                sy = y0 + panel_h * (ymax - value) / (ymax - ymin)
+                pts.append((sx, sy))
+            lines.append(_polyline(pts, RUN_COLORS.get(run_name, "#64748b"), width=2.2))
+        lines.append(f'<text x="{x0}" y="{y0 + panel_h + 18}" class="axis">step 0</text>')
+        lines.append(f'<text x="{x0 + panel_w}" y="{y0 + panel_h + 18}" text-anchor="end" class="axis">step {max_step:.0f}</text>')
+        lines.append(f'<text x="{x0 - 8}" y="{y0 + 4}" text-anchor="end" class="axis">{ymax:.2g}</text>')
+        lines.append(f'<text x="{x0 - 8}" y="{y0 + panel_h}" text-anchor="end" class="axis">{ymin:.2g}</text>')
+    legend_x, legend_y = 920, 645
+    lines.append(f'<text x="{legend_x}" y="{legend_y}" class="label">Legend</text>')
+    offset = 24
+    for run_name in grouped:
+        color = RUN_COLORS.get(run_name, "#64748b")
+        y = legend_y + offset
+        lines.append(f'<line x1="{legend_x}" y1="{y}" x2="{legend_x + 28}" y2="{y}" stroke="{color}" stroke-width="3"/>')
+        lines.append(f'<text x="{legend_x + 36}" y="{y + 4}" class="axis">{run_name}</text>')
+        offset += 20
+    lines.append("</svg>")
+    path.write_text("\n".join(lines))
+
+
+def summarize_run_lengths(rows: list[dict[str, float | str]]) -> dict[str, dict[str, float]]:
+    summary: dict[str, dict[str, float]] = {}
+    for run_name, group_rows in _group_rows(rows).items():
+        valid = [
+            row
+            for row in group_rows
+            if "original_rollout_length_mean" in row and not math.isnan(float(row["original_rollout_length_mean"]))
+        ]
+        if not valid:
+            continue
+        peak = max(valid, key=lambda row: float(row["original_rollout_length_mean"]))
+        final = max(valid, key=lambda row: float(row.get("step", 0.0)))
+        summary[run_name] = {
+            "peak_step": float(peak.get("step", 0.0)),
+            "peak_original_rollout_length": float(peak["original_rollout_length_mean"]),
+            "final_step": float(final.get("step", 0.0)),
+            "final_original_rollout_length": float(final["original_rollout_length_mean"]),
+        }
+    return summary
+
+
+def write_summary(rows: list[dict[str, float | str]], out_dir: Path) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    length_summary = summarize_run_lengths(rows)
+    lines = [
+        "# OPD Training Dynamics Offline Audit",
+        "",
+        "This report is generated from existing local W&B logs only. It does not launch training.",
+        "",
+        "## Macro length summary",
+        "",
+        "| run | peak step | peak original rollout length | final step | final original rollout length |",
+        "|---|---:|---:|---:|---:|",
+    ]
+    for run_name, stats in sorted(length_summary.items()):
+        lines.append(
+            f"| {run_name} | {stats['peak_step']:.0f} | {stats['peak_original_rollout_length']:.1f} | "
+            f"{stats['final_step']:.0f} | {stats['final_original_rollout_length']:.1f} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Initial interpretation",
+            "",
+            "- Raw OPD should be inspected around its peak-length step for truncation-repetition inflation.",
+            "- Concise-teacher hardtrunc should be inspected for entropy collapse and short-mode attraction.",
+            "- Rollout-length-budget hardtrunc should be inspected using original rollout length, not supervised length.",
+            "",
+            "## Limitations",
+            "",
+            "- Step18/19 mechanism-level proof requires step18/19 checkpoints. If unavailable, token-level claims are limited to available checkpoints and log-level consistency.",
+        ]
+    )
+    (out_dir / "summary.md").write_text("\n".join(lines))
+
+
+def run_macro(args: argparse.Namespace) -> None:
+    repo_dir = Path(args.repo_dir).resolve()
+    out_dir = Path(args.output_dir)
+    if not out_dir.is_absolute():
+        out_dir = repo_dir / out_dir
+    rows = load_default_log_metrics(repo_dir)
+    write_csv(rows, out_dir / "metrics_by_step.csv")
+    render_macro_svg(rows, out_dir / "macro_length_score_entropy_grad.svg")
+    write_summary(rows, out_dir)
+    print(f"wrote {out_dir}")
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    macro = sub.add_parser("macro", help="parse W&B logs and render macro curves")
+    macro.add_argument("--repo-dir", default="/home/mchen/FiRe-OPD")
+    macro.add_argument("--output-dir", default="math_eval/opd_training_dynamics_audit")
+    macro.set_defaults(func=run_macro)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

@@ -73,3 +73,57 @@ def test_default_run_specs_include_required_runs():
     assert "hardtrunc_budget" in names
     assert "hardtrunc_concise" in names
     assert "hardtrunc_normal" in names
+
+
+from math_eval.opd_training_dynamics_audit import write_csv, render_macro_svg, summarize_run_lengths
+
+
+def test_write_csv_includes_normalized_fields(tmp_path):
+    rows = [
+        {"run_name": "r", "step": 1.0, "supervised_length_mean": 10.0, "original_rollout_length_mean": 50.0},
+        {"run_name": "r", "step": 2.0, "supervised_length_mean": 20.0, "original_rollout_length_mean": 60.0},
+    ]
+    out = tmp_path / "metrics.csv"
+    write_csv(rows, out)
+    text = out.read_text()
+    assert "run_name,step" in text
+    assert "original_rollout_length_mean" in text
+    assert "60.0" in text
+
+
+def test_render_macro_svg_writes_series_labels(tmp_path):
+    rows = [
+        {"run_name": "raw_opd", "step": 1.0, "original_rollout_length_mean": 1500.0, "supervised_length_mean": 1500.0, "critic/score/mean": 0.5, "actor/entropy": 0.3, "actor/grad_norm": 4.0},
+        {"run_name": "raw_opd", "step": 2.0, "original_rollout_length_mean": 2500.0, "supervised_length_mean": 2500.0, "critic/score/mean": 0.6, "actor/entropy": 0.2, "actor/grad_norm": 3.0},
+        {"run_name": "hardtrunc_concise", "step": 1.0, "original_rollout_length_mean": 1500.0, "supervised_length_mean": 300.0, "critic/score/mean": 0.5, "actor/entropy": 0.3, "actor/grad_norm": 12.0},
+    ]
+    out = tmp_path / "macro.svg"
+    render_macro_svg(rows, out)
+    svg = out.read_text()
+    assert "AIME-independent training dynamics" in svg
+    assert "raw_opd" in svg
+    assert "hardtrunc_concise" in svg
+    assert "Original rollout length" in svg
+
+
+def test_summarize_run_lengths_reports_peak_and_final():
+    rows = [
+        {"run_name": "raw_opd", "step": 1.0, "original_rollout_length_mean": 1500.0},
+        {"run_name": "raw_opd", "step": 19.0, "original_rollout_length_mean": 8218.8},
+        {"run_name": "raw_opd", "step": 69.0, "original_rollout_length_mean": 4895.8},
+    ]
+    summary = summarize_run_lengths(rows)
+    assert summary["raw_opd"]["peak_step"] == 19.0
+    assert summary["raw_opd"]["peak_original_rollout_length"] == 8218.8
+    assert summary["raw_opd"]["final_original_rollout_length"] == 4895.8
+
+
+def test_summarize_run_lengths_ignores_nan_lengths():
+    rows = [
+        {"run_name": "raw_opd", "step": 0.0, "original_rollout_length_mean": float("nan")},
+        {"run_name": "raw_opd", "step": 19.0, "original_rollout_length_mean": 8218.8},
+        {"run_name": "raw_opd", "step": 69.0, "original_rollout_length_mean": 4895.8},
+    ]
+    summary = summarize_run_lengths(rows)
+    assert summary["raw_opd"]["peak_step"] == 19.0
+    assert summary["raw_opd"]["final_step"] == 69.0
