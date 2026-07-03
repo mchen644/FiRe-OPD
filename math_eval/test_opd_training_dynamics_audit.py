@@ -253,3 +253,31 @@ def test_build_teacher_messages_for_audit_concise_inserts_concise_instruction():
 def test_build_teacher_messages_for_audit_rejects_unknown_style():
     with pytest.raises(ValueError, match="style"):
         build_teacher_messages_for_audit("Problem text", None, style="shortest", budget=None)
+
+
+from math_eval.opd_training_dynamics_audit import render_alignment_svg, render_single_run_svg
+
+
+def test_render_alignment_svg_writes_prompt_styles(tmp_path):
+    rows = [
+        {"teacher_prompt_style": "normal", "topk_overlap_ratio": 0.8, "overlap_student_mass": 0.9, "student_entropy": 1.2, "teacher_entropy": 1.1, "entropy_gap": 0.1},
+        {"teacher_prompt_style": "concise", "topk_overlap_ratio": 0.6, "overlap_student_mass": 0.95, "student_entropy": 0.5, "teacher_entropy": 0.4, "entropy_gap": 0.1},
+    ]
+    out = tmp_path / "alignment.svg"
+    render_alignment_svg(rows, out)
+    svg = out.read_text()
+    assert "Teacher prompt style alignment metrics" in svg
+    assert "normal" in svg
+    assert "concise" in svg
+
+
+def test_render_single_run_svg_filters_other_runs(tmp_path):
+    rows = [
+        {"run_name": "raw_opd", "step": 1.0, "original_rollout_length_mean": 1500.0, "supervised_length_mean": 1500.0, "critic/score/mean": 0.5, "actor/entropy": 0.3},
+        {"run_name": "hardtrunc_normal", "step": 1.0, "original_rollout_length_mean": 1000.0, "supervised_length_mean": 200.0, "critic/score/mean": 0.4, "actor/entropy": 0.2},
+    ]
+    out = tmp_path / "single.svg"
+    render_single_run_svg(rows, "raw_opd", out)
+    svg = out.read_text()
+    assert "raw_opd" in svg
+    assert "hardtrunc_normal" not in svg

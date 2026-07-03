@@ -698,6 +698,57 @@ def run_alignment(args: argparse.Namespace) -> None:
     print(f"wrote {out_dir / 'alignment_metrics.csv'}")
 
 
+def render_single_run_svg(rows: list[dict[str, float | str]], run_name: str, path: Path) -> None:
+    selected = [row for row in rows if row.get("run_name") == run_name]
+    render_macro_svg(selected, path)
+
+
+def render_alignment_svg(alignment_rows: list[dict[str, float | str]], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    width, height = 760, 420
+    styles = sorted({str(row.get("teacher_prompt_style", "unknown")) for row in alignment_rows})
+    metrics = ["topk_overlap_ratio", "overlap_student_mass", "student_entropy", "teacher_entropy", "entropy_gap"]
+    means: dict[tuple[str, str], float] = {}
+    for style in styles:
+        style_rows = [row for row in alignment_rows if row.get("teacher_prompt_style") == style]
+        for metric in metrics:
+            vals = [float(row[metric]) for row in style_rows if metric in row and not math.isnan(float(row[metric]))]
+            means[(style, metric)] = statistics.fmean(vals) if vals else float("nan")
+    bar_w = 28
+    group_gap = 34
+    x0, y0 = 80, 330
+    max_val = max([value for value in means.values() if not math.isnan(value)] + [1.0])
+    lines = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="white"/>',
+        '<style>text{font-family:Arial,Helvetica,sans-serif;fill:#1f2933}.title{font-size:20px;font-weight:700}.axis{font-size:12px;fill:#52616b}</style>',
+        '<text x="380" y="32" text-anchor="middle" class="title">Teacher prompt style alignment metrics</text>',
+        f'<line x1="{x0}" y1="{y0}" x2="700" y2="{y0}" stroke="#1f2933"/>',
+    ]
+    colors = {"normal": "#2ca02c", "budget": "#d62728", "concise": "#ff7f0e"}
+    x = x0
+    for metric in metrics:
+        lines.append(f'<text x="{x + 35}" y="{y0 + 42}" text-anchor="middle" class="axis">{metric}</text>')
+        for style in styles:
+            value = means[(style, metric)]
+            if math.isnan(value):
+                height_px = 0.0
+            else:
+                height_px = 250.0 * value / max_val
+            lines.append(
+                f'<rect x="{x}" y="{y0 - height_px:.1f}" width="{bar_w}" height="{height_px:.1f}" fill="{colors.get(style, "#64748b")}"/>'
+            )
+            x += bar_w + 3
+        x += group_gap
+    lx, ly = 560, 70
+    for style in styles:
+        lines.append(f'<rect x="{lx}" y="{ly}" width="14" height="14" fill="{colors.get(style, "#64748b")}"/>')
+        lines.append(f'<text x="{lx + 20}" y="{ly + 12}" class="axis">{style}</text>')
+        ly += 22
+    lines.append("</svg>")
+    path.write_text("\n".join(lines))
+
+
 def run_macro(args: argparse.Namespace) -> None:
     repo_dir = Path(args.repo_dir).resolve()
     out_dir = Path(args.output_dir)
