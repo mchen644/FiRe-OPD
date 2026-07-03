@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from math_eval.opd_training_dynamics_audit import (
@@ -127,3 +128,57 @@ def test_summarize_run_lengths_ignores_nan_lengths():
     summary = summarize_run_lengths(rows)
     assert summary["raw_opd"]["peak_step"] == 19.0
     assert summary["raw_opd"]["final_step"] == 69.0
+
+
+from math_eval.opd_training_dynamics_audit import (
+    compression_repetition_ratio,
+    ngram_repetition_rate,
+    iter_eval_responses,
+    compute_repetition_metrics,
+)
+
+
+def test_compression_repetition_ratio_higher_for_repetitive_text():
+    repetitive = "wait wait wait wait wait wait wait wait " * 30
+    diverse = "We solve by substituting x, simplifying a quadratic, and checking the boundary cases. " * 4
+    assert compression_repetition_ratio(repetitive) > compression_repetition_ratio(diverse)
+
+
+def test_ngram_repetition_rate_counts_repeated_ngrams():
+    tokens = "a b c a b c a b c d e".split()
+    assert ngram_repetition_rate(tokens, n=3) > 0.0
+    assert ngram_repetition_rate(["a", "b"], n=3) == 0.0
+
+
+def test_iter_eval_responses_reads_problem_level_schema(tmp_path):
+    path = tmp_path / "eval.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "problem": "p0",
+                "responses": ["short", "long long long"],
+                "response_lengths": [1, 3],
+                "acc_list": [True, False],
+            }
+        )
+        + "\n"
+    )
+    rows = list(iter_eval_responses(path, run_name="r"))
+    assert len(rows) == 2
+    assert rows[0]["run_name"] == "r"
+    assert rows[0]["problem_index"] == 0
+    assert rows[1]["sample_index"] == 1
+    assert rows[1]["is_correct"] == 0.0
+
+
+def test_compute_repetition_metrics_flags_truncated_length():
+    rows = [
+        {"run_name": "r", "response": "a b c", "response_length": 3.0, "is_correct": 1.0},
+        {"run_name": "r", "response": "wait " * 100, "response_length": 16384.0, "is_correct": 0.0},
+    ]
+    metrics = compute_repetition_metrics(rows, max_token_length=16384)
+    assert len(metrics) == 1
+    assert metrics[0]["run_name"] == "r"
+    assert metrics[0]["num_responses"] == 2.0
+    assert metrics[0]["truncation_rate"] == 0.5
+    assert metrics[0]["mean_compression_repetition_ratio"] > 0.0

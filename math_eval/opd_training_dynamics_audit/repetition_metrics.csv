@@ -1,0 +1,4 @@
+run_name,step,run_group,wandb_step,source_path,original_rollout_length_mean,supervised_length_mean,has_tale_original_length,response_length/max,response_length/clip_ratio,response/aborted_ratio,tale_budget/esr_tokens_mean,tale_budget/esr_supervised_fraction_mean,critic/score/mean,actor/entropy,actor/grad_norm,rollout_corr/chi2_seq,rollout_corr/log_ppl_abs_diff,rollout_corr/skipped_no_valid_tokens,num_responses,mean_response_length,accuracy,truncation_rate,mean_compression_repetition_ratio,mean_4gram_repetition_rate
+budget20,,,,,,,,,,,,,,,,,,,960.0,7245.317708333333,0.49166666666666664,0.08125,0.6987649252095599,0.17630290831441617
+normal20,,,,,,,,,,,,,,,,,,,960.0,8106.188541666666,0.5114583333333333,0.134375,0.7033937203502973,0.17846492599950722
+raw_opd,,,,,,,,,,,,,,,,,,,960.0,9219.605208333332,0.5614583333333333,0.19375,0.7105372457677551,0.19018189654326784

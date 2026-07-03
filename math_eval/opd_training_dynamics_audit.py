@@ -342,6 +342,103 @@ def write_summary(rows: list[dict[str, float | str]], out_dir: Path) -> None:
     (out_dir / "summary.md").write_text("\n".join(lines))
 
 
+def compression_repetition_ratio(text: str) -> float:
+    """Return a compressibility-based repetition score in [0, 1].
+
+    Higher values mean the text is easier to compress and therefore more
+    repetition-like. This is a transparent proxy for 2604.08527's
+    compression-based repetition lens.
+    """
+
+    raw = text.encode("utf-8", errors="ignore")
+    if not raw:
+        return 0.0
+    compressed = zlib.compress(raw, level=9)
+    return max(0.0, min(1.0, 1.0 - len(compressed) / max(1, len(raw))))
+
+
+def ngram_repetition_rate(tokens: list[str], n: int) -> float:
+    if n <= 0:
+        raise ValueError("n must be positive")
+    if len(tokens) < n:
+        return 0.0
+    ngrams = [tuple(tokens[i : i + n]) for i in range(len(tokens) - n + 1)]
+    if not ngrams:
+        return 0.0
+    seen: set[tuple[str, ...]] = set()
+    repeated = 0
+    for ngram in ngrams:
+        if ngram in seen:
+            repeated += 1
+        else:
+            seen.add(ngram)
+    return repeated / len(ngrams)
+
+
+def iter_eval_responses(path: Path, run_name: str) -> Iterable[dict[str, Any]]:
+    """Yield one row per response from FiRe-OPD eval JSONL outputs."""
+
+    with path.open() as f:
+        for problem_index, line in enumerate(f):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            responses = row.get("responses", [])
+            lengths = row.get("response_lengths", [float("nan")] * len(responses))
+            acc_list = row.get("acc_list", [False] * len(responses))
+            for sample_index, response in enumerate(responses):
+                yield {
+                    "run_name": run_name,
+                    "source_path": str(path),
+                    "problem_index": float(problem_index),
+                    "sample_index": float(sample_index),
+                    "response": str(response),
+                    "response_length": float(lengths[sample_index]) if sample_index < len(lengths) else float("nan"),
+                    "is_correct": 1.0 if sample_index < len(acc_list) and bool(acc_list[sample_index]) else 0.0,
+                }
+
+
+def compute_repetition_metrics(rows: Iterable[dict[str, Any]], max_token_length: int | None) -> list[dict[str, float | str]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(str(row["run_name"]), []).append(row)
+    out: list[dict[str, float | str]] = []
+    for run_name, group_rows in sorted(grouped.items()):
+        compression_scores = [compression_repetition_ratio(str(row.get("response", ""))) for row in group_rows]
+        unigram_tokens = [str(row.get("response", "")).split() for row in group_rows]
+        rep4 = [ngram_repetition_rate(tokens, 4) for tokens in unigram_tokens]
+        lengths = [float(row.get("response_length", float("nan"))) for row in group_rows]
+        correct = [float(row.get("is_correct", 0.0)) for row in group_rows]
+        if max_token_length is None:
+            truncation_rate = float("nan")
+        else:
+            truncation_rate = sum(1 for length in lengths if length >= max_token_length) / max(1, len(lengths))
+        out.append(
+            {
+                "run_name": run_name,
+                "num_responses": float(len(group_rows)),
+                "mean_response_length": statistics.fmean(lengths) if lengths else float("nan"),
+                "accuracy": statistics.fmean(correct) if correct else float("nan"),
+                "truncation_rate": truncation_rate,
+                "mean_compression_repetition_ratio": statistics.fmean(compression_scores) if compression_scores else float("nan"),
+                "mean_4gram_repetition_rate": statistics.fmean(rep4) if rep4 else float("nan"),
+            }
+        )
+    return out
+
+
+def run_repetition(args: argparse.Namespace) -> None:
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rows: list[dict[str, Any]] = []
+    for item in args.eval_jsonl:
+        run_name, path_str = item.split("=", 1)
+        rows.extend(iter_eval_responses(Path(path_str), run_name=run_name))
+    metrics = compute_repetition_metrics(rows, max_token_length=args.max_token_length)
+    write_csv(metrics, out_dir / "repetition_metrics.csv")
+    print(f"wrote {out_dir / 'repetition_metrics.csv'}")
+
+
 def run_macro(args: argparse.Namespace) -> None:
     repo_dir = Path(args.repo_dir).resolve()
     out_dir = Path(args.output_dir)
@@ -361,6 +458,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     macro.add_argument("--repo-dir", default="/home/mchen/FiRe-OPD")
     macro.add_argument("--output-dir", default="math_eval/opd_training_dynamics_audit")
     macro.set_defaults(func=run_macro)
+
+    repetition = sub.add_parser("repetition", help="compute response-level repetition metrics from eval JSONL")
+    repetition.add_argument("--output-dir", default="math_eval/opd_training_dynamics_audit")
+    repetition.add_argument("--max-token-length", type=int, default=16384)
+    repetition.add_argument(
+        "--eval-jsonl",
+        action="append",
+        required=True,
+        help="Named eval output in the form run_name=/path/to/output.jsonl. Can be repeated.",
+    )
+    repetition.set_defaults(func=run_repetition)
     return parser
 
 
