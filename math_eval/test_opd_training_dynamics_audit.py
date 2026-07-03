@@ -245,6 +245,13 @@ def test_build_teacher_messages_for_audit_budget_inserts_budget():
     assert "Problem text" in messages[0]["content"]
 
 
+def test_build_teacher_messages_for_audit_budget_strips_verbose_instruction():
+    question = "Problem text\nPlease reason step by step, and put your final answer within \\boxed{}."
+    messages = build_teacher_messages_for_audit(question, None, style="budget", budget=512)
+    assert messages[0]["content"].count("Please reason step by step") == 0
+    assert messages[0]["content"].startswith("Problem text\nLet's think step by step")
+
+
 def test_build_teacher_messages_for_audit_concise_inserts_concise_instruction():
     messages = build_teacher_messages_for_audit("Problem text", None, style="concise", budget=None)
     assert "Solve concisely" in messages[0]["content"]

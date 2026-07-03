@@ -541,7 +541,7 @@ def compute_position_binned_alignment(student_logits, teacher_logits, mask=None,
 
 
 _FIRE_OPD_VERBOSE_RE = re.compile(
-    r"\s*Please reason step by step, and put your final answer within \\\\boxed\{\}\.\s*$"
+    r"\s*Please reason step by step, and put your final answer within \\boxed\{\}\.\s*$"
 )
 
 
