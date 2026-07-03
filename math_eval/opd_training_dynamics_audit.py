@@ -540,6 +540,164 @@ def compute_position_binned_alignment(student_logits, teacher_logits, mask=None,
     return out
 
 
+_FIRE_OPD_VERBOSE_RE = re.compile(
+    r"\s*Please reason step by step, and put your final answer within \\\\boxed\{\}\.\s*$"
+)
+
+
+def _strip_fire_opd_verbose_instruction(question: str) -> str:
+    return _FIRE_OPD_VERBOSE_RE.sub("", question).strip()
+
+
+def build_teacher_messages_for_audit(
+    question: str,
+    raw_messages: list[dict[str, str]] | None,
+    style: str,
+    budget: int | None,
+) -> list[dict[str, str]]:
+    if style == "normal":
+        if raw_messages is not None:
+            return [dict(message) for message in raw_messages]
+        return [{"role": "user", "content": question}]
+    stripped_question = _strip_fire_opd_verbose_instruction(question)
+    if style == "budget":
+        if budget is None:
+            raise ValueError("budget style requires budget")
+        content = (
+            f"{stripped_question}\n"
+            f"Let's think step by step and use less than {int(budget)} tokens. "
+            r"Put your final answer within \boxed{}."
+        )
+        return [{"role": "user", "content": content}]
+    if style == "concise":
+        content = (
+            f"{stripped_question}\n"
+            r"Solve concisely. Avoid unnecessary explanation. Put your final answer within \boxed{}."
+        )
+        return [{"role": "user", "content": content}]
+    raise ValueError(f"style must be one of normal, budget, concise; got {style!r}")
+
+
+def _apply_chat_template(tokenizer, messages: list[dict[str, str]]) -> str:
+    try:
+        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+    except TypeError:
+        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+
+def score_response_logits(model, tokenizer, messages: list[dict[str, str]], response: str, max_score_tokens: int):
+    """Return logits for response-token positions under prompt+response.
+
+    This is lazy-heavy and intended for small diagnostic subsets. It returns a
+    tensor with shape [1, scored_response_tokens, vocab].
+    """
+
+    import torch
+
+    prompt_text = _apply_chat_template(tokenizer, messages)
+    prompt_ids = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False).input_ids.to(model.device)
+    response_ids = tokenizer(response, return_tensors="pt", add_special_tokens=False).input_ids.to(model.device)
+    if max_score_tokens > 0:
+        response_ids = response_ids[:, :max_score_tokens]
+    input_ids = torch.cat([prompt_ids, response_ids], dim=1)
+    with torch.no_grad():
+        output = model(input_ids=input_ids)
+    prompt_len = prompt_ids.shape[1]
+    response_len = response_ids.shape[1]
+    if response_len == 0:
+        return output.logits[:, :0, :]
+    return output.logits[:, prompt_len - 1 : prompt_len - 1 + response_len, :]
+
+
+def _load_transformers_model(model_path: str, dtype: str, device_map: str):
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    torch_dtype = {"auto": "auto", "bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[
+        dtype
+    ]
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype=torch_dtype,
+        device_map=device_map,
+        trust_remote_code=True,
+    )
+    model.eval()
+    return model, tokenizer
+
+
+def _iter_alignment_eval_rows(path: Path, max_prompts: int, max_responses_per_prompt: int):
+    with path.open() as f:
+        for problem_index, line in enumerate(f):
+            if max_prompts >= 0 and problem_index >= max_prompts:
+                break
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            problem = str(row.get("problem", row.get("question", "")))
+            responses = list(row.get("responses", []))[:max_responses_per_prompt]
+            lengths = row.get("response_lengths", [])
+            for sample_index, response in enumerate(responses):
+                yield {
+                    "problem_index": problem_index,
+                    "sample_index": sample_index,
+                    "question": problem,
+                    "response": str(response),
+                    "budget": int(lengths[sample_index]) if sample_index < len(lengths) else None,
+                }
+
+
+def run_alignment(args: argparse.Namespace) -> None:
+    import torch
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    student_model, student_tokenizer = _load_transformers_model(args.student_model, args.dtype, args.device_map)
+    teacher_model, teacher_tokenizer = _load_transformers_model(args.teacher_model, args.dtype, args.device_map)
+    rows: list[dict[str, float | str]] = []
+    for item in _iter_alignment_eval_rows(Path(args.responses_jsonl), args.max_prompts, args.max_responses_per_prompt):
+        student_messages = [{"role": "user", "content": item["question"]}]
+        student_logits = score_response_logits(
+            student_model,
+            student_tokenizer,
+            student_messages,
+            item["response"],
+            max_score_tokens=args.max_score_tokens,
+        )
+        for style in args.teacher_prompt_style:
+            teacher_messages = build_teacher_messages_for_audit(
+                question=item["question"],
+                raw_messages=student_messages,
+                style=style,
+                budget=item["budget"],
+            )
+            teacher_logits = score_response_logits(
+                teacher_model,
+                teacher_tokenizer,
+                teacher_messages,
+                item["response"],
+                max_score_tokens=args.max_score_tokens,
+            )
+            seq = min(student_logits.shape[1], teacher_logits.shape[1])
+            metrics = compute_topk_alignment_metrics(
+                student_logits[:, :seq, :].to(dtype=torch.float32),
+                teacher_logits[:, :seq, :].to(dtype=torch.float32),
+                k=args.top_k,
+            )
+            metrics.update(
+                {
+                    "teacher_prompt_style": style,
+                    "problem_index": float(item["problem_index"]),
+                    "sample_index": float(item["sample_index"]),
+                    "scored_tokens": float(seq),
+                }
+            )
+            rows.append(metrics)
+    write_csv(rows, out_dir / "alignment_metrics.csv")
+    print(f"wrote {out_dir / 'alignment_metrics.csv'}")
+
+
 def run_macro(args: argparse.Namespace) -> None:
     repo_dir = Path(args.repo_dir).resolve()
     out_dir = Path(args.output_dir)
@@ -570,6 +728,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Named eval output in the form run_name=/path/to/output.jsonl. Can be repeated.",
     )
     repetition.set_defaults(func=run_repetition)
+
+    alignment = sub.add_parser("alignment", help="score fixed responses for student-teacher top-k alignment")
+    alignment.add_argument("--output-dir", default="math_eval/opd_training_dynamics_audit")
+    alignment.add_argument("--responses-jsonl", required=True)
+    alignment.add_argument("--student-model", required=True)
+    alignment.add_argument("--teacher-model", required=True)
+    alignment.add_argument("--teacher-prompt-style", action="append", choices=["normal", "budget", "concise"], required=True)
+    alignment.add_argument("--top-k", type=int, default=16)
+    alignment.add_argument("--max-prompts", type=int, default=4)
+    alignment.add_argument("--max-responses-per-prompt", type=int, default=1)
+    alignment.add_argument("--max-score-tokens", type=int, default=512)
+    alignment.add_argument("--dtype", choices=["auto", "bfloat16", "float16", "float32"], default="bfloat16")
+    alignment.add_argument("--device-map", default="auto")
+    alignment.set_defaults(func=run_alignment)
     return parser
 
 

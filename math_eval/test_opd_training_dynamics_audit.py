@@ -228,3 +228,28 @@ def test_compute_position_binned_alignment_returns_requested_bins():
     assert bins[0]["position_bin"] == 0.0
     assert bins[-1]["position_bin"] == 3.0
     assert all(row["topk_overlap_ratio"] == pytest.approx(1.0) for row in bins)
+
+
+from math_eval.opd_training_dynamics_audit import build_teacher_messages_for_audit
+
+
+def test_build_teacher_messages_for_audit_normal_uses_raw_messages():
+    raw = [{"role": "user", "content": "Problem text\nPlease reason step by step, and put your final answer within \\boxed{}."}]
+    messages = build_teacher_messages_for_audit("Problem text", raw, style="normal", budget=None)
+    assert messages == raw
+
+
+def test_build_teacher_messages_for_audit_budget_inserts_budget():
+    messages = build_teacher_messages_for_audit("Problem text", None, style="budget", budget=512)
+    assert "less than 512 tokens" in messages[0]["content"]
+    assert "Problem text" in messages[0]["content"]
+
+
+def test_build_teacher_messages_for_audit_concise_inserts_concise_instruction():
+    messages = build_teacher_messages_for_audit("Problem text", None, style="concise", budget=None)
+    assert "Solve concisely" in messages[0]["content"]
+
+
+def test_build_teacher_messages_for_audit_rejects_unknown_style():
+    with pytest.raises(ValueError, match="style"):
+        build_teacher_messages_for_audit("Problem text", None, style="shortest", budget=None)
