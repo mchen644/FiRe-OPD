@@ -989,7 +989,7 @@ class DataParallelPPOActor(BasePPOActor):
                     # all return: (bsz, response_length)
                     # For entropy-aware distillation, always compute current student entropy
                     calculate_entropy = entropy_coeff != 0 or entropy_aware
-                    entropy, log_prob = self._forward_micro_batch(
+                    entropy, log_prob, _ = self._forward_micro_batch(
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
 
