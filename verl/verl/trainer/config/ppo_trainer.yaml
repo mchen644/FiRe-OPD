@@ -140,6 +140,84 @@ algorithm:
     # Whether no-correct groups with only teacher-rejected candidates are dropped from actor update
     drop_rejected_no_correct: True
 
+  # Online TALE token-budget teacher prompt configuration
+  tale_budget:
+
+    # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+    _target_: verl.trainer.config.TaleBudgetConfig
+
+    # Whether to enable TALE budgets before reference log-prob computation
+    enabled: False
+
+    # Budget source: llm_estimate uses an auxiliary generation; rollout_length uses alpha * student rollout length
+    source: llm_estimate
+
+    # Minimum normalized token budget for teacher prompts
+    min_budget: 128
+
+    # Maximum normalized token budget for teacher prompts
+    max_budget: 8192
+
+    # Token budget rounding interval
+    round_to: 64
+
+    # Token budget used when parsing the estimate fails
+    fallback_budget: 2048
+
+    # Maximum new tokens for the budget-estimation generation
+    estimation_max_tokens: 64
+
+    # Sampling temperature for budget-estimation generation
+    temperature: 0.0
+
+    # Top-p sampling value for budget-estimation generation
+    top_p: 1.0
+
+    # Non-tensor batch key used for budget-aware teacher prompts
+    teacher_prompt_key: teacher_prompt
+
+    # Alpha for source=rollout_length: budget = round(alpha * response_length)
+    rollout_length_alpha: 0.8
+
+    # Beta for source=rollout_length ESR mask: supervised_tokens = round(beta * budget)
+    esr_beta: 1.0
+
+    # Optional max budget for source=rollout_length; null means no budget/N max cap
+    rollout_length_max_budget: null
+
+    # Physically truncate ref/actor training tensors to the ESR prefix after full rollout/reward
+    truncate_to_esr: False
+
+    # If False, keep the teacher/ref prompt as the normal raw prompt while still computing budgets/ESR masks
+    use_budget_teacher_prompt: True
+
+    # Teacher/ref prompt style: auto maps legacy use_budget_teacher_prompt to budget or normal; concise uses no numeric budget
+    teacher_prompt_style: auto
+
+  # Training-time current-batch Rethinking OPD diagnostics
+  rethinking_opd_probe:
+
+    # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+    _target_: verl.trainer.config.RethinkingOpdProbeConfig
+
+    # Whether to enable current-batch Rethinking OPD diagnostics
+    enabled: False
+
+    # Number of top-k tokens used for overlap diagnostics
+    top_k: 16
+
+    # Response-token chunk size for depth-binned metrics
+    chunk_size: 1024
+
+    # Optional CSV sidecar path; null disables sidecar writing
+    csv_path: null
+
+    # Metric prefix for scalar logger keys
+    log_prefix: rethinking_opd
+
+    # Whether to add metrics to the normal training logger
+    include_scalar_logger: True
+
 # config for the trainer
 trainer:
 

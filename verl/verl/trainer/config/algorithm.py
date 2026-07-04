@@ -17,7 +17,15 @@ from typing import Any, Optional
 
 from verl.base_config import BaseConfig
 
-__all__ = ["AlgoConfig", "CandidateSelectionConfig", "FilterGroupsConfig", "KLControlConfig", "RolloutCorrectionConfig"]
+__all__ = [
+    "AlgoConfig",
+    "CandidateSelectionConfig",
+    "FilterGroupsConfig",
+    "KLControlConfig",
+    "RethinkingOpdProbeConfig",
+    "RolloutCorrectionConfig",
+    "TaleBudgetConfig",
+]
 
 
 @dataclass
@@ -343,6 +351,40 @@ class CandidateSelectionConfig(BaseConfig):
 
 
 @dataclass
+class TaleBudgetConfig(BaseConfig):
+    """Configuration for online TALE token-budget teacher prompts."""
+
+    enabled: bool = False
+    source: str = "llm_estimate"
+    min_budget: int = 128
+    max_budget: int = 8192
+    round_to: int = 64
+    fallback_budget: int = 2048
+    estimation_max_tokens: int = 64
+    temperature: float = 0.0
+    top_p: float = 1.0
+    teacher_prompt_key: str = "teacher_prompt"
+    rollout_length_alpha: float = 0.8
+    esr_beta: float = 1.0
+    rollout_length_max_budget: Optional[int] = None
+    truncate_to_esr: bool = False
+    use_budget_teacher_prompt: bool = True
+    teacher_prompt_style: str = "auto"
+
+
+@dataclass
+class RethinkingOpdProbeConfig(BaseConfig):
+    """Training-time current-batch Rethinking OPD diagnostics."""
+
+    enabled: bool = False
+    top_k: int = 16
+    chunk_size: int = 1024
+    csv_path: Optional[str] = None
+    log_prefix: str = "rethinking_opd"
+    include_scalar_logger: bool = True
+
+
+@dataclass
 class AlgoConfig(BaseConfig):
     """Configuration for the algorithm.
 
@@ -359,6 +401,7 @@ class AlgoConfig(BaseConfig):
         use_pf_ppo (bool): Whether to enable preference feedback PPO.
         pf_ppo (dict[str, Any]): Preference feedback PPO settings.
         filter_groups (Optional[FilterGroupsConfig]): Filter groups configuration, used in DAPO and Entropy
+        tale_budget (TaleBudgetConfig): Online TALE token-budget teacher prompt configuration.
         rollout_correction (Optional[RolloutCorrectionConfig]): Rollout Correction configuration.
             Addresses off-policy issues from policy mismatch, model staleness, and general distribution shifts.
 
@@ -386,6 +429,8 @@ class AlgoConfig(BaseConfig):
     pf_ppo: dict[str, Any] = field(default_factory=dict)
     filter_groups: Optional[FilterGroupsConfig] = None
     candidate_selection: Optional[CandidateSelectionConfig] = field(default_factory=CandidateSelectionConfig)
+    tale_budget: TaleBudgetConfig = field(default_factory=TaleBudgetConfig)
+    rethinking_opd_probe: RethinkingOpdProbeConfig = field(default_factory=RethinkingOpdProbeConfig)
     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None

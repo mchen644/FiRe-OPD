@@ -136,6 +136,57 @@ class TestAlgoConfig(unittest.TestCase):
 
         assert isinstance(algo_config, AlgoConfig)
 
+    def test_yaml_accepts_tale_budget_teacher_prompt_style_override(self):
+        import os
+
+        from hydra import compose, initialize_config_dir
+        from hydra.core.global_hydra import GlobalHydra
+
+        GlobalHydra.instance().clear()
+        try:
+            with initialize_config_dir(config_dir=os.path.abspath("verl/trainer/config")):
+                cfg = compose(
+                    config_name="ppo_trainer",
+                    overrides=["algorithm.tale_budget.teacher_prompt_style=concise"],
+                )
+        finally:
+            GlobalHydra.instance().clear()
+
+        assert cfg.algorithm.tale_budget.teacher_prompt_style == "concise"
+
+    def test_yaml_accepts_rethinking_opd_probe_overrides(self):
+        config = None
+
+        import os
+
+        from hydra import compose, initialize_config_dir
+        from hydra.core.global_hydra import GlobalHydra
+
+        GlobalHydra.instance().clear()
+        try:
+            with initialize_config_dir(config_dir=os.path.abspath("verl/trainer/config")):
+                config = omega_conf_to_dataclass(
+                    compose(
+                        config_name="ppo_trainer",
+                        overrides=[
+                            "algorithm.rethinking_opd_probe.enabled=True",
+                            "algorithm.rethinking_opd_probe.top_k=16",
+                            "algorithm.rethinking_opd_probe.chunk_size=1024",
+                            "algorithm.rethinking_opd_probe.csv_path=/tmp/rethinking_probe.csv",
+                            "algorithm.rethinking_opd_probe.log_prefix=rethinking_opd",
+                        ],
+                    ).algorithm
+                )
+        finally:
+            GlobalHydra.instance().clear()
+
+        probe = config.rethinking_opd_probe
+        assert probe.enabled is True
+        assert probe.top_k == 16
+        assert probe.chunk_size == 1024
+        assert probe.csv_path == "/tmp/rethinking_probe.csv"
+        assert probe.log_prefix == "rethinking_opd"
+
 
 class TestAlgoCompute(unittest.TestCase):
     """Test the AlgoConfig dataclass and its integration with core algorithms."""
