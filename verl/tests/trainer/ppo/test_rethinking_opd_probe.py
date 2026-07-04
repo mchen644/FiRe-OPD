@@ -6,8 +6,19 @@ import torch
 from verl.trainer.ppo.rethinking_opd_probe import (
     aggregate_rethinking_opd_probe_metrics,
     append_rethinking_opd_probe_csv,
+    compute_student_topk_from_logits,
     compute_teacher_topk_overlap,
 )
+
+
+def test_compute_student_topk_from_logits_returns_log_probs():
+    logits = torch.tensor([[[5.0, 4.0, 1.0], [0.0, 3.0, 2.0]]])
+
+    ids, log_probs = compute_student_topk_from_logits(logits, top_k=2)
+
+    assert ids.tolist() == [[[0, 1], [1, 2]]]
+    expected = torch.log_softmax(logits, dim=-1).gather(-1, ids)
+    assert torch.allclose(log_probs, expected)
 
 
 def test_compute_teacher_topk_overlap_marks_student_ids_in_teacher_topk():

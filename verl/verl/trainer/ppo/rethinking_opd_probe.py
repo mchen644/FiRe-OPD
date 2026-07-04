@@ -35,6 +35,16 @@ CSV_FIELDS = [
 ]
 
 
+def compute_student_topk_from_logits(logits: torch.Tensor, top_k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return top-k ids and log-probs from logits with shape `(..., vocab_size)`."""
+
+    if top_k <= 0:
+        raise ValueError("top_k must be positive")
+    top_k_logits, top_k_ids = torch.topk(logits, k=top_k, dim=-1)
+    logsumexp = torch.logsumexp(logits, dim=-1, keepdim=True)
+    return top_k_ids, top_k_logits - logsumexp
+
+
 def compute_teacher_topk_overlap(
     logits: torch.Tensor, student_top_k_ids: torch.Tensor, top_k: int
 ) -> dict[str, torch.Tensor]:

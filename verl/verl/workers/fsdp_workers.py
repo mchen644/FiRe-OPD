@@ -1003,12 +1003,23 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
+        data.meta_info["rethinking_opd_probe_top_k"] = data.meta_info.get("rethinking_opd_probe_top_k", 0)
+        top_k = int(data.meta_info["rethinking_opd_probe_top_k"] or 0)
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             with adapter_ctx:
-                output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+                if top_k > 0:
+                    output, entropys, probe_tensors = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+                else:
+                    output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+                    probe_tensors = {}
+            tensors = {"old_log_probs": output, "entropys": entropys}
+            if probe_tensors:
+                tensors.update(probe_tensors)
+                if entropys is not None:
+                    tensors["student_entropys"] = entropys
             output = DataProto.from_dict(
-                tensors={"old_log_probs": output, "entropys": entropys},
+                tensors=tensors,
                 meta_info={"temperature": self.config.rollout.temperature},
             )
 

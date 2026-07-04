@@ -225,7 +225,12 @@ class DataParallelPPOActor(BasePPOActor):
             self.scaler = None
 
     def _forward_micro_batch(
-        self, micro_batch, temperature, calculate_entropy=False
+        self,
+        micro_batch,
+        temperature,
+        calculate_entropy=False,
+        top_k: int = 0,
+        student_top_k_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
@@ -233,11 +238,50 @@ class DataParallelPPOActor(BasePPOActor):
             log_probs: # (bs, response_len)
         """
         response_length = micro_batch["responses"].size(-1)
+        probe_tensors: dict[str, torch.Tensor] = {}
+        need_logits_for_probe = top_k > 0 or student_top_k_ids is not None
         multi_modal_inputs = {}
         if "multi_modal_inputs" in micro_batch.keys():
             from verl.utils.model import extract_multi_modal_inputs
 
             multi_modal_inputs = extract_multi_modal_inputs(micro_batch["multi_modal_inputs"])
+
+        def _store_student_topk(logits: torch.Tensor, *, rmpad: bool = False) -> None:
+            if top_k <= 0 or student_top_k_ids is not None:
+                return
+            from verl.trainer.ppo.rethinking_opd_probe import compute_student_topk_from_logits
+
+            topk_ids, topk_log_probs = compute_student_topk_from_logits(logits, top_k=top_k)
+            if rmpad:
+                if self.use_ulysses_sp:
+                    topk_ids = gather_outputs_and_unpad(
+                        topk_ids,
+                        gather_dim=0,
+                        unpad_dim=0,
+                        padding_size=pad_size,
+                    )
+                    topk_log_probs = gather_outputs_and_unpad(
+                        topk_log_probs,
+                        gather_dim=0,
+                        unpad_dim=0,
+                        padding_size=pad_size,
+                    )
+                topk_ids = pad_input(
+                    hidden_states=topk_ids,
+                    indices=indices,
+                    batch=batch_size,
+                    seqlen=seqlen,
+                )
+                topk_log_probs = pad_input(
+                    hidden_states=topk_log_probs,
+                    indices=indices,
+                    batch=batch_size,
+                    seqlen=seqlen,
+                )
+                topk_ids = topk_ids[:, -response_length - 1 : -1, :]
+                topk_log_probs = topk_log_probs[:, -response_length - 1 : -1, :]
+            probe_tensors["student_top_k_ids"] = topk_ids
+            probe_tensors["student_top_k_log_probs"] = topk_log_probs
 
         with torch.autocast(device_type=self.device_name, dtype=self.param_dtype):
             input_ids = micro_batch["input_ids"]
@@ -314,6 +358,8 @@ class DataParallelPPOActor(BasePPOActor):
                 if self.use_fused_kernels:
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
+                    if need_logits_for_probe:
+                        extra_args["output_hidden_states"] = True
 
                 output = self.actor_module(
                     input_ids=input_ids_rmpad,
@@ -392,6 +438,8 @@ class DataParallelPPOActor(BasePPOActor):
                 if self.use_fused_kernels:
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
+                    if need_logits_for_probe:
+                        extra_args["output_hidden_states"] = True
 
                 output = self.actor_module(
                     input_ids=input_ids,
@@ -417,7 +465,11 @@ class DataParallelPPOActor(BasePPOActor):
                             entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
                         else:
                             entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
+                    if need_logits_for_probe:
+                        _store_student_topk(logits, rmpad=False)
 
+            if probe_tensors:
+                return entropy, log_probs, probe_tensors
             return entropy, log_probs
 
     def _optimizer_step(self):
@@ -470,6 +522,7 @@ class DataParallelPPOActor(BasePPOActor):
 
         micro_batch_size = data.meta_info["micro_batch_size"]
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
+        top_k = int(data.meta_info.get("rethinking_opd_probe_top_k", 0) or 0)
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         has_ref_input_ids = "ref_input_ids" in data.batch.keys() # handle when ref input_ids is different from actor input_ids
@@ -488,13 +541,25 @@ class DataParallelPPOActor(BasePPOActor):
 
         log_probs_lst = []
         entropy_lst = []
+        student_top_k_ids_lst = []
+        student_top_k_log_probs_lst = []
         for micro_batch in micro_batches:
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
-                entropy, log_probs = self._forward_micro_batch(
-                    model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
-                )
+                if top_k > 0:
+                    entropy, log_probs, probe_tensors = self._forward_micro_batch(
+                        model_inputs,
+                        temperature=temperature,
+                        calculate_entropy=calculate_entropy,
+                        top_k=top_k,
+                    )
+                    student_top_k_ids_lst.append(probe_tensors["student_top_k_ids"])
+                    student_top_k_log_probs_lst.append(probe_tensors["student_top_k_log_probs"])
+                else:
+                    entropy, log_probs = self._forward_micro_batch(
+                        model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                    )
             log_probs_lst.append(log_probs)
             if calculate_entropy:
                 entropy_lst.append(entropy)
@@ -504,11 +569,23 @@ class DataParallelPPOActor(BasePPOActor):
         if calculate_entropy:
             entropys = torch.concat(entropy_lst, dim=0)
 
+        extra_tensors = {}
+        if top_k > 0:
+            student_top_k_ids = torch.concat(student_top_k_ids_lst, dim=0)
+            student_top_k_log_probs = torch.concat(student_top_k_log_probs_lst, dim=0)
+            if use_dynamic_bsz:
+                student_top_k_ids = restore_dynamic_batch(student_top_k_ids, batch_idx_list)
+                student_top_k_log_probs = restore_dynamic_batch(student_top_k_log_probs, batch_idx_list)
+            extra_tensors["student_top_k_ids"] = student_top_k_ids
+            extra_tensors["student_top_k_log_probs"] = student_top_k_log_probs
+
         if use_dynamic_bsz:
             log_probs = restore_dynamic_batch(log_probs, batch_idx_list)
             if calculate_entropy:
                 entropys = restore_dynamic_batch(entropys, batch_idx_list)
 
+        if top_k > 0:
+            return log_probs, entropys, extra_tensors
         return log_probs, entropys
 
     def _compute_entropy_aware_loss(
