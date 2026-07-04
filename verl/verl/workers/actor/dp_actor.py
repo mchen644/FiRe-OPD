@@ -697,7 +697,9 @@ class DataParallelPPOActor(BasePPOActor):
             if calculate_entropy:
                 entropys = restore_dynamic_batch(entropys, batch_idx_list)
 
-        return log_probs, entropys, extra_tensors
+        if extra_tensors:
+            return log_probs, entropys, extra_tensors
+        return log_probs, entropys
 
     def _compute_entropy_aware_loss(
         self,

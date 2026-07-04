@@ -97,6 +97,17 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
+def _unpack_log_prob_result(result):
+    """Normalize actor/ref compute_log_prob return values across probe-disabled/enabled paths."""
+
+    if len(result) == 3:
+        output, entropys, probe_tensors = result
+    else:
+        output, entropys = result
+        probe_tensors = {}
+    return output, entropys, probe_tensors
+
+
 def create_device_mesh(world_size, fsdp_size):
     if fsdp_size < 0 or fsdp_size >= world_size:
         device_mesh = init_device_mesh(device_name, mesh_shape=(world_size,), mesh_dim_names=["fsdp"])
@@ -1018,7 +1029,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             with adapter_ctx:
-                output, entropys, probe_tensors = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+                output, entropys, probe_tensors = _unpack_log_prob_result(
+                    self.actor.compute_log_prob(data=data, calculate_entropy=True)
+                )
             tensors = {"old_log_probs": output, "entropys": entropys}
             if probe_tensors:
                 tensors.update(probe_tensors)
@@ -1082,8 +1095,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on ref.compute_log_prob
-            output, ref_entropys, probe_tensors = self.ref_policy.compute_log_prob(
-                data=data, calculate_entropy=compute_teacher_entropy
+            output, ref_entropys, probe_tensors = _unpack_log_prob_result(
+                self.ref_policy.compute_log_prob(data=data, calculate_entropy=compute_teacher_entropy)
             )
             tensors = {"ref_log_prob": output}
             if compute_teacher_entropy and ref_entropys is not None:
@@ -1133,8 +1146,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         with self.ulysses_sharding_manager:
             data = data.to("cpu")
-            output, base_ref_entropys, _ = self.base_ref_policy.compute_log_prob(
-                data=data, calculate_entropy=compute_teacher_entropy
+            output, base_ref_entropys, _ = _unpack_log_prob_result(
+                self.base_ref_policy.compute_log_prob(data=data, calculate_entropy=compute_teacher_entropy)
             )
             tensors = {"base_ref_log_prob": output}
             if compute_teacher_entropy and base_ref_entropys is not None:
