@@ -169,7 +169,10 @@ def _aggregate_one_window(
         torch.ones_like(teacher_probs),
     )
     token_adv = (normalized_student * (torch.log(normalized_teacher.clamp(min=1e-12)) - torch.log(normalized_student.clamp(min=1e-12)))).sum(dim=-1)
-    overlap_token_advantage = _masked_mean(token_adv, has_overlap)
+    if int(has_overlap.sum().item()) == 0:
+        overlap_token_advantage = float("nan")
+    else:
+        overlap_token_advantage = _masked_mean(token_adv, has_overlap)
 
     return {
         "chunk_start": chunk_start,

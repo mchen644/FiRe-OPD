@@ -67,6 +67,39 @@ def test_aggregate_rethinking_opd_probe_metrics_global_and_chunks():
     assert chunk1["topk_overlap_ratio"] == pytest.approx(1.0)
 
 
+def test_aggregate_rethinking_opd_probe_metrics_no_overlap_advantage_nan():
+    student_log_probs = torch.log(torch.tensor([[[0.50, 0.50], [0.20, 0.80], [0.60, 0.40]]])
+    )
+    teacher_on_student = torch.log(
+        torch.tensor([[[0.70, 0.30], [0.90, 0.10], [0.55, 0.45]]])
+    )
+    overlap_mask = torch.zeros((1, 3, 2))
+    response_mask = torch.tensor([[1.0, 1.0, 1.0]])
+
+    rows = aggregate_rethinking_opd_probe_metrics(
+        {
+            "student_top_k_log_probs": student_log_probs,
+            "teacher_on_student_log_probs": teacher_on_student,
+            "overlap_mask": overlap_mask,
+            "student_entropys": torch.tensor([[0.1, 0.2, 0.3]]),
+            "ref_entropys": torch.tensor([[0.2, 0.3, 0.4]]),
+        },
+        response_mask,
+        top_k=2,
+        chunk_size=2,
+    )
+
+    global_row = next(row for row in rows if row["chunk_start"] == -1)
+    chunk0 = next(row for row in rows if row["chunk_start"] == 0)
+    chunk1 = next(row for row in rows if row["chunk_start"] == 2)
+
+    assert global_row["valid_token_count"] == 3
+    assert chunk0["valid_token_count"] == 2
+    assert chunk1["valid_token_count"] == 1
+    assert all(row["topk_overlap_ratio"] == 0.0 for row in rows)
+    assert all(torch.isnan(torch.tensor(row["overlap_token_advantage"])) for row in rows)
+
+
 def test_append_rethinking_opd_probe_csv_writes_header_once(tmp_path: Path):
     path = tmp_path / "probe.csv"
     rows = [
