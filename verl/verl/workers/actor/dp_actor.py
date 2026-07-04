@@ -179,6 +179,55 @@ def _apply_length_aware_opd_penalty(advantages: torch.Tensor, model_inputs: dict
     return advantages - penalty.unsqueeze(-1)
 
 
+def _apply_candidate_selection_loss_mask(response_mask: torch.Tensor, model_inputs: dict) -> torch.Tensor:
+    """Zero response-mask rows for selected candidates that should not contribute actor loss."""
+    loss_mask = model_inputs.get("candidate_selection_loss_mask", None)
+    if loss_mask is None:
+        return response_mask
+    loss_mask = loss_mask.to(device=response_mask.device, dtype=response_mask.dtype)
+    return response_mask * loss_mask.view(-1, *([1] * (response_mask.dim() - 1)))
+
+
+def _apply_tale_budget_esr_loss_mask(response_mask: torch.Tensor, model_inputs: dict) -> torch.Tensor:
+    """Keep only rollout-length adaptive ESR-supervised response tokens for actor loss."""
+    esr_loss_mask = model_inputs.get("tale_budget_esr_loss_mask", None)
+    if esr_loss_mask is None:
+        return response_mask
+    esr_loss_mask = esr_loss_mask.to(device=response_mask.device, dtype=response_mask.dtype)
+    return response_mask * esr_loss_mask
+
+
+def _maybe_compute_rollout_corr_metrics(
+    loss_mode: str,
+    log_prob: torch.Tensor,
+    rollout_log_prob: torch.Tensor | None,
+    response_mask: torch.Tensor,
+) -> dict[str, float]:
+    """Compute rollout-correction metrics unless candidate masking removed every valid token."""
+    if loss_mode == "rollout_correction" or rollout_log_prob is None:
+        return {}
+
+    # Always emit this key when rollout-log-prob diagnostics are active so every
+    # actor worker returns lists with the same length during cross-worker metric
+    # reduction, even if only some microbatches are fully candidate-masked.
+    metrics: dict[str, float] = {"rollout_corr/skipped_no_valid_tokens": 0.0}
+
+    if not response_mask.bool().any().item():
+        metrics["rollout_corr/skipped_no_valid_tokens"] = 1.0
+        return metrics
+
+    from verl.trainer.ppo.rollout_corr_helper import compute_rollout_corr_metrics_from_logprobs
+
+    metrics.update(
+        compute_rollout_corr_metrics_from_logprobs(
+            log_prob=log_prob,
+            rollout_log_prob=rollout_log_prob,
+            response_mask=response_mask,
+        )
+    )
+    return metrics
+
+
 class DataParallelPPOActor(BasePPOActor):
     """FSDP DataParallel PPO Actor or Ref worker
 
@@ -231,7 +280,7 @@ class DataParallelPPOActor(BasePPOActor):
         calculate_entropy=False,
         top_k: int = 0,
         student_top_k_ids: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor | None, torch.Tensor, dict[str, torch.Tensor]]:
         """
         Returns:
             entropy: # (bs, response_len)
@@ -282,6 +331,56 @@ class DataParallelPPOActor(BasePPOActor):
                 topk_log_probs = topk_log_probs[:, -response_length - 1 : -1, :]
             probe_tensors["student_top_k_ids"] = topk_ids
             probe_tensors["student_top_k_log_probs"] = topk_log_probs
+
+        def _store_teacher_topk_overlap(logits: torch.Tensor, *, rmpad: bool = False) -> None:
+            if student_top_k_ids is None:
+                return
+            from verl.trainer.ppo.rethinking_opd_probe import compute_teacher_topk_overlap
+
+            if rmpad:
+                full_student_top_k_ids = torch.zeros(
+                    (batch_size, seqlen, student_top_k_ids.shape[-1]),
+                    dtype=student_top_k_ids.dtype,
+                    device=student_top_k_ids.device,
+                )
+                full_student_top_k_ids[:, -response_length - 1 : -1, :] = student_top_k_ids
+                packed_student_top_k_ids = index_first_axis(
+                    rearrange(full_student_top_k_ids, "b s k -> (b s) k"),
+                    indices,
+                )
+                if self.use_ulysses_sp:
+                    packed_student_top_k_ids, _, _ = ulysses_pad_and_slice_inputs(
+                        packed_student_top_k_ids.transpose(0, 1),
+                        position_ids_rmpad=None,
+                        sp_size=self.ulysses_sequence_parallel_size,
+                    )
+                    packed_student_top_k_ids = packed_student_top_k_ids.transpose(0, 1)
+                teacher_overlap = compute_teacher_topk_overlap(logits, packed_student_top_k_ids, top_k=top_k)
+                for key, value in teacher_overlap.items():
+                    if self.use_ulysses_sp:
+                        value = gather_outputs_and_unpad(
+                            value,
+                            gather_dim=0,
+                            unpad_dim=0,
+                            padding_size=pad_size,
+                        )
+                    value = pad_input(
+                        hidden_states=value,
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
+                    probe_tensors[key] = value[:, -response_length - 1 : -1, :]
+                return
+
+            teacher_overlap = compute_teacher_topk_overlap(
+                logits.reshape(-1, logits.shape[-1]),
+                student_top_k_ids.reshape(-1, student_top_k_ids.shape[-1]),
+                top_k=top_k,
+            )
+            bsz, resp_len, _ = student_top_k_ids.shape
+            for key, value in teacher_overlap.items():
+                probe_tensors[key] = value.view(bsz, resp_len, value.shape[-1])
 
         with torch.autocast(device_type=self.device_name, dtype=self.param_dtype):
             input_ids = micro_batch["input_ids"]
@@ -373,7 +472,13 @@ class DataParallelPPOActor(BasePPOActor):
                 if self.use_fused_kernels:
                     log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
                     entropy_rmpad = output.entropy.squeeze(0)  # (total_nnz,)
-
+                    if need_logits_for_probe:
+                        if output.hidden_states is None:
+                            raise RuntimeError("student top-k probe requires hidden_states from the fused actor forward")
+                        actor_module = getattr(self.actor_module, "module", self.actor_module)
+                        logits_rmpad = torch.matmul(output.hidden_states[-1], actor_module.lm_head.weight.t())
+                        logits_rmpad.div_(temperature)
+                        logits_rmpad = logits_rmpad.squeeze(0)
                 else:
                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
                     logits_rmpad.div_(temperature)
@@ -428,6 +533,10 @@ class DataParallelPPOActor(BasePPOActor):
                     seqlen=seqlen,
                 )
 
+                if need_logits_for_probe:
+                    _store_student_topk(logits_rmpad, rmpad=True)
+                    _store_teacher_topk_overlap(logits_rmpad, rmpad=True)
+
                 # only return response part:
                 if calculate_entropy:
                     entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
@@ -453,6 +562,15 @@ class DataParallelPPOActor(BasePPOActor):
                 if self.use_fused_kernels:
                     log_probs = output.log_probs[:, -response_length - 1 : -1]
                     entropy = output.entropy[:, -response_length - 1 : -1]  # (bsz, response_length)
+                    if need_logits_for_probe:
+                        if output.hidden_states is None:
+                            raise RuntimeError("student top-k probe requires hidden_states from the fused actor forward")
+                        actor_module = getattr(self.actor_module, "module", self.actor_module)
+                        logits = torch.matmul(output.hidden_states[-1], actor_module.lm_head.weight.t())
+                        logits.div_(temperature)
+                        logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
+                        _store_student_topk(logits, rmpad=False)
+                        _store_teacher_topk_overlap(logits, rmpad=False)
 
                 else:
                     logits = output.logits
@@ -467,10 +585,9 @@ class DataParallelPPOActor(BasePPOActor):
                             entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
                     if need_logits_for_probe:
                         _store_student_topk(logits, rmpad=False)
+                        _store_teacher_topk_overlap(logits, rmpad=False)
 
-            if probe_tensors:
-                return entropy, log_probs, probe_tensors
-            return entropy, log_probs
+            return entropy, log_probs, probe_tensors
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
@@ -526,9 +643,12 @@ class DataParallelPPOActor(BasePPOActor):
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         has_ref_input_ids = "ref_input_ids" in data.batch.keys() # handle when ref input_ids is different from actor input_ids
+        has_student_top_k_ids = "student_top_k_ids" in data.batch.keys()
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
         if has_ref_input_ids:
             select_keys.extend(["ref_input_ids", "ref_attention_mask", "ref_position_ids"])
+        if has_student_top_k_ids:
+            select_keys.append("student_top_k_ids")
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
@@ -541,25 +661,21 @@ class DataParallelPPOActor(BasePPOActor):
 
         log_probs_lst = []
         entropy_lst = []
-        student_top_k_ids_lst = []
-        student_top_k_log_probs_lst = []
+        probe_tensor_lists: dict[str, list[torch.Tensor]] = {}
         for micro_batch in micro_batches:
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
-                if top_k > 0:
-                    entropy, log_probs, probe_tensors = self._forward_micro_batch(
-                        model_inputs,
-                        temperature=temperature,
-                        calculate_entropy=calculate_entropy,
-                        top_k=top_k,
-                    )
-                    student_top_k_ids_lst.append(probe_tensors["student_top_k_ids"])
-                    student_top_k_log_probs_lst.append(probe_tensors["student_top_k_log_probs"])
-                else:
-                    entropy, log_probs = self._forward_micro_batch(
-                        model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
-                    )
+                mb_student_top_k_ids = model_inputs.get("student_top_k_ids")
+                entropy, log_probs, probe_tensors = self._forward_micro_batch(
+                    model_inputs,
+                    temperature=temperature,
+                    calculate_entropy=calculate_entropy,
+                    top_k=top_k,
+                    student_top_k_ids=mb_student_top_k_ids,
+                )
+            for key, value in probe_tensors.items():
+                probe_tensor_lists.setdefault(key, []).append(value)
             log_probs_lst.append(log_probs)
             if calculate_entropy:
                 entropy_lst.append(entropy)

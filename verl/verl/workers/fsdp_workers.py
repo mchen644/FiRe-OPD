@@ -957,8 +957,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             loop.run_until_complete(self.rollout_mode())
             log_gpu_memory_usage("After switch to rollout mode", logger=logger)
 
+        generation_kwargs = prompts.meta_info.pop("generation_kwargs", {})
+        rollout_generate = self.rollout.generate_sequences
+        supports_generation_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in inspect.signature(rollout_generate).parameters.values()
+        )
         with simple_timer("generate_sequences", timing_generate):
-            output = self.rollout.generate_sequences(prompts=prompts)
+            if generation_kwargs and supports_generation_kwargs:
+                output = rollout_generate(prompts=prompts, **generation_kwargs)
+            else:
+                output = rollout_generate(prompts=prompts)
 
         if self._is_actor:
             loop.run_until_complete(self.trainer_mode())
@@ -1008,11 +1017,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             with adapter_ctx:
-                if top_k > 0:
-                    output, entropys, probe_tensors = self.actor.compute_log_prob(data=data, calculate_entropy=True)
-                else:
-                    output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
-                    probe_tensors = {}
+                output, entropys, probe_tensors = self.actor.compute_log_prob(data=data, calculate_entropy=True)
             tensors = {"old_log_probs": output, "entropys": entropys}
             if probe_tensors:
                 tensors.update(probe_tensors)
@@ -1043,6 +1048,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         compute_teacher_entropy = getattr(
             self.config.actor.policy_loss, "entropy_aware_distill", False
         ) if hasattr(self.config, "actor") else False
+        probe_top_k = int(data.meta_info.get("rethinking_opd_probe_top_k", 0) or 0)
+        compute_teacher_entropy = compute_teacher_entropy or probe_top_k > 0
 
         if self._is_lora:
             # if _is_lora, actor without lora applied is the ref
@@ -1052,6 +1059,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             tensors = {"ref_log_prob": data.batch["old_log_probs"]}
             if compute_teacher_entropy and "entropys" in data.batch:
                 tensors["ref_entropys"] = data.batch["entropys"]
+            for key in (
+                "teacher_top_k_ids",
+                "teacher_top_k_log_probs",
+                "teacher_on_student_log_probs",
+                "overlap_mask",
+                "teacher_in_student_mask",
+            ):
+                if key in data.batch:
+                    tensors[key] = data.batch[key]
             data = DataProto.from_dict(tensors=tensors)
             return data
         assert self._is_ref
@@ -1065,12 +1081,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on ref.compute_log_prob
-            output, ref_entropys = self.ref_policy.compute_log_prob(
+            output, ref_entropys, probe_tensors = self.ref_policy.compute_log_prob(
                 data=data, calculate_entropy=compute_teacher_entropy
             )
             tensors = {"ref_log_prob": output}
             if compute_teacher_entropy and ref_entropys is not None:
                 tensors["ref_entropys"] = ref_entropys
+            if probe_top_k > 0:
+                tensors.update(probe_tensors)
             output = DataProto.from_dict(tensors=tensors)
 
         output = output.to("cpu")
@@ -1114,7 +1132,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         with self.ulysses_sharding_manager:
             data = data.to("cpu")
-            output, base_ref_entropys = self.base_ref_policy.compute_log_prob(
+            output, base_ref_entropys, _ = self.base_ref_policy.compute_log_prob(
                 data=data, calculate_entropy=compute_teacher_entropy
             )
             tensors = {"base_ref_log_prob": output}

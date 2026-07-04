@@ -39,6 +39,14 @@ def test_compute_teacher_topk_overlap_marks_student_ids_in_teacher_topk():
     assert out["teacher_top_k_log_probs"].shape == (2, 2)
 
 
+def test_compute_teacher_topk_overlap_rejects_shape_mismatch():
+    logits = torch.zeros(2, 5)
+    student_ids = torch.zeros(2, 3, dtype=torch.long)
+
+    with pytest.raises(ValueError, match="last dimension must equal top_k"):
+        compute_teacher_topk_overlap(logits, student_ids, top_k=2)
+
+
 def test_aggregate_rethinking_opd_probe_metrics_global_and_chunks():
     student_log_probs = torch.log(torch.tensor([[[0.50, 0.25], [0.60, 0.20], [0.70, 0.10], [0.80, 0.05]]]))
     teacher_on_student = torch.log(torch.tensor([[[0.40, 0.30], [0.50, 0.10], [0.60, 0.20], [0.70, 0.10]]]))
