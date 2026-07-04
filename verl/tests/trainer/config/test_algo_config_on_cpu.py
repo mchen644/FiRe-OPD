@@ -129,7 +129,10 @@ class TestAlgoConfig(unittest.TestCase):
 
         from hydra import compose, initialize_config_dir
 
-        with initialize_config_dir(config_dir=os.path.abspath("verl/trainer/config")):
+        config_dir = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "..", "verl", "trainer", "config")
+        )
+        with initialize_config_dir(config_dir=config_dir):
             cfg = compose(config_name="ppo_trainer")
         algo_config = omega_conf_to_dataclass(cfg.algorithm)
         from verl.trainer.config import AlgoConfig
@@ -144,7 +147,10 @@ class TestAlgoConfig(unittest.TestCase):
 
         GlobalHydra.instance().clear()
         try:
-            with initialize_config_dir(config_dir=os.path.abspath("verl/trainer/config")):
+            config_dir = os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "..", "..", "..", "verl", "trainer", "config")
+            )
+            with initialize_config_dir(config_dir=config_dir):
                 cfg = compose(
                     config_name="ppo_trainer",
                     overrides=["algorithm.tale_budget.teacher_prompt_style=concise"],
@@ -164,7 +170,10 @@ class TestAlgoConfig(unittest.TestCase):
 
         GlobalHydra.instance().clear()
         try:
-            with initialize_config_dir(config_dir=os.path.abspath("verl/trainer/config")):
+            config_dir = os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "..", "..", "..", "verl", "trainer", "config")
+            )
+            with initialize_config_dir(config_dir=config_dir):
                 config = omega_conf_to_dataclass(
                     compose(
                         config_name="ppo_trainer",

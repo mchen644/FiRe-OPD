@@ -686,23 +686,18 @@ class DataParallelPPOActor(BasePPOActor):
             entropys = torch.concat(entropy_lst, dim=0)
 
         extra_tensors = {}
-        if top_k > 0:
-            student_top_k_ids = torch.concat(student_top_k_ids_lst, dim=0)
-            student_top_k_log_probs = torch.concat(student_top_k_log_probs_lst, dim=0)
+        for key, values in probe_tensor_lists.items():
+            tensor = torch.concat(values, dim=0)
             if use_dynamic_bsz:
-                student_top_k_ids = restore_dynamic_batch(student_top_k_ids, batch_idx_list)
-                student_top_k_log_probs = restore_dynamic_batch(student_top_k_log_probs, batch_idx_list)
-            extra_tensors["student_top_k_ids"] = student_top_k_ids
-            extra_tensors["student_top_k_log_probs"] = student_top_k_log_probs
+                tensor = restore_dynamic_batch(tensor, batch_idx_list)
+            extra_tensors[key] = tensor
 
         if use_dynamic_bsz:
             log_probs = restore_dynamic_batch(log_probs, batch_idx_list)
             if calculate_entropy:
                 entropys = restore_dynamic_batch(entropys, batch_idx_list)
 
-        if top_k > 0:
-            return log_probs, entropys, extra_tensors
-        return log_probs, entropys
+        return log_probs, entropys, extra_tensors
 
     def _compute_entropy_aware_loss(
         self,
