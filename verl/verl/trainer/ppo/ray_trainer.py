@@ -425,11 +425,17 @@ def _log_rethinking_opd_probe_metrics(batch: DataProto, *, config, global_step: 
         aggregate_rethinking_opd_probe_metrics,
         append_rethinking_opd_probe_csv,
         decorate_rethinking_probe_rows,
+        has_rethinking_opd_probe_tensors,
     )
+
+    log_prefix = str(probe_config.get("log_prefix", "rethinking_opd"))
+    if not has_rethinking_opd_probe_tensors(batch.batch):
+        if probe_config.get("include_scalar_logger", True):
+            metrics[f"{log_prefix}/skipped_missing_tensors"] = 1.0
+        return
 
     top_k = int(probe_config.get("top_k", 16))
     chunk_size = int(probe_config.get("chunk_size", 1024))
-    log_prefix = str(probe_config.get("log_prefix", "rethinking_opd"))
     response_mask = batch.batch["response_mask"]
     tensors = {
         key: batch.batch[key]

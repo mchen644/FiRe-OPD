@@ -34,6 +34,23 @@ CSV_FIELDS = [
     "overlap_token_advantage",
 ]
 
+RETHINKING_OPD_PROBE_REQUIRED_TENSORS = (
+    "student_top_k_log_probs",
+    "teacher_on_student_log_probs",
+    "overlap_mask",
+)
+
+
+def has_rethinking_opd_probe_tensors(tensors_or_batch_keys: Any) -> bool:
+    """Return True when the required probe tensors are present."""
+
+    if hasattr(tensors_or_batch_keys, "keys"):
+        keys = tensors_or_batch_keys.keys()
+    else:
+        keys = tensors_or_batch_keys
+    key_set = set(keys)
+    return all(key in key_set for key in RETHINKING_OPD_PROBE_REQUIRED_TENSORS)
+
 
 def compute_student_topk_from_logits(logits: torch.Tensor, top_k: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Return top-k ids and log-probs from logits with shape `(..., vocab_size)`."""
@@ -208,8 +225,7 @@ def aggregate_rethinking_opd_probe_metrics(
 ) -> list[dict[str, float | int]]:
     """Aggregate global and depth-chunk metrics from current-batch probe tensors."""
 
-    required = ["student_top_k_log_probs", "teacher_on_student_log_probs", "overlap_mask"]
-    missing = [key for key in required if key not in tensors]
+    missing = [key for key in RETHINKING_OPD_PROBE_REQUIRED_TENSORS if key not in tensors]
     if missing:
         raise ValueError(f"Missing Rethinking OPD probe tensors: {missing}")
     if response_mask.dim() != 2:

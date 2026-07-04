@@ -9,6 +9,7 @@ from verl.trainer.ppo.rethinking_opd_probe import (
     compute_student_topk_from_logits,
     compute_teacher_topk_overlap,
     decorate_rethinking_probe_rows,
+    has_rethinking_opd_probe_tensors,
 )
 
 
@@ -46,6 +47,21 @@ def test_compute_teacher_topk_overlap_rejects_shape_mismatch():
 
     with pytest.raises(ValueError, match="last dimension must equal top_k"):
         compute_teacher_topk_overlap(logits, student_ids, top_k=2)
+
+
+def test_has_rethinking_opd_probe_tensors_detects_required_keys():
+    required = {
+        "student_top_k_log_probs": torch.zeros(1, 1, 1),
+        "teacher_on_student_log_probs": torch.zeros(1, 1, 1),
+        "overlap_mask": torch.zeros(1, 1, 1),
+    }
+    missing_student = {
+        "teacher_on_student_log_probs": torch.zeros(1, 1, 1),
+        "overlap_mask": torch.zeros(1, 1, 1),
+    }
+
+    assert has_rethinking_opd_probe_tensors(required)
+    assert not has_rethinking_opd_probe_tensors(missing_student)
 
 
 def test_aggregate_rethinking_opd_probe_metrics_global_and_chunks():
@@ -140,6 +156,33 @@ def test_decorate_rethinking_probe_rows_adds_context_fields():
     assert out[0]["max_all_batch_response_length"] == pytest.approx(2.0)
     assert out[0]["clip_rate_all_batch"] == pytest.approx(0.0)
 
+
+def test_log_rethinking_opd_probe_metrics_skips_when_required_tensors_missing():
+    from types import SimpleNamespace
+
+    from verl.trainer.ppo import ray_trainer
+
+    batch = SimpleNamespace(
+        batch={
+            "teacher_on_student_log_probs": torch.zeros((1, 2, 2)),
+            "overlap_mask": torch.ones((1, 2, 2)),
+        }
+    )
+    metrics = {}
+    config = SimpleNamespace(
+        algorithm={
+            "rethinking_opd_probe": {
+                "enabled": True,
+                "include_scalar_logger": True,
+                "log_prefix": "rethinking_opd",
+            }
+        },
+        trainer={"experiment_name": "probe-run"},
+    )
+
+    ray_trainer._log_rethinking_opd_probe_metrics(batch, config=config, global_step=3, metrics=metrics)
+
+    assert metrics == {"rethinking_opd/skipped_missing_tensors": 1.0}
 
 
 def test_append_rethinking_opd_probe_csv_writes_header_once(tmp_path: Path):
