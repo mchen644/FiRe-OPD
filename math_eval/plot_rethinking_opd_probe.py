@@ -32,7 +32,7 @@ def write_summary(rows: list[dict[str, str]], output: Path) -> None:
         grouped.setdefault(key, []).append(row)
     with output.open("w") as f:
         f.write("# Rethinking OPD Training Probe Summary\n\n")
-        for (run, chunk), group in sorted(grouped.items()):
+        for (run, chunk), group in sorted(grouped.items(), key=lambda item: (item[0][0], int(float(item[0][1])))):
             last = sorted(group, key=lambda r: int(float(r["step"])))[-1]
             f.write(
                 f"- {run} chunk {chunk}: "
