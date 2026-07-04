@@ -8,6 +8,7 @@ from verl.trainer.ppo.rethinking_opd_probe import (
     append_rethinking_opd_probe_csv,
     compute_student_topk_from_logits,
     compute_teacher_topk_overlap,
+    decorate_rethinking_probe_rows,
 )
 
 
@@ -117,6 +118,28 @@ def test_aggregate_rethinking_opd_probe_metrics_no_overlap_advantage_nan():
     assert chunk1["valid_token_count"] == 1
     assert all(row["topk_overlap_ratio"] == 0.0 for row in rows)
     assert all(torch.isnan(torch.tensor(row["overlap_token_advantage"])) for row in rows)
+
+
+def test_decorate_rethinking_probe_rows_adds_context_fields():
+    rows = [{"chunk_start": -1, "chunk_end": -1, "valid_token_count": 2, "topk_overlap_ratio": 0.5}]
+    response_mask = torch.tensor([[1.0, 1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]])
+
+    out = decorate_rethinking_probe_rows(
+        rows,
+        run_name="probe-run",
+        step=7,
+        top_k=16,
+        response_mask=response_mask,
+    )
+
+    assert out[0]["run_name"] == "probe-run"
+    assert out[0]["step"] == 7
+    assert out[0]["top_k"] == 16
+    assert out[0]["batch_size"] == 2
+    assert out[0]["mean_all_batch_response_length"] == pytest.approx(1.5)
+    assert out[0]["max_all_batch_response_length"] == pytest.approx(2.0)
+    assert out[0]["clip_rate_all_batch"] == pytest.approx(0.0)
+
 
 
 def test_append_rethinking_opd_probe_csv_writes_header_once(tmp_path: Path):

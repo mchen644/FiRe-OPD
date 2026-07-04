@@ -226,6 +226,29 @@ def aggregate_rethinking_opd_probe_metrics(
     return rows
 
 
+def decorate_rethinking_probe_rows(
+    rows: list[dict[str, Any]],
+    *,
+    run_name: str,
+    step: int,
+    top_k: int,
+    response_mask: torch.Tensor,
+) -> list[dict[str, Any]]:
+    response_lengths = response_mask.float().sum(dim=-1)
+    max_response_width = float(response_mask.shape[-1])
+    context = {
+        "run_name": run_name,
+        "step": int(step),
+        "top_k": int(top_k),
+        "batch_size": int(response_mask.shape[0]),
+        "mean_all_batch_response_length": response_lengths.mean().detach().item(),
+        "max_all_batch_response_length": response_lengths.max().detach().item(),
+        "clip_rate_all_batch": (response_lengths == max_response_width).float().mean().detach().item(),
+    }
+    return [{**context, **row} for row in rows]
+
+
+
 def append_rethinking_opd_probe_csv(path: str | Path, rows: list[dict[str, Any]]) -> None:
     """Append probe rows to a CSV, writing the header once."""
 

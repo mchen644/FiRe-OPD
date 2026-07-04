@@ -51,14 +51,26 @@ from verl.trainer.ppo.metric_utils import (
     process_validation_metrics,
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
+from verl.trainer.ppo.tale_budget import (
+    build_concise_teacher_messages,
+    build_tale_budget_estimation_prompt,
+    build_tale_budget_teacher_messages,
+    compute_rollout_length_tale_budget,
+    drop_ref_retokenization_tensors,
+    normalize_tale_budget,
+    parse_tale_budget,
+    summarize_tale_budget_metrics,
+    truncate_to_tale_budget_esr,
+)
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
+from verl.utils.model import compute_position_id_with_mask
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
-from verl.utils.torch_functional import masked_mean
+from verl.utils.torch_functional import masked_mean, postprocess_data
 from verl.utils.tracking import ValidationGenerationsLogger
 
 
@@ -177,6 +189,319 @@ def compute_response_mask(data: DataProto):
     response_length = responses.size(1)
     attention_mask = data.batch["attention_mask"]
     return attention_mask[:, -response_length:]
+
+
+def _messages_to_list(messages):
+    if hasattr(messages, "tolist"):
+        messages = messages.tolist()
+    return list(messages)
+
+
+def _object_array(values):
+    output = np.empty(len(values), dtype=object)
+    for index, value in enumerate(values):
+        output[index] = value
+    return output
+
+
+def _extract_single_user_question(messages) -> str:
+    message_list = _messages_to_list(messages)
+    if len(message_list) != 1:
+        raise ValueError(f"Expected exactly one raw prompt message, got {len(message_list)}")
+    message = dict(message_list[0])
+    if message.get("role") != "user":
+        raise ValueError(f"Expected raw prompt role 'user', got {message.get('role')!r}")
+    return str(message.get("content", ""))
+
+
+def _build_online_tale_budget_generation_batch(
+    *,
+    questions: list[str],
+    tokenizer,
+    max_prompt_length: int,
+    truncation: str,
+    estimation_max_tokens: int,
+    temperature: float,
+    top_p: float,
+    apply_chat_template_kwargs: dict | None,
+) -> DataProto:
+    if apply_chat_template_kwargs is None:
+        apply_chat_template_kwargs = {}
+
+    budget_messages = [
+        [{"role": "user", "content": build_tale_budget_estimation_prompt(question)}] for question in questions
+    ]
+    prompt_texts = [
+        tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=False,
+            **apply_chat_template_kwargs,
+        )
+        for messages in budget_messages
+    ]
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    input_id_rows = []
+    attention_mask_rows = []
+    for prompt_text in prompt_texts:
+        model_inputs = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)
+        input_ids, attention_mask = postprocess_data(
+            input_ids=model_inputs["input_ids"],
+            attention_mask=model_inputs["attention_mask"],
+            max_length=max_prompt_length,
+            pad_token_id=pad_token_id,
+            left_pad=True,
+            truncation=truncation,
+        )
+        input_id_rows.append(input_ids[0])
+        attention_mask_rows.append(attention_mask[0])
+
+    input_ids = torch.stack(input_id_rows, dim=0)
+    attention_mask = torch.stack(attention_mask_rows, dim=0)
+    position_ids = compute_position_id_with_mask(attention_mask)
+
+    return DataProto.from_dict(
+        tensors={
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+        },
+        meta_info={
+            "do_sample": True,
+            "response_length": int(estimation_max_tokens),
+            "temperature": float(temperature),
+            "top_p": float(top_p),
+            "eos_token_id": tokenizer.eos_token_id,
+            "pad_token_id": pad_token_id,
+            "generation_kwargs": {
+                "max_tokens": int(estimation_max_tokens),
+                "temperature": float(temperature),
+                "top_p": float(top_p),
+            },
+        },
+    )
+
+
+def _resolve_tale_teacher_prompt_style(tale_budget_config) -> str:
+    """Resolve legacy budget-prompt bool plus the newer prompt-style selector."""
+
+    style = str(tale_budget_config.get("teacher_prompt_style", "auto"))
+    if style == "auto":
+        return "budget" if tale_budget_config.get("use_budget_teacher_prompt", True) else "normal"
+    if style not in {"budget", "normal", "concise"}:
+        raise ValueError(
+            "algorithm.tale_budget.teacher_prompt_style must be one of "
+            f"'auto', 'budget', 'normal', or 'concise'. Got {style!r}."
+        )
+    return style
+
+
+
+def _apply_online_tale_budget_prompts(
+    *,
+    batch: DataProto,
+    actor_rollout_wg,
+    tokenizer,
+    tale_budget_config,
+    max_prompt_length: int,
+    truncation: str,
+    apply_chat_template_kwargs: dict | None = None,
+) -> dict[str, float]:
+    """Generate online TALE budgets and write budget-aware teacher prompts into batch."""
+
+    if not tale_budget_config or not tale_budget_config.get("enabled", False):
+        return {}
+    if "raw_prompt" not in batch.non_tensor_batch:
+        raise ValueError("algorithm.tale_budget.enabled=True requires data.return_raw_chat=True for raw_prompt.")
+
+    questions = [_extract_single_user_question(messages) for messages in batch.non_tensor_batch["raw_prompt"]]
+    source = tale_budget_config.get("source", "llm_estimate")
+    teacher_prompt_style = _resolve_tale_teacher_prompt_style(tale_budget_config)
+
+    if source == "rollout_length":
+        if "response_mask" not in batch.batch.keys():
+            raise ValueError("algorithm.tale_budget.source=rollout_length requires response_mask in batch.")
+        max_budget = tale_budget_config.get("rollout_length_max_budget", None)
+        result = compute_rollout_length_tale_budget(
+            response_mask=batch.batch["response_mask"],
+            alpha=float(tale_budget_config.get("rollout_length_alpha", 0.8)),
+            beta=float(tale_budget_config.get("esr_beta", 1.0)),
+            min_budget=int(tale_budget_config.min_budget),
+            round_to=int(tale_budget_config.round_to),
+            max_budget=None if max_budget is None else int(max_budget),
+        )
+        budgets = [int(value) for value in result.budgets.detach().cpu().tolist()]
+        raw_budgets = budgets
+        response_lengths = [int(value) for value in result.response_lengths.detach().cpu().tolist()]
+        estimate_texts = [
+            f"rollout_length={response_length},alpha={float(tale_budget_config.get('rollout_length_alpha', 0.8)):g}"
+            for response_length in response_lengths
+        ]
+        batch.batch["tale_budget_esr_loss_mask"] = result.esr_loss_mask
+        esr_tokens = result.esr_tokens.float()
+        response_lengths_tensor = result.response_lengths.float().clamp(min=1.0)
+        metrics = summarize_tale_budget_metrics(raw_budgets=raw_budgets, budgets=budgets)
+        metrics.update(
+            {
+                "tale_budget/source_rollout_length": 1.0,
+                "tale_budget/response_length_mean": response_lengths_tensor.mean().item(),
+                "tale_budget/esr_tokens_mean": esr_tokens.mean().item(),
+                "tale_budget/esr_supervised_fraction_mean": (esr_tokens / response_lengths_tensor).mean().item(),
+                "tale_budget/use_budget_teacher_prompt": 0.0 if teacher_prompt_style == "normal" else 1.0,
+            }
+        )
+    elif source == "llm_estimate":
+        budget_generation_batch = _build_online_tale_budget_generation_batch(
+            questions=questions,
+            tokenizer=tokenizer,
+            max_prompt_length=max_prompt_length,
+            truncation=truncation,
+            estimation_max_tokens=tale_budget_config.estimation_max_tokens,
+            temperature=tale_budget_config.temperature,
+            top_p=tale_budget_config.top_p,
+            apply_chat_template_kwargs=apply_chat_template_kwargs,
+        )
+        budget_output = actor_rollout_wg.generate_sequences(budget_generation_batch)
+        estimate_texts = tokenizer.batch_decode(budget_output.batch["responses"], skip_special_tokens=True)
+        if len(estimate_texts) != len(questions):
+            raise ValueError(f"Expected {len(questions)} TALE budget estimates, got {len(estimate_texts)}")
+
+        raw_budgets = [parse_tale_budget(text) for text in estimate_texts]
+        budgets = [
+            normalize_tale_budget(
+                raw_budget,
+                min_budget=tale_budget_config.min_budget,
+                max_budget=tale_budget_config.max_budget,
+                round_to=tale_budget_config.round_to,
+                fallback_budget=tale_budget_config.fallback_budget,
+            )
+            for raw_budget in raw_budgets
+        ]
+        metrics = summarize_tale_budget_metrics(raw_budgets=raw_budgets, budgets=budgets)
+    else:
+        raise ValueError(f"Unsupported algorithm.tale_budget.source={source!r}")
+
+    if teacher_prompt_style == "budget":
+        teacher_prompts = [
+            build_tale_budget_teacher_messages(question=question, budget=budget)
+            for question, budget in zip(questions, budgets, strict=True)
+        ]
+    elif teacher_prompt_style == "normal":
+        teacher_prompts = [deepcopy(messages) for messages in batch.non_tensor_batch["raw_prompt"]]
+    elif teacher_prompt_style == "concise":
+        teacher_prompts = [build_concise_teacher_messages(question=question) for question in questions]
+    else:
+        raise ValueError(f"Unsupported resolved TALE teacher prompt style: {teacher_prompt_style!r}")
+
+    teacher_prompt_key = tale_budget_config.teacher_prompt_key
+    batch.non_tensor_batch[teacher_prompt_key] = _object_array(teacher_prompts)
+    batch.non_tensor_batch["tale_budget"] = np.array(budgets)
+    batch.non_tensor_batch["tale_budget_raw"] = _object_array(raw_budgets)
+    batch.non_tensor_batch["tale_budget_estimate_text"] = _object_array(estimate_texts)
+    return metrics
+
+
+def _rethinking_probe_enabled(config) -> bool:
+    probe_config = config.algorithm.get("rethinking_opd_probe", None)
+    return bool(probe_config and probe_config.get("enabled", False))
+
+
+
+def _set_rethinking_probe_meta(batch: DataProto, config) -> None:
+    probe_config = config.algorithm.get("rethinking_opd_probe", None)
+    top_k = int(probe_config.get("top_k", 16)) if probe_config else 0
+    batch.meta_info["rethinking_opd_probe_top_k"] = (
+        top_k if probe_config and probe_config.get("enabled", False) else 0
+    )
+
+
+
+def _log_rethinking_opd_probe_metrics(batch: DataProto, *, config, global_step: int, metrics: dict) -> None:
+    probe_config = config.algorithm.get("rethinking_opd_probe", None)
+    if not probe_config or not probe_config.get("enabled", False):
+        return
+
+    from verl.trainer.ppo.rethinking_opd_probe import (
+        aggregate_rethinking_opd_probe_metrics,
+        append_rethinking_opd_probe_csv,
+        decorate_rethinking_probe_rows,
+    )
+
+    top_k = int(probe_config.get("top_k", 16))
+    chunk_size = int(probe_config.get("chunk_size", 1024))
+    log_prefix = str(probe_config.get("log_prefix", "rethinking_opd"))
+    response_mask = batch.batch["response_mask"]
+    tensors = {
+        key: batch.batch[key]
+        for key in (
+            "student_top_k_log_probs",
+            "teacher_on_student_log_probs",
+            "overlap_mask",
+            "student_entropys",
+            "ref_entropys",
+        )
+        if key in batch.batch
+    }
+
+    rows = aggregate_rethinking_opd_probe_metrics(tensors, response_mask, top_k=top_k, chunk_size=chunk_size)
+    run_name = str(config.trainer.get("experiment_name", "unknown"))
+    rows = decorate_rethinking_probe_rows(
+        rows,
+        run_name=run_name,
+        step=int(global_step),
+        top_k=top_k,
+        response_mask=response_mask,
+    )
+
+    if probe_config.get("include_scalar_logger", True):
+        for row in rows:
+            suffix = "global" if row["chunk_start"] == -1 else f"chunk_{row['chunk_start']}_{row['chunk_end']}"
+            for key in (
+                "topk_overlap_ratio",
+                "student_overlap_mass",
+                "teacher_overlap_mass",
+                "student_entropy",
+                "teacher_entropy",
+                "entropy_gap",
+                "overlap_token_advantage",
+                "valid_token_count",
+                "valid_sequence_count",
+            ):
+                metrics[f"{log_prefix}/{key}_{suffix}"] = row[key]
+
+    csv_path = probe_config.get("csv_path", None)
+    if csv_path:
+        append_rethinking_opd_probe_csv(csv_path, rows)
+
+
+
+def _truncate_response_tensor_to_batch(response_tensor: torch.Tensor, batch: DataProto) -> torch.Tensor:
+    """Align full-response outcome rewards to a hard-truncated ESR training batch.
+
+    Rule-based math rewards are sequence-level scores stored on a response token.
+    If that token is outside the ESR prefix, a plain slice would turn correct
+    trajectories into zero-reward trajectories for logging/advantage plumbing.
+    Preserve the sequence reward sum by moving it to the last supervised token.
+    """
+
+    response_length = batch.batch["responses"].shape[-1]
+    if response_tensor.shape[-1] == response_length:
+        return response_tensor
+    if response_tensor.shape[-1] < response_length:
+        raise ValueError(
+            f"Cannot align response tensor length {response_tensor.shape[-1]} to batch response length {response_length}"
+        )
+
+    response_mask = batch.batch["response_mask"].to(device=response_tensor.device)
+    sequence_reward = response_tensor.sum(dim=-1)
+    truncated = torch.zeros(
+        (*response_tensor.shape[:-1], response_length),
+        dtype=response_tensor.dtype,
+        device=response_tensor.device,
+    )
+    last_supervised_index = response_mask.to(dtype=torch.long).sum(dim=-1).clamp(min=1) - 1
+    truncated.scatter_(dim=-1, index=last_supervised_index.unsqueeze(-1), src=sequence_reward.unsqueeze(-1))
+    return truncated
 
 
 def compute_advantage(
@@ -319,14 +644,15 @@ class RayPPOTrainer:
         # Store ref_tokenizer for re-tokenization when ref model uses different tokenizer
         self.ref_tokenizer = ref_tokenizer
         self.use_ref_retokenization = ref_tokenizer is not None
+        self.ref_raw_prompt_key = config.data.get("ref_raw_prompt_key", "raw_prompt")
 
         if self.use_ref_retokenization:
             return_raw_chat = config.data.get("return_raw_chat", False)
-            if not return_raw_chat:
+            if self.ref_raw_prompt_key == "raw_prompt" and not return_raw_chat:
                 raise ValueError(
                     "When using a different tokenizer for ref model (ref_tokenizer is provided) "
-                    "you must set data.return_raw_chat=True in config to enable re-tokenization. "
-                    "This is needed to access the original messages for re-tokenizing with ref model's chat template."
+                    "you must set data.return_raw_chat=True in config to enable re-tokenization, "
+                    "or set data.ref_raw_prompt_key to a parquet prompt column such as teacher_prompt."
                 )
 
         # Multi-teacher: ref's base model is the code teacher
@@ -1144,6 +1470,7 @@ class RayPPOTrainer:
                         )
                     else:  # Recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
+                            _set_rethinking_probe_meta(batch, self.config)
                             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                             entropys = old_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
@@ -1172,30 +1499,109 @@ class RayPPOTrainer:
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
+                    tale_budget_hard_truncated = False
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
+                            tale_budget_config = self.config.algorithm.get("tale_budget", None)
+                            if tale_budget_config and tale_budget_config.get("enabled", False):
+                                teacher_prompt_key = tale_budget_config.get("teacher_prompt_key", "teacher_prompt")
+                                if self.ref_raw_prompt_key != teacher_prompt_key:
+                                    raise ValueError(
+                                        "algorithm.tale_budget.enabled=True requires "
+                                        f"data.ref_raw_prompt_key={teacher_prompt_key!r}; "
+                                        f"got {self.ref_raw_prompt_key!r}."
+                                    )
+                                if not self.use_ref_retokenization:
+                                    raise ValueError(
+                                        "algorithm.tale_budget.enabled=True requires ref re-tokenization so "
+                                        "teacher/ref log-prob uses the generated budget-aware prompt."
+                                    )
+                                with marked_timer("tale_budget", timing_raw, color="orange"):
+                                    tale_budget_metrics = _apply_online_tale_budget_prompts(
+                                        batch=batch,
+                                        actor_rollout_wg=self.actor_rollout_wg,
+                                        tokenizer=self.tokenizer,
+                                        tale_budget_config=tale_budget_config,
+                                        max_prompt_length=self.config.data.max_prompt_length,
+                                        truncation=self.config.data.get("truncation", "error"),
+                                        apply_chat_template_kwargs=self.config.data.get(
+                                            "apply_chat_template_kwargs", {}
+                                        ),
+                                    )
+                                metrics.update(tale_budget_metrics)
+                                probe_enabled = _rethinking_probe_enabled(self.config)
+                                if probe_enabled and self.use_ref_retokenization:
+                                    from verl.trainer.ppo.ref_input_utils import prepare_ref_model_inputs
+
+                                    apply_chat_template_kwargs = self.config.data.get("apply_chat_template_kwargs", {})
+                                    batch = prepare_ref_model_inputs(
+                                        batch=batch,
+                                        ref_tokenizer=self.ref_tokenizer,
+                                        apply_chat_template_kwargs=apply_chat_template_kwargs,
+                                        raw_prompt_key=self.ref_raw_prompt_key,
+                                    )
+                                    _set_rethinking_probe_meta(batch, self.config)
+                                    if not self.ref_in_actor:
+                                        ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                                    else:
+                                        ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
+                                    batch = batch.union(ref_log_prob)
+                                    _log_rethinking_opd_probe_metrics(
+                                        batch,
+                                        config=self.config,
+                                        global_step=self.global_steps,
+                                        metrics=metrics,
+                                    )
+
+                                if tale_budget_config.get("truncate_to_esr", False):
+                                    candidate_selection_config = self.config.algorithm.get("candidate_selection", None)
+                                    if candidate_selection_config is not None and candidate_selection_config.get(
+                                        "enabled", False
+                                    ):
+                                        raise ValueError(
+                                            "algorithm.tale_budget.truncate_to_esr=True is not compatible with "
+                                            "algorithm.candidate_selection.enabled=True because candidate selection "
+                                            "needs full-response teacher scores."
+                                        )
+                                    batch, truncate_metrics = truncate_to_tale_budget_esr(batch)
+                                    metrics.update(truncate_metrics)
+                                    tale_budget_hard_truncated = True
+                            else:
+                                probe_enabled = _rethinking_probe_enabled(self.config)
+
                             # Get apply_chat_template_kwargs from config if available
                             apply_chat_template_kwargs = self.config.data.get(
                                 "apply_chat_template_kwargs", {}
                             )
+                            ref_log_prob_already_computed = probe_enabled and "ref_log_prob" in batch.batch.keys()
 
                             # If ref model uses different tokenizer/prompt template, re-tokenize inputs for ref model
                             if self.use_ref_retokenization:
                                 from verl.trainer.ppo.ref_input_utils import prepare_ref_model_inputs
-                                
-                                batch = prepare_ref_model_inputs(
-                                    batch=batch,
-                                    ref_tokenizer=self.ref_tokenizer,
-                                    apply_chat_template_kwargs=apply_chat_template_kwargs,
-                                )
-                                
-                                if not self.ref_in_actor:
-                                    ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
-                                else:
-                                    ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
-                                batch = batch.union(ref_log_prob)
-                            
+
+                                if not ref_log_prob_already_computed:
+                                    batch = prepare_ref_model_inputs(
+                                        batch=batch,
+                                        ref_tokenizer=self.ref_tokenizer,
+                                        apply_chat_template_kwargs=apply_chat_template_kwargs,
+                                        raw_prompt_key=self.ref_raw_prompt_key,
+                                    )
+
+                                    if not self.ref_in_actor:
+                                        ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                                    else:
+                                        ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
+                                    batch = batch.union(ref_log_prob)
+                                    _log_rethinking_opd_probe_metrics(
+                                        batch,
+                                        config=self.config,
+                                        global_step=self.global_steps,
+                                        metrics=metrics,
+                                    )
+                                if tale_budget_hard_truncated:
+                                    drop_ref_retokenization_tensors(batch)
+
                             else:
                                 # Standard ref model log prob computation
                                 if not self.ref_in_actor:
@@ -1203,6 +1609,14 @@ class RayPPOTrainer:
                                 else:
                                     ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
                                 batch = batch.union(ref_log_prob)
+                                _log_rethinking_opd_probe_metrics(
+                                    batch,
+                                    config=self.config,
+                                    global_step=self.global_steps,
+                                    metrics=metrics,
+                                )
+                                if tale_budget_hard_truncated:
+                                    drop_ref_retokenization_tensors(batch)
 
                     # Compute code teacher log probs (and entropy) for multi-teacher distillation
                     if self.use_base_models:
@@ -1224,6 +1638,8 @@ class RayPPOTrainer:
                         reward_extra_infos_dict: dict[str, list]
                         if self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                        if tale_budget_hard_truncated:
+                            reward_tensor = _truncate_response_tensor_to_batch(reward_tensor, batch)
                         batch.batch["token_level_scores"] = reward_tensor
 
                         if reward_extra_infos_dict:
@@ -1245,6 +1661,9 @@ class RayPPOTrainer:
                                 selection_config=candidate_selection_config,
                             )
                             metrics.update(candidate_selection_metrics)
+                            batch.meta_info["global_token_num"] = torch.sum(
+                                batch.batch["attention_mask"], dim=-1
+                            ).tolist()
 
                         # Compute rollout correction: IS weights, rejection sampling, and metrics
                         # Only runs in decoupled mode (computes once per batch using stable π_old)
