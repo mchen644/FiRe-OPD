@@ -20,6 +20,7 @@ from verl.base_config import BaseConfig
 __all__ = [
     "AlgoConfig",
     "CandidateSelectionConfig",
+    "DifficultyAwareOpdConfig",
     "FilterGroupsConfig",
     "KLControlConfig",
     "RethinkingOpdProbeConfig",
@@ -385,6 +386,23 @@ class RethinkingOpdProbeConfig(BaseConfig):
 
 
 @dataclass
+class DifficultyAwareOpdConfig(BaseConfig):
+    """Single-rollout difficulty routing for Budget20 OPD."""
+
+    enabled: bool = False
+    method: str = "two_signal_prompt_esr_entropy"
+    correct_reward_threshold: float = 0.5
+    confidence_rank_scope: str = "batch"
+    easy_prompt_threshold: float = 0.7
+    easy_prompt_style: str = "concise"
+    default_prompt_style: str = "budget"
+    base_esr_beta: Optional[float] = None
+    min_easy_esr_beta: float = 0.10
+    easy_esr_delta: float = 0.10
+    hard_entropy_coef: float = 0.001
+
+
+@dataclass
 class AlgoConfig(BaseConfig):
     """Configuration for the algorithm.
 
@@ -431,6 +449,7 @@ class AlgoConfig(BaseConfig):
     candidate_selection: Optional[CandidateSelectionConfig] = field(default_factory=CandidateSelectionConfig)
     tale_budget: TaleBudgetConfig = field(default_factory=TaleBudgetConfig)
     rethinking_opd_probe: RethinkingOpdProbeConfig = field(default_factory=RethinkingOpdProbeConfig)
+    difficulty_aware_opd: DifficultyAwareOpdConfig = field(default_factory=DifficultyAwareOpdConfig)
     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None

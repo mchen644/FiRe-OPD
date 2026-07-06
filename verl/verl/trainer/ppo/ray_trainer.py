@@ -322,10 +322,13 @@ def _apply_online_tale_budget_prompts(
         if "response_mask" not in batch.batch.keys():
             raise ValueError("algorithm.tale_budget.source=rollout_length requires response_mask in batch.")
         max_budget = tale_budget_config.get("rollout_length_max_budget", None)
+        esr_beta_value = tale_budget_config.get("esr_beta", 1.0)
+        if "difficulty_aware_esr_beta" in batch.batch.keys():
+            esr_beta_value = batch.batch["difficulty_aware_esr_beta"]
         result = compute_rollout_length_tale_budget(
             response_mask=batch.batch["response_mask"],
             alpha=float(tale_budget_config.get("rollout_length_alpha", 0.8)),
-            beta=float(tale_budget_config.get("esr_beta", 1.0)),
+            beta=esr_beta_value,
             min_budget=int(tale_budget_config.min_budget),
             round_to=int(tale_budget_config.round_to),
             max_budget=None if max_budget is None else int(max_budget),
@@ -338,6 +341,7 @@ def _apply_online_tale_budget_prompts(
             for response_length in response_lengths
         ]
         batch.batch["tale_budget_esr_loss_mask"] = result.esr_loss_mask
+        batch.batch["tale_budget_response_lengths"] = result.response_lengths.detach().to(dtype=torch.long)
         esr_tokens = result.esr_tokens.float()
         response_lengths_tensor = result.response_lengths.float().clamp(min=1.0)
         metrics = summarize_tale_budget_metrics(raw_budgets=raw_budgets, budgets=budgets)
@@ -381,17 +385,27 @@ def _apply_online_tale_budget_prompts(
     else:
         raise ValueError(f"Unsupported algorithm.tale_budget.source={source!r}")
 
-    if teacher_prompt_style == "budget":
-        teacher_prompts = [
-            build_tale_budget_teacher_messages(question=question, budget=budget)
-            for question, budget in zip(questions, budgets, strict=True)
-        ]
-    elif teacher_prompt_style == "normal":
-        teacher_prompts = [deepcopy(messages) for messages in batch.non_tensor_batch["raw_prompt"]]
-    elif teacher_prompt_style == "concise":
-        teacher_prompts = [build_concise_teacher_messages(question=question) for question in questions]
-    else:
-        raise ValueError(f"Unsupported resolved TALE teacher prompt style: {teacher_prompt_style!r}")
+    per_sample_prompt_styles = batch.non_tensor_batch.get("difficulty_aware_prompt_style", None)
+    if per_sample_prompt_styles is None:
+        per_sample_prompt_styles = np.array([teacher_prompt_style] * len(questions), dtype=object)
+
+    teacher_prompts = []
+    for question, budget, row_style, raw_messages in zip(
+        questions,
+        budgets,
+        per_sample_prompt_styles.tolist(),
+        batch.non_tensor_batch["raw_prompt"].tolist(),
+        strict=True,
+    ):
+        row_style = str(row_style)
+        if row_style == "budget":
+            teacher_prompts.append(build_tale_budget_teacher_messages(question=question, budget=budget))
+        elif row_style == "normal":
+            teacher_prompts.append(deepcopy(raw_messages))
+        elif row_style == "concise":
+            teacher_prompts.append(build_concise_teacher_messages(question=question))
+        else:
+            raise ValueError(f"Unsupported per-sample teacher prompt style: {row_style!r}")
 
     teacher_prompt_key = tale_budget_config.teacher_prompt_key
     batch.non_tensor_batch[teacher_prompt_key] = _object_array(teacher_prompts)
@@ -399,6 +413,52 @@ def _apply_online_tale_budget_prompts(
     batch.non_tensor_batch["tale_budget_raw"] = _object_array(raw_budgets)
     batch.non_tensor_batch["tale_budget_estimate_text"] = _object_array(estimate_texts)
     return metrics
+
+
+def _difficulty_aware_opd_enabled(config) -> bool:
+    difficulty_config = config.algorithm.get("difficulty_aware_opd", None)
+    return bool(difficulty_config and difficulty_config.get("enabled", False))
+
+
+
+def _apply_difficulty_aware_opd_routing(
+    *,
+    batch: DataProto,
+    reward_tensor: torch.Tensor,
+    difficulty_config,
+    base_esr_beta: float,
+    metrics: dict,
+) -> None:
+    from verl.trainer.ppo.difficulty_aware_opd import (
+        compute_two_signal_difficulty_routing,
+        summarize_difficulty_routing,
+    )
+
+    if "old_log_probs" not in batch.batch.keys():
+        raise ValueError("difficulty-aware OPD routing requires old_log_probs")
+    if "response_mask" not in batch.batch.keys():
+        raise ValueError("difficulty-aware OPD routing requires response_mask")
+
+    result = compute_two_signal_difficulty_routing(
+        token_level_scores=reward_tensor,
+        old_log_probs=batch.batch["old_log_probs"],
+        response_mask=batch.batch["response_mask"],
+        config=difficulty_config,
+        base_esr_beta=base_esr_beta,
+    )
+    target_device = batch.batch["response_mask"].device
+    batch.batch["difficulty_aware_correct"] = result.correct.to(device=target_device)
+    batch.batch["difficulty_aware_confidence_rank"] = result.confidence_rank.to(device=target_device)
+    batch.batch["difficulty_aware_easy"] = result.easy.to(device=target_device)
+    batch.batch["difficulty_aware_hard"] = result.hard.to(device=target_device)
+    batch.batch["difficulty_aware_esr_beta"] = result.esr_beta.to(device=target_device)
+    if torch.any(result.entropy_weight > 0):
+        batch.batch["difficulty_aware_entropy_weight"] = result.entropy_weight.to(device=target_device)
+    batch.non_tensor_batch["difficulty_aware_prompt_style"] = result.prompt_styles
+
+    original_lengths = batch.batch["response_mask"].to(dtype=torch.long).sum(dim=-1)
+    metrics.update(summarize_difficulty_routing(result, original_response_lengths=original_lengths))
+
 
 
 def _rethinking_probe_enabled(config) -> bool:
@@ -1447,6 +1507,8 @@ class RayPPOTrainer:
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
+                    reward_tensor = None
+                    reward_extra_infos_dict = {}
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
@@ -1504,6 +1566,24 @@ class RayPPOTrainer:
                                 metrics.update(calculate_debug_metrics(batch))
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
+
+                    if _difficulty_aware_opd_enabled(self.config):
+                        if self.config.reward_model.launch_reward_fn_async and reward_tensor is None:
+                            reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                        difficulty_config = self.config.algorithm.difficulty_aware_opd
+                        tale_budget_config_for_da = self.config.algorithm.get("tale_budget", None)
+                        configured_base_esr_beta = difficulty_config.get("base_esr_beta", None)
+                        if configured_base_esr_beta is None:
+                            base_esr_beta = float(tale_budget_config_for_da.get("esr_beta", 0.2))
+                        else:
+                            base_esr_beta = float(configured_base_esr_beta)
+                        _apply_difficulty_aware_opd_routing(
+                            batch=batch,
+                            reward_tensor=reward_tensor,
+                            difficulty_config=difficulty_config,
+                            base_esr_beta=base_esr_beta,
+                            metrics=metrics,
+                        )
 
                     tale_budget_hard_truncated = False
                     if self.use_reference_policy:
@@ -1642,7 +1722,7 @@ class RayPPOTrainer:
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
-                        if self.config.reward_model.launch_reward_fn_async:
+                        if self.config.reward_model.launch_reward_fn_async and reward_tensor is None:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         if tale_budget_hard_truncated:
                             reward_tensor = _truncate_response_tensor_to_batch(reward_tensor, batch)

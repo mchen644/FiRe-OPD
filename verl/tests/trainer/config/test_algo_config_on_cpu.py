@@ -196,6 +196,41 @@ class TestAlgoConfig(unittest.TestCase):
         assert probe.csv_path == "/tmp/rethinking_probe.csv"
         assert probe.log_prefix == "rethinking_opd"
 
+    def test_yaml_accepts_difficulty_aware_opd_overrides(self):
+        config = None
+
+        import os
+
+        from hydra import compose, initialize_config_dir
+        from hydra.core.global_hydra import GlobalHydra
+
+        GlobalHydra.instance().clear()
+        try:
+            config_dir = os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "..", "..", "..", "verl", "trainer", "config")
+            )
+            with initialize_config_dir(config_dir=config_dir):
+                config = omega_conf_to_dataclass(
+                    compose(
+                        config_name="ppo_trainer",
+                        overrides=[
+                            "algorithm.difficulty_aware_opd.enabled=True",
+                            "algorithm.difficulty_aware_opd.easy_prompt_threshold=0.75",
+                            "algorithm.difficulty_aware_opd.min_easy_esr_beta=0.1",
+                            "algorithm.difficulty_aware_opd.hard_entropy_coef=0.003",
+                        ],
+                    ).algorithm
+                )
+        finally:
+            GlobalHydra.instance().clear()
+
+        da = config.difficulty_aware_opd
+        assert da.enabled is True
+        assert da.method == "two_signal_prompt_esr_entropy"
+        assert da.easy_prompt_threshold == 0.75
+        assert da.min_easy_esr_beta == 0.1
+        assert da.hard_entropy_coef == 0.003
+
 
 class TestAlgoCompute(unittest.TestCase):
     """Test the AlgoConfig dataclass and its integration with core algorithms."""
