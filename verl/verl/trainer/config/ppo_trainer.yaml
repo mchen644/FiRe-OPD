@@ -218,6 +218,45 @@ algorithm:
     # Whether to add metrics to the normal training logger
     include_scalar_logger: True
 
+  # Single-rollout difficulty-routed Budget20 OPD
+  difficulty_aware_opd:
+
+    # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+    _target_: verl.trainer.config.DifficultyAwareOpdConfig
+
+    # Whether to enable correctness-confidence prompt/ESR routing and hard entropy
+    enabled: False
+
+    # Routing method; currently only two_signal_prompt_esr_entropy is supported
+    method: two_signal_prompt_esr_entropy
+
+    # Sequence reward threshold above which a rollout is considered correct
+    correct_reward_threshold: 0.5
+
+    # Confidence rank scope; currently only batch is supported
+    confidence_rank_scope: batch
+
+    # Easy samples with easy_i >= threshold use easy_prompt_style
+    easy_prompt_threshold: 0.7
+
+    # Teacher prompt style for easy samples
+    easy_prompt_style: concise
+
+    # Teacher prompt style for non-easy samples
+    default_prompt_style: budget
+
+    # Base ESR beta; null means use algorithm.tale_budget.esr_beta
+    base_esr_beta: null
+
+    # Minimum ESR beta for easy samples
+    min_easy_esr_beta: 0.10
+
+    # Easy compression delta: esr_beta_i = base_esr_beta - easy_esr_delta * easy_i
+    easy_esr_delta: 0.10
+
+    # Coefficient for hard-gated max-entropy loss
+    hard_entropy_coef: 0.001
+
 # config for the trainer
 trainer:
 
