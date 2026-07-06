@@ -1,6 +1,9 @@
 from types import SimpleNamespace
 
+import numpy as np
 import torch
+
+from verl import DataProto
 
 from verl.trainer.ppo.difficulty_aware_opd import (
     compute_two_signal_difficulty_routing,
@@ -90,3 +93,34 @@ def test_summarize_difficulty_routing_emits_proxy_diagnostics():
     assert metrics["difficulty_aware_opd/orig_response_length_mean"] == 15.0
     assert "difficulty_aware_opd/wrong_high_conf_ratio" in metrics
     assert "difficulty_aware_opd/correct_low_conf_ratio" in metrics
+
+
+def test_apply_difficulty_aware_opd_routing_adds_batch_tensors_and_metrics():
+    from verl.trainer.ppo.ray_trainer import _apply_difficulty_aware_opd_routing
+
+    response_mask = torch.ones((2, 3), dtype=torch.float32)
+    old_log_probs = torch.tensor([[-0.1, -0.1, -0.1], [-2.0, -2.0, -2.0]], dtype=torch.float32)
+    reward_tensor = torch.zeros_like(response_mask)
+    reward_tensor[0, -1] = 1.0
+    batch = DataProto.from_dict(
+        tensors={
+            "response_mask": response_mask,
+            "old_log_probs": old_log_probs,
+        }
+    )
+    metrics = {}
+
+    _apply_difficulty_aware_opd_routing(
+        batch=batch,
+        reward_tensor=reward_tensor,
+        difficulty_config=_cfg(),
+        base_esr_beta=0.20,
+        metrics=metrics,
+    )
+
+    assert batch.batch["difficulty_aware_correct"].tolist() == [1.0, 0.0]
+    assert batch.non_tensor_batch["difficulty_aware_prompt_style"].tolist() == ["concise", "budget"]
+    assert batch.batch["difficulty_aware_esr_beta"][0].item() < 0.20
+    assert batch.batch["difficulty_aware_entropy_weight"][1].item() > 0.0
+    assert metrics["difficulty_aware_opd/correct_rate"] == 0.5
+    assert metrics["difficulty_aware_opd/concise_prompt_ratio"] == 0.5
