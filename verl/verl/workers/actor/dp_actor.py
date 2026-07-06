@@ -197,6 +197,30 @@ def _apply_tale_budget_esr_loss_mask(response_mask: torch.Tensor, model_inputs: 
     return response_mask * esr_loss_mask
 
 
+def _compute_difficulty_aware_entropy_loss(
+    *,
+    entropy: torch.Tensor,
+    response_mask: torch.Tensor,
+    entropy_weight: torch.Tensor,
+    loss_agg_mode: str,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    entropy_weight = entropy_weight.to(device=entropy.device, dtype=entropy.dtype)
+    if entropy_weight.dim() != 1 or entropy_weight.shape[0] != entropy.shape[0]:
+        raise ValueError("difficulty_aware_entropy_weight must have shape [batch]")
+    if torch.all(entropy_weight <= 0):
+        zero = entropy.sum() * 0.0
+        return zero, {"difficulty_aware_opd/hard_entropy_weight_mean": 0.0, "difficulty_aware_opd/hard_entropy_loss": 0.0}
+
+    weighted_entropy = entropy * entropy_weight.unsqueeze(-1)
+    entropy_loss = -agg_loss(loss_mat=weighted_entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+    metrics = {
+        "difficulty_aware_opd/hard_entropy_weight_mean": entropy_weight.float().mean().item(),
+        "difficulty_aware_opd/hard_entropy_loss": entropy_loss.detach().item(),
+    }
+    return entropy_loss, metrics
+
+
+
 def _maybe_compute_rollout_corr_metrics(
     loss_mode: str,
     log_prob: torch.Tensor,
@@ -905,6 +929,8 @@ class DataParallelPPOActor(BasePPOActor):
         # Include rollout_log_probs for computing rollout_corr metrics in bypass mode
         if "rollout_log_probs" in data.batch.keys():
             select_keys.append("rollout_log_probs")
+        if "difficulty_aware_entropy_weight" in data.batch.keys():
+            select_keys.append("difficulty_aware_entropy_weight")
          # Include code teacher log probs for multi-teacher distillation
         if "base_ref_log_prob" in data.batch.keys():
             select_keys.append("base_ref_log_prob")
@@ -915,6 +941,7 @@ class DataParallelPPOActor(BasePPOActor):
 
         # Include entropy tensors for entropy-aware distillation
         entropy_aware = getattr(self.config.policy_loss, "entropy_aware_distill", False)
+        difficulty_aware_entropy = "difficulty_aware_entropy_weight" in data.batch.keys()
         length_aware_opd = (
             getattr(self.config.policy_loss, "length_aware_opd", False)
             and self.config.policy_loss.only_reverse_kl_advantages
@@ -988,7 +1015,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                     # all return: (bsz, response_length)
                     # For entropy-aware distillation, always compute current student entropy
-                    calculate_entropy = entropy_coeff != 0 or entropy_aware
+                    calculate_entropy = entropy_coeff != 0 or entropy_aware or difficulty_aware_entropy
                     entropy, log_prob, _ = self._forward_micro_batch(
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
@@ -1051,6 +1078,16 @@ class DataParallelPPOActor(BasePPOActor):
                             rollout_is_weights=rollout_is_weights,
                         )
                         micro_batch_metrics.update(pg_metrics)
+
+                    if "difficulty_aware_entropy_weight" in model_inputs:
+                        difficulty_entropy_loss, difficulty_entropy_metrics = _compute_difficulty_aware_entropy_loss(
+                            entropy=entropy,
+                            response_mask=response_mask,
+                            entropy_weight=model_inputs["difficulty_aware_entropy_weight"],
+                            loss_agg_mode=loss_agg_mode,
+                        )
+                        pg_loss = pg_loss + difficulty_entropy_loss
+                        micro_batch_metrics.update(difficulty_entropy_metrics)
 
                     # Skip if using pure rollout correction mode (metrics already in pg_metrics)
                     rollout_log_prob = model_inputs.get("rollout_log_probs", None)

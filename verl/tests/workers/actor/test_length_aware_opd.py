@@ -8,6 +8,7 @@ from verl.trainer.ppo.core_algos import compute_policy_loss_vanilla
 from verl.workers.actor.dp_actor import (
     _add_length_aware_opd_tensors,
     _apply_length_aware_opd_penalty,
+    _compute_difficulty_aware_entropy_loss,
     _compute_length_aware_opd_tensors,
 )
 
@@ -28,6 +29,39 @@ def _policy_loss_config(**overrides):
 class _ActorLossConfig(SimpleNamespace):
     def get(self, name, default=None):
         return getattr(self, name, default)
+
+
+def test_difficulty_aware_entropy_loss_is_negative_and_weighted():
+    entropy = torch.tensor([[0.5, 1.0, 0.0], [2.0, 0.0, 0.0]], dtype=torch.float32)
+    response_mask = torch.tensor([[1, 1, 0], [1, 0, 0]], dtype=torch.float32)
+    entropy_weight = torch.tensor([0.0, 0.01], dtype=torch.float32)
+
+    loss, metrics = _compute_difficulty_aware_entropy_loss(
+        entropy=entropy,
+        response_mask=response_mask,
+        entropy_weight=entropy_weight,
+        loss_agg_mode="token-mean",
+    )
+
+    assert loss.item() < 0.0
+    assert abs(metrics["difficulty_aware_opd/hard_entropy_weight_mean"] - 0.005) < 1e-8
+    assert metrics["difficulty_aware_opd/hard_entropy_loss"] == loss.item()
+
+
+def test_difficulty_aware_entropy_loss_returns_zero_without_valid_weight():
+    entropy = torch.ones((2, 3), dtype=torch.float32)
+    response_mask = torch.ones((2, 3), dtype=torch.float32)
+    entropy_weight = torch.zeros(2, dtype=torch.float32)
+
+    loss, metrics = _compute_difficulty_aware_entropy_loss(
+        entropy=entropy,
+        response_mask=response_mask,
+        entropy_weight=entropy_weight,
+        loss_agg_mode="token-mean",
+    )
+
+    assert loss.item() == 0.0
+    assert metrics["difficulty_aware_opd/hard_entropy_weight_mean"] == 0.0
 
 
 def test_length_penalty_penalizes_long_incorrect_response_only():
