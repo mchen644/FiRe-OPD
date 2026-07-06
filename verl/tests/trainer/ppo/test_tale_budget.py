@@ -433,6 +433,65 @@ def test_apply_online_tale_budget_prompts_can_use_concise_teacher_prompt_with_es
 
 
 
+def test_apply_online_tale_budget_prompts_uses_per_sample_difficulty_routing():
+    from verl.trainer.ppo.ray_trainer import _apply_online_tale_budget_prompts
+
+    raw_prompts = _object_array(
+        [
+            [{"role": "user", "content": "Easy problem?\nPlease reason step by step, and put your final answer within \\boxed{}."}],
+            [{"role": "user", "content": "Hard problem?"}],
+        ]
+    )
+    response_mask = torch.tensor(
+        [
+            [1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+            [1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+        ],
+        dtype=torch.long,
+    )
+    batch = DataProto.from_dict(
+        tensors={
+            "input_ids": torch.ones((2, 12), dtype=torch.long),
+            "response_mask": response_mask,
+            "difficulty_aware_esr_beta": torch.tensor([0.1, 0.2], dtype=torch.float32),
+        },
+        non_tensors={
+            "raw_prompt": raw_prompts,
+            "difficulty_aware_prompt_style": _object_array(["concise", "budget"]),
+        },
+    )
+    tokenizer = FakeBudgetTokenizer([])
+    rollout_worker = FakeBudgetRolloutWorker()
+    config = TaleBudgetConfig(
+        enabled=True,
+        source="rollout_length",
+        min_budget=1,
+        max_budget=8192,
+        round_to=1,
+        rollout_length_alpha=1.0,
+        esr_beta=0.2,
+        teacher_prompt_style="budget",
+    )
+
+    metrics = _apply_online_tale_budget_prompts(
+        batch=batch,
+        actor_rollout_wg=rollout_worker,
+        tokenizer=tokenizer,
+        tale_budget_config=config,
+        max_prompt_length=512,
+        truncation="error",
+        apply_chat_template_kwargs={"enable_thinking": False},
+    )
+
+    prompts = batch.non_tensor_batch["teacher_prompt"].tolist()
+    assert "Solve concisely" in prompts[0][0]["content"]
+    assert "use less than 10 tokens" in prompts[1][0]["content"]
+    assert batch.batch["tale_budget_response_lengths"].tolist() == [10, 10]
+    assert batch.batch["tale_budget_esr_loss_mask"].sum(dim=-1).tolist() == [1, 2]
+    assert metrics["tale_budget/esr_tokens_mean"] == 1.5
+    assert abs(metrics["tale_budget/esr_supervised_fraction_mean"] - 0.15) < 1e-6
+
+
 def test_truncate_to_tale_budget_esr_physically_keeps_only_prefix_needed_for_training():
     responses = torch.tensor(
         [

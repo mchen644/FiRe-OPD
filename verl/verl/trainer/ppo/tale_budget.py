@@ -214,7 +214,7 @@ def compute_rollout_length_tale_budget(
     *,
     response_mask: torch.Tensor,
     alpha: float,
-    beta: float,
+    beta: float | torch.Tensor,
     min_budget: int,
     round_to: int,
     max_budget: int | None = None,
@@ -231,8 +231,16 @@ def compute_rollout_length_tale_budget(
         raise ValueError("response_mask must be a 2D tensor")
     if alpha <= 0.0:
         raise ValueError("alpha must be positive")
-    if beta <= 0.0:
-        raise ValueError("beta must be positive")
+    if isinstance(beta, torch.Tensor):
+        beta_values = beta.to(device=response_mask.device, dtype=torch.float32)
+        if beta_values.dim() != 1 or beta_values.shape[0] != response_mask.shape[0]:
+            raise ValueError("beta tensor must have shape [batch]")
+        if torch.any(beta_values <= 0.0):
+            raise ValueError("all beta values must be positive")
+    else:
+        if beta <= 0.0:
+            raise ValueError("beta must be positive")
+        beta_values = torch.full((response_mask.shape[0],), float(beta), device=response_mask.device)
     if min_budget <= 0:
         raise ValueError("min_budget must be positive")
     if round_to <= 0:
@@ -247,7 +255,7 @@ def compute_rollout_length_tale_budget(
     if max_budget is not None:
         budgets = budgets.clamp(max=int(max_budget))
 
-    esr_tokens = torch.round(budgets.float() * float(beta)).to(dtype=torch.long)
+    esr_tokens = torch.round(budgets.float() * beta_values).to(dtype=torch.long)
     esr_tokens = torch.minimum(esr_tokens.clamp(min=0), response_lengths)
     positions = torch.arange(response_mask.shape[-1], device=response_mask.device).unsqueeze(0)
     esr_loss_mask = ((positions < esr_tokens.unsqueeze(1)) & response_mask.bool()).to(dtype=response_mask.dtype)

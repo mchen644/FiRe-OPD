@@ -322,10 +322,13 @@ def _apply_online_tale_budget_prompts(
         if "response_mask" not in batch.batch.keys():
             raise ValueError("algorithm.tale_budget.source=rollout_length requires response_mask in batch.")
         max_budget = tale_budget_config.get("rollout_length_max_budget", None)
+        esr_beta_value = tale_budget_config.get("esr_beta", 1.0)
+        if "difficulty_aware_esr_beta" in batch.batch.keys():
+            esr_beta_value = batch.batch["difficulty_aware_esr_beta"]
         result = compute_rollout_length_tale_budget(
             response_mask=batch.batch["response_mask"],
             alpha=float(tale_budget_config.get("rollout_length_alpha", 0.8)),
-            beta=float(tale_budget_config.get("esr_beta", 1.0)),
+            beta=esr_beta_value,
             min_budget=int(tale_budget_config.min_budget),
             round_to=int(tale_budget_config.round_to),
             max_budget=None if max_budget is None else int(max_budget),
@@ -338,6 +341,7 @@ def _apply_online_tale_budget_prompts(
             for response_length in response_lengths
         ]
         batch.batch["tale_budget_esr_loss_mask"] = result.esr_loss_mask
+        batch.batch["tale_budget_response_lengths"] = result.response_lengths.detach().to(dtype=torch.long)
         esr_tokens = result.esr_tokens.float()
         response_lengths_tensor = result.response_lengths.float().clamp(min=1.0)
         metrics = summarize_tale_budget_metrics(raw_budgets=raw_budgets, budgets=budgets)
@@ -381,17 +385,27 @@ def _apply_online_tale_budget_prompts(
     else:
         raise ValueError(f"Unsupported algorithm.tale_budget.source={source!r}")
 
-    if teacher_prompt_style == "budget":
-        teacher_prompts = [
-            build_tale_budget_teacher_messages(question=question, budget=budget)
-            for question, budget in zip(questions, budgets, strict=True)
-        ]
-    elif teacher_prompt_style == "normal":
-        teacher_prompts = [deepcopy(messages) for messages in batch.non_tensor_batch["raw_prompt"]]
-    elif teacher_prompt_style == "concise":
-        teacher_prompts = [build_concise_teacher_messages(question=question) for question in questions]
-    else:
-        raise ValueError(f"Unsupported resolved TALE teacher prompt style: {teacher_prompt_style!r}")
+    per_sample_prompt_styles = batch.non_tensor_batch.get("difficulty_aware_prompt_style", None)
+    if per_sample_prompt_styles is None:
+        per_sample_prompt_styles = np.array([teacher_prompt_style] * len(questions), dtype=object)
+
+    teacher_prompts = []
+    for question, budget, row_style, raw_messages in zip(
+        questions,
+        budgets,
+        per_sample_prompt_styles.tolist(),
+        batch.non_tensor_batch["raw_prompt"].tolist(),
+        strict=True,
+    ):
+        row_style = str(row_style)
+        if row_style == "budget":
+            teacher_prompts.append(build_tale_budget_teacher_messages(question=question, budget=budget))
+        elif row_style == "normal":
+            teacher_prompts.append(deepcopy(raw_messages))
+        elif row_style == "concise":
+            teacher_prompts.append(build_concise_teacher_messages(question=question))
+        else:
+            raise ValueError(f"Unsupported per-sample teacher prompt style: {row_style!r}")
 
     teacher_prompt_key = tale_budget_config.teacher_prompt_key
     batch.non_tensor_batch[teacher_prompt_key] = _object_array(teacher_prompts)
