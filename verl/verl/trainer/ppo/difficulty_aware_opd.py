@@ -22,6 +22,7 @@ class DifficultyAwareRoutingResult:
     prompt_styles: np.ndarray
     sequence_rewards: torch.Tensor
     student_logp_mean: torch.Tensor
+    easy_prompt_threshold: float
 
 
 def _config_get(config, name: str, default):
@@ -117,6 +118,7 @@ def compute_two_signal_difficulty_routing(
         prompt_styles=prompt_styles,
         sequence_rewards=sequence_rewards.detach(),
         student_logp_mean=student_logp_mean.detach(),
+        easy_prompt_threshold=easy_threshold,
     )
 
 
@@ -135,8 +137,8 @@ def summarize_difficulty_routing(
     concise_count = sum(style == "concise" for style in prompt_styles)
     budget_count = sum(style == "budget" for style in prompt_styles)
     wrong = 1.0 - result.correct
-    high_conf = result.confidence_rank >= 0.7
-    low_conf = result.confidence_rank <= 0.3
+    high_conf = result.confidence_rank >= result.easy_prompt_threshold
+    low_conf = result.confidence_rank <= (1.0 - result.easy_prompt_threshold)
     metrics = {
         "difficulty_aware_opd/enabled": 1.0,
         "difficulty_aware_opd/correct_rate": _safe_mean(result.correct),
