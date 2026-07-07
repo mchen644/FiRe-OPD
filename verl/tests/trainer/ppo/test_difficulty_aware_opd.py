@@ -73,6 +73,46 @@ def test_two_signal_routing_marks_correct_high_conf_easy_and_wrong_low_conf_hard
     assert result.entropy_weight[3].item() < result.entropy_weight[1].item()
 
 
+def test_hard_prompt_routing_uses_normal_prompt_without_changing_budget20_esr():
+    response_mask = torch.ones((4, 3), dtype=torch.float32)
+    old_log_probs = torch.tensor(
+        [
+            [-0.1, -0.1, -0.1],  # highest confidence, correct -> budget because easy routing disabled
+            [-3.0, -3.0, -3.0],  # lowest confidence, wrong -> hard -> normal
+            [-2.0, -2.0, -2.0],  # medium-low confidence, wrong -> below hard threshold -> budget
+            [-1.0, -1.0, -1.0],  # medium-high confidence, correct -> budget
+        ],
+        dtype=torch.float32,
+    )
+    token_level_scores = torch.zeros_like(response_mask)
+    token_level_scores[0, -1] = 1.0
+    token_level_scores[3, -1] = 1.0
+
+    result = compute_two_signal_difficulty_routing(
+        token_level_scores=token_level_scores,
+        old_log_probs=old_log_probs,
+        response_mask=response_mask,
+        config=_cfg(
+            easy_prompt_threshold=1.1,
+            easy_prompt_style="budget",
+            default_prompt_style="budget",
+            hard_prompt_threshold=0.7,
+            hard_prompt_style="normal",
+            min_easy_esr_beta=0.20,
+            easy_esr_delta=0.0,
+            hard_entropy_coef=0.0,
+        ),
+        base_esr_beta=0.20,
+    )
+
+    assert result.correct.tolist() == [1.0, 0.0, 0.0, 1.0]
+    assert result.hard[1].item() >= 0.7
+    assert result.hard[2].item() < 0.7
+    assert result.prompt_styles.tolist() == ["budget", "normal", "budget", "budget"]
+    assert torch.allclose(result.esr_beta.float(), torch.full((4,), 0.20))
+    assert torch.allclose(result.entropy_weight, torch.zeros(4))
+
+
 def test_summarize_difficulty_routing_emits_proxy_diagnostics():
     response_mask = torch.ones((2, 2), dtype=torch.float32)
     old_log_probs = torch.tensor([[-0.1, -0.1], [-2.0, -2.0]], dtype=torch.float32)

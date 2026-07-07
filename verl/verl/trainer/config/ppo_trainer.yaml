@@ -242,8 +242,14 @@ algorithm:
     # Teacher prompt style for easy samples
     easy_prompt_style: concise
 
-    # Teacher prompt style for non-easy samples
+    # Teacher prompt style for non-easy and non-hard samples
     default_prompt_style: budget
+
+    # Optional hard threshold; hard samples with hard_i >= threshold use hard_prompt_style
+    hard_prompt_threshold: null
+
+    # Teacher prompt style for hard samples when hard_prompt_threshold is set
+    hard_prompt_style: normal
 
     # Base ESR beta; null means use algorithm.tale_budget.esr_beta
     base_esr_beta: null

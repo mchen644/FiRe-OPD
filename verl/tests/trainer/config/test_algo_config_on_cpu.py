@@ -18,7 +18,7 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
-from verl.trainer.config import AlgoConfig, KLControlConfig
+from verl.trainer.config import AlgoConfig, DifficultyAwareOpdConfig, KLControlConfig
 from verl.trainer.ppo.core_algos import (
     compute_gae_advantage_return,
     compute_grpo_outcome_advantage,
@@ -196,6 +196,12 @@ class TestAlgoConfig(unittest.TestCase):
         assert probe.csv_path == "/tmp/rethinking_probe.csv"
         assert probe.log_prefix == "rethinking_opd"
 
+    def test_difficulty_aware_opd_hard_prompt_defaults(self):
+        config = DifficultyAwareOpdConfig()
+
+        assert config.hard_prompt_threshold is None
+        assert config.hard_prompt_style == "normal"
+
     def test_yaml_accepts_difficulty_aware_opd_overrides(self):
         config = None
 
@@ -218,6 +224,8 @@ class TestAlgoConfig(unittest.TestCase):
                             "algorithm.difficulty_aware_opd.easy_prompt_threshold=0.75",
                             "algorithm.difficulty_aware_opd.min_easy_esr_beta=0.1",
                             "algorithm.difficulty_aware_opd.hard_entropy_coef=0.003",
+                            "algorithm.difficulty_aware_opd.hard_prompt_threshold=0.7",
+                            "algorithm.difficulty_aware_opd.hard_prompt_style=normal",
                         ],
                     ).algorithm
                 )
@@ -230,6 +238,8 @@ class TestAlgoConfig(unittest.TestCase):
         assert da.easy_prompt_threshold == 0.75
         assert da.min_easy_esr_beta == 0.1
         assert da.hard_entropy_coef == 0.003
+        assert da.hard_prompt_threshold == 0.7
+        assert da.hard_prompt_style == "normal"
 
 
 class TestAlgoCompute(unittest.TestCase):

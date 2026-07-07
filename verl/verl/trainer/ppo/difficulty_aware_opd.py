@@ -79,10 +79,13 @@ def compute_two_signal_difficulty_routing(
 
     easy_prompt_style = str(_config_get(config, "easy_prompt_style", "concise"))
     default_prompt_style = str(_config_get(config, "default_prompt_style", "budget"))
+    hard_prompt_style = str(_config_get(config, "hard_prompt_style", "normal"))
     if easy_prompt_style not in _ALLOWED_PROMPT_STYLES:
         raise ValueError(f"Invalid easy_prompt_style: {easy_prompt_style!r}")
     if default_prompt_style not in _ALLOWED_PROMPT_STYLES:
         raise ValueError(f"Invalid default_prompt_style: {default_prompt_style!r}")
+    if hard_prompt_style not in _ALLOWED_PROMPT_STYLES:
+        raise ValueError(f"Invalid hard_prompt_style: {hard_prompt_style!r}")
 
     sequence_rewards = token_level_scores.float().sum(dim=-1)
     threshold = float(_config_get(config, "correct_reward_threshold", 0.5))
@@ -103,10 +106,17 @@ def compute_two_signal_difficulty_routing(
     entropy_weight = hard * entropy_coef
 
     easy_threshold = float(_config_get(config, "easy_prompt_threshold", 0.7))
-    prompt_styles = np.array(
-        [easy_prompt_style if float(value) >= easy_threshold else default_prompt_style for value in easy.detach().cpu()],
-        dtype=object,
-    )
+    hard_threshold = _config_get(config, "hard_prompt_threshold", None)
+    hard_threshold = None if hard_threshold is None else float(hard_threshold)
+    prompt_styles_list: list[str] = []
+    for easy_value, hard_value in zip(easy.detach().cpu(), hard.detach().cpu(), strict=True):
+        if hard_threshold is not None and float(hard_value) >= hard_threshold:
+            prompt_styles_list.append(hard_prompt_style)
+        elif float(easy_value) >= easy_threshold:
+            prompt_styles_list.append(easy_prompt_style)
+        else:
+            prompt_styles_list.append(default_prompt_style)
+    prompt_styles = np.array(prompt_styles_list, dtype=object)
 
     return DifficultyAwareRoutingResult(
         correct=correct.detach(),
@@ -136,6 +146,7 @@ def summarize_difficulty_routing(
     total = max(len(prompt_styles), 1)
     concise_count = sum(style == "concise" for style in prompt_styles)
     budget_count = sum(style == "budget" for style in prompt_styles)
+    normal_count = sum(style == "normal" for style in prompt_styles)
     wrong = 1.0 - result.correct
     high_conf = result.confidence_rank >= result.easy_prompt_threshold
     low_conf = result.confidence_rank <= (1.0 - result.easy_prompt_threshold)
@@ -155,6 +166,7 @@ def summarize_difficulty_routing(
         "difficulty_aware_opd/hard_max": float(result.hard.float().max().item()) if result.hard.numel() else 0.0,
         "difficulty_aware_opd/concise_prompt_ratio": concise_count / total,
         "difficulty_aware_opd/budget_prompt_ratio": budget_count / total,
+        "difficulty_aware_opd/normal_prompt_ratio": normal_count / total,
         "difficulty_aware_opd/esr_beta_mean": _safe_mean(result.esr_beta),
         "difficulty_aware_opd/esr_beta_min": float(result.esr_beta.float().min().item()) if result.esr_beta.numel() else 0.0,
         "difficulty_aware_opd/esr_beta_max": float(result.esr_beta.float().max().item()) if result.esr_beta.numel() else 0.0,
