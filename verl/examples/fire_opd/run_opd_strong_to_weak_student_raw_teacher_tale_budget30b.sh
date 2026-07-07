@@ -102,4 +102,5 @@ python3 -m verl.trainer.main_ppo \
     trainer.test_freq=10 \
     trainer.total_epochs=3 \
     trainer.resume_mode=auto \
-    ray_kwargs.ray_init.num_cpus=${RAY_NUM_CPUS}
+    ray_kwargs.ray_init.num_cpus=${RAY_NUM_CPUS} \
+    "$@"
