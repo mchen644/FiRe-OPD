@@ -201,6 +201,8 @@ class TestAlgoConfig(unittest.TestCase):
 
         assert config.hard_prompt_threshold is None
         assert config.hard_prompt_style == "normal"
+        assert config.hard_esr_threshold is None
+        assert config.hard_esr_beta is None
 
     def test_yaml_accepts_difficulty_aware_opd_overrides(self):
         config = None
@@ -226,6 +228,8 @@ class TestAlgoConfig(unittest.TestCase):
                             "algorithm.difficulty_aware_opd.hard_entropy_coef=0.003",
                             "algorithm.difficulty_aware_opd.hard_prompt_threshold=0.7",
                             "algorithm.difficulty_aware_opd.hard_prompt_style=normal",
+                            "algorithm.difficulty_aware_opd.hard_esr_threshold=0.5",
+                            "algorithm.difficulty_aware_opd.hard_esr_beta=0.5",
                         ],
                     ).algorithm
                 )
@@ -240,6 +244,8 @@ class TestAlgoConfig(unittest.TestCase):
         assert da.hard_entropy_coef == 0.003
         assert da.hard_prompt_threshold == 0.7
         assert da.hard_prompt_style == "normal"
+        assert da.hard_esr_threshold == 0.5
+        assert da.hard_esr_beta == 0.5
 
 
 class TestAlgoCompute(unittest.TestCase):

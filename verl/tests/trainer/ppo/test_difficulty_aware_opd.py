@@ -113,6 +113,48 @@ def test_hard_prompt_routing_uses_normal_prompt_without_changing_budget20_esr():
     assert torch.allclose(result.entropy_weight, torch.zeros(4))
 
 
+def test_hard_esr_override_expands_supervision_for_hard_normal_samples():
+    response_mask = torch.ones((4, 3), dtype=torch.float32)
+    old_log_probs = torch.tensor(
+        [
+            [-0.1, -0.1, -0.1],  # highest confidence, correct -> budget, 20% ESR
+            [-3.0, -3.0, -3.0],  # lowest confidence, wrong -> hard -> normal, 50% ESR
+            [-2.0, -2.0, -2.0],  # medium-low confidence, wrong -> hard -> normal, 50% ESR
+            [-1.0, -1.0, -1.0],  # medium-high confidence, correct -> budget, 20% ESR
+        ],
+        dtype=torch.float32,
+    )
+    token_level_scores = torch.zeros_like(response_mask)
+    token_level_scores[0, -1] = 1.0
+    token_level_scores[3, -1] = 1.0
+
+    result = compute_two_signal_difficulty_routing(
+        token_level_scores=token_level_scores,
+        old_log_probs=old_log_probs,
+        response_mask=response_mask,
+        config=_cfg(
+            easy_prompt_threshold=1.1,
+            easy_prompt_style="budget",
+            default_prompt_style="budget",
+            hard_prompt_threshold=0.5,
+            hard_prompt_style="normal",
+            hard_esr_threshold=0.5,
+            hard_esr_beta=0.5,
+            min_easy_esr_beta=0.20,
+            easy_esr_delta=0.0,
+            hard_entropy_coef=0.0,
+        ),
+        base_esr_beta=0.20,
+    )
+
+    assert result.correct.tolist() == [1.0, 0.0, 0.0, 1.0]
+    assert result.hard[1].item() >= 0.5
+    assert result.hard[2].item() >= 0.5
+    assert result.prompt_styles.tolist() == ["budget", "normal", "normal", "budget"]
+    assert torch.allclose(result.esr_beta.float(), torch.tensor([0.2, 0.5, 0.5, 0.2]))
+    assert torch.allclose(result.entropy_weight, torch.zeros(4))
+
+
 def test_summarize_difficulty_routing_emits_proxy_diagnostics():
     response_mask = torch.ones((2, 2), dtype=torch.float32)
     old_log_probs = torch.tensor([[-0.1, -0.1], [-2.0, -2.0]], dtype=torch.float32)

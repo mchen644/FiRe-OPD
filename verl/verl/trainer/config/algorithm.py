@@ -398,6 +398,8 @@ class DifficultyAwareOpdConfig(BaseConfig):
     default_prompt_style: str = "budget"
     hard_prompt_threshold: Optional[float] = None
     hard_prompt_style: str = "normal"
+    hard_esr_threshold: Optional[float] = None
+    hard_esr_beta: Optional[float] = None
     base_esr_beta: Optional[float] = None
     min_easy_esr_beta: float = 0.10
     easy_esr_delta: float = 0.10

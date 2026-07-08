@@ -101,6 +101,15 @@ def compute_two_signal_difficulty_routing(
     min_beta = float(_config_get(config, "min_easy_esr_beta", 0.10))
     delta = float(_config_get(config, "easy_esr_delta", 0.10))
     esr_beta = torch.clamp(base - delta * easy.to(dtype=torch.float64), min=min_beta, max=float(base_esr_beta))
+    hard_esr_threshold = _config_get(config, "hard_esr_threshold", None)
+    hard_esr_beta = _config_get(config, "hard_esr_beta", None)
+    if hard_esr_threshold is not None and hard_esr_beta is not None:
+        hard_esr_threshold = float(hard_esr_threshold)
+        hard_esr_beta = float(hard_esr_beta)
+        if hard_esr_beta <= 0.0:
+            raise ValueError("hard_esr_beta must be positive")
+        hard_esr_mask = hard.to(dtype=torch.float64) >= hard_esr_threshold
+        esr_beta = torch.where(hard_esr_mask, torch.full_like(esr_beta, hard_esr_beta), esr_beta)
 
     entropy_coef = float(_config_get(config, "hard_entropy_coef", 0.001))
     entropy_weight = hard * entropy_coef

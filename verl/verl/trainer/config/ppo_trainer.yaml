@@ -251,6 +251,12 @@ algorithm:
     # Teacher prompt style for hard samples when hard_prompt_threshold is set
     hard_prompt_style: normal
 
+    # Optional hard threshold for overriding ESR beta on hard samples
+    hard_esr_threshold: null
+
+    # Optional ESR beta for hard samples with hard_i >= hard_esr_threshold
+    hard_esr_beta: null
+
     # Base ESR beta; null means use algorithm.tale_budget.esr_beta
     base_esr_beta: null
 
