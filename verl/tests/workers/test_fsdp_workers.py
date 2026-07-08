@@ -15,7 +15,13 @@ import os
 
 from omegaconf import OmegaConf
 
-from verl.workers.fsdp_workers import ActorRolloutRefWorker
+from verl.workers.fsdp_workers import ActorRolloutRefWorker, _should_calculate_log_prob_entropy
+
+
+def test_log_prob_entropy_meta_flag_defaults_true_and_can_disable():
+    assert _should_calculate_log_prob_entropy({}) is True
+    assert _should_calculate_log_prob_entropy({"calculate_entropy": True}) is True
+    assert _should_calculate_log_prob_entropy({"calculate_entropy": False}) is False
 
 
 def test_actor_rollout_ref_worker_actor_ref_model():

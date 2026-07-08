@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
+from omegaconf import OmegaConf
 
 from verl import DataProto
 
@@ -175,6 +176,54 @@ def test_summarize_difficulty_routing_emits_proxy_diagnostics():
     assert metrics["difficulty_aware_opd/orig_response_length_mean"] == 15.0
     assert "difficulty_aware_opd/wrong_high_conf_ratio" in metrics
     assert "difficulty_aware_opd/correct_low_conf_ratio" in metrics
+
+
+def test_old_log_prob_entropy_is_skipped_without_entropy_consumers():
+    from verl.trainer.ppo.ray_trainer import _old_log_prob_entropy_required
+
+    config = OmegaConf.create(
+        {
+            "actor_rollout_ref": {
+                "actor": {
+                    "entropy_coeff": 0,
+                    "policy_loss": {"entropy_aware_distill": False},
+                }
+            },
+            "algorithm": {
+                "rethinking_opd_probe": {"enabled": False},
+                "difficulty_aware_opd": {"enabled": False, "hard_entropy_coef": 0.001},
+            },
+        }
+    )
+
+    assert _old_log_prob_entropy_required(config) is False
+
+
+def test_old_log_prob_entropy_is_required_for_probe_or_entropy_distill():
+    from verl.trainer.ppo.ray_trainer import _old_log_prob_entropy_required
+
+    probe_config = OmegaConf.create(
+        {
+            "actor_rollout_ref": {"actor": {"entropy_coeff": 0, "policy_loss": {"entropy_aware_distill": False}}},
+            "algorithm": {"rethinking_opd_probe": {"enabled": True}},
+        }
+    )
+    distill_config = OmegaConf.create(
+        {
+            "actor_rollout_ref": {"actor": {"entropy_coeff": 0, "policy_loss": {"entropy_aware_distill": True}}},
+            "algorithm": {"rethinking_opd_probe": {"enabled": False}},
+        }
+    )
+    entropy_bonus_config = OmegaConf.create(
+        {
+            "actor_rollout_ref": {"actor": {"entropy_coeff": 0.01, "policy_loss": {"entropy_aware_distill": False}}},
+            "algorithm": {"rethinking_opd_probe": {"enabled": False}},
+        }
+    )
+
+    assert _old_log_prob_entropy_required(probe_config) is True
+    assert _old_log_prob_entropy_required(distill_config) is True
+    assert _old_log_prob_entropy_required(entropy_bonus_config) is True
 
 
 def test_apply_difficulty_aware_opd_routing_adds_batch_tensors_and_metrics():

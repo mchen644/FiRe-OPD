@@ -17,9 +17,11 @@ export DA_HARD_PROMPT_STYLE="${DA_HARD_PROMPT_STYLE:-normal}"
 export DA_HARD_ESR_THRESHOLD="${DA_HARD_ESR_THRESHOLD:-0.5}"
 export DA_HARD_ESR_BETA="${DA_HARD_ESR_BETA:-0.50}"
 export DA_HARD_ENTROPY_COEF="${DA_HARD_ENTROPY_COEF:-0}"
+export TRAINER_SAVE_FREQ="${TRAINER_SAVE_FREQ:-20}"
 export EXPERIMENT_NAME="${EXPERIMENT_NAME:-opd-budget20-hardnormal-esr50-noprobe}"
 
 bash run_train_tale_budget_rolloutlen_hardtrunc_hardnormal_opd.sh \
   algorithm.difficulty_aware_opd.hard_esr_threshold="${DA_HARD_ESR_THRESHOLD}" \
   algorithm.difficulty_aware_opd.hard_esr_beta="${DA_HARD_ESR_BETA}" \
+  trainer.save_freq="${TRAINER_SAVE_FREQ}" \
   "$@"

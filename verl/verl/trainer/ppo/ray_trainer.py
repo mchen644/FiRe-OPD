@@ -466,6 +466,29 @@ def _rethinking_probe_enabled(config) -> bool:
     return bool(probe_config and probe_config.get("enabled", False))
 
 
+def _old_log_prob_entropy_required(config) -> bool:
+    """Whether old-log-prob recomputation must also materialize per-token entropy."""
+
+    entropy_coeff = float(OmegaConf.select(config, "actor_rollout_ref.actor.entropy_coeff", default=0.0) or 0.0)
+    if entropy_coeff != 0.0:
+        return True
+
+    entropy_aware_distill = bool(
+        OmegaConf.select(config, "actor_rollout_ref.actor.policy_loss.entropy_aware_distill", default=False)
+    )
+    if entropy_aware_distill:
+        return True
+
+    difficulty_aware_enabled = bool(OmegaConf.select(config, "algorithm.difficulty_aware_opd.enabled", default=False))
+    hard_entropy_coef = float(
+        OmegaConf.select(config, "algorithm.difficulty_aware_opd.hard_entropy_coef", default=0.0) or 0.0
+    )
+    if difficulty_aware_enabled and hard_entropy_coef != 0.0:
+        return True
+
+    return _rethinking_probe_enabled(config)
+
+
 
 def _set_rethinking_probe_meta(batch: DataProto, config) -> None:
     probe_config = config.algorithm.get("rethinking_opd_probe", None)
@@ -1539,25 +1562,32 @@ class RayPPOTrainer:
                     else:  # Recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
                             _set_rethinking_probe_meta(batch, self.config)
+                            batch.meta_info["calculate_entropy"] = _old_log_prob_entropy_required(self.config)
                             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                            entropys = old_log_prob.batch["entropys"]
-                            response_masks = batch.batch["response_mask"]
-                            loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                            entropy_agg = agg_loss(
-                                loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode
-                            )
-                            old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
-                            metrics.update(old_log_prob_metrics)
                             # Keep student entropys in batch if entropy-aware distillation is enabled
                             entropy_aware = getattr(
                                 self.config.actor_rollout_ref.actor.policy_loss,
                                 "entropy_aware_distill", False
                             )
-                            if entropy_aware:
-                                # Rename to student_entropys and keep in batch
-                                old_log_prob.batch["student_entropys"] = old_log_prob.batch.pop("entropys")
+                            if "entropys" in old_log_prob.batch.keys():
+                                entropys = old_log_prob.batch["entropys"]
+                                response_masks = batch.batch["response_mask"]
+                                loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                                entropy_agg = agg_loss(
+                                    loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode
+                                )
+                                old_log_prob_metrics = {
+                                    "actor/entropy": entropy_agg.detach().item(),
+                                    "actor/entropy_computed": 1.0,
+                                }
+                                metrics.update(old_log_prob_metrics)
+                                if entropy_aware:
+                                    # Rename to student_entropys and keep in batch
+                                    old_log_prob.batch["student_entropys"] = old_log_prob.batch.pop("entropys")
+                                else:
+                                    old_log_prob.batch.pop("entropys")
                             else:
-                                old_log_prob.batch.pop("entropys")
+                                metrics["actor/entropy_computed"] = 0.0
                             batch = batch.union(old_log_prob)
                             if "rollout_log_probs" in batch.batch.keys():
                                 # TODO: we may want to add diff of probs too.

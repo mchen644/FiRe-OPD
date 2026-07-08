@@ -108,6 +108,15 @@ def _unpack_log_prob_result(result):
     return output, entropys, probe_tensors
 
 
+def _should_calculate_log_prob_entropy(meta_info: dict) -> bool:
+    """Return whether actor/ref log-prob recomputation should also compute entropy.
+
+    Defaults to True to preserve legacy behavior unless the trainer explicitly disables it.
+    """
+
+    return bool(meta_info.get("calculate_entropy", True))
+
+
 def create_device_mesh(world_size, fsdp_size):
     if fsdp_size < 0 or fsdp_size >= world_size:
         device_mesh = init_device_mesh(device_name, mesh_shape=(world_size,), mesh_dim_names=["fsdp"])
@@ -1026,13 +1035,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["temperature"] = self.config.rollout.temperature
         data.meta_info["rethinking_opd_probe_top_k"] = data.meta_info.get("rethinking_opd_probe_top_k", 0)
         top_k = int(data.meta_info["rethinking_opd_probe_top_k"] or 0)
+        calculate_entropy = _should_calculate_log_prob_entropy(data.meta_info)
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             with adapter_ctx:
                 output, entropys, probe_tensors = _unpack_log_prob_result(
-                    self.actor.compute_log_prob(data=data, calculate_entropy=True)
+                    self.actor.compute_log_prob(data=data, calculate_entropy=calculate_entropy)
                 )
-            tensors = {"old_log_probs": output, "entropys": entropys}
+            tensors = {"old_log_probs": output}
+            if entropys is not None:
+                tensors["entropys"] = entropys
             if probe_tensors:
                 tensors.update(probe_tensors)
                 if entropys is not None:
@@ -1068,6 +1080,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_lora:
             # if _is_lora, actor without lora applied is the ref
             data.meta_info["is_lora"] = True
+            data.meta_info["calculate_entropy"] = compute_teacher_entropy
             data = self.compute_log_prob(data)
             # this old_log_probs is in fact ref_log_prob
             tensors = {"ref_log_prob": data.batch["old_log_probs"]}
