@@ -199,6 +199,27 @@ def test_old_log_prob_entropy_is_skipped_without_entropy_consumers():
     assert _old_log_prob_entropy_required(config) is False
 
 
+def test_old_log_prob_entropy_is_not_required_for_difficulty_aware_hard_entropy():
+    from verl.trainer.ppo.ray_trainer import _old_log_prob_entropy_required
+
+    config = OmegaConf.create(
+        {
+            "actor_rollout_ref": {
+                "actor": {
+                    "entropy_coeff": 0,
+                    "policy_loss": {"entropy_aware_distill": False},
+                }
+            },
+            "algorithm": {
+                "rethinking_opd_probe": {"enabled": False},
+                "difficulty_aware_opd": {"enabled": True, "hard_entropy_coef": 0.003},
+            },
+        }
+    )
+
+    assert _old_log_prob_entropy_required(config) is False
+
+
 def test_old_log_prob_entropy_is_required_for_probe_or_entropy_distill():
     from verl.trainer.ppo.ray_trainer import _old_log_prob_entropy_required
 

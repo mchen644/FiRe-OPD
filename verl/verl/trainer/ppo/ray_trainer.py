@@ -479,13 +479,9 @@ def _old_log_prob_entropy_required(config) -> bool:
     if entropy_aware_distill:
         return True
 
-    difficulty_aware_enabled = bool(OmegaConf.select(config, "algorithm.difficulty_aware_opd.enabled", default=False))
-    hard_entropy_coef = float(
-        OmegaConf.select(config, "algorithm.difficulty_aware_opd.hard_entropy_coef", default=0.0) or 0.0
-    )
-    if difficulty_aware_enabled and hard_entropy_coef != 0.0:
-        return True
-
+    # Difficulty-aware hard entropy regularizes the *current* actor during
+    # actor update. It does not consume old-policy entropy from old-log-prob
+    # recomputation, so keep that path disabled unless another consumer needs it.
     return _rethinking_probe_enabled(config)
 
 
