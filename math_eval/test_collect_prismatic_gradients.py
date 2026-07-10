@@ -144,7 +144,7 @@ def _write_chunk(
     prefix: str,
     start: int,
     ids: list[str],
-    dtype: torch.dtype = torch.float16,
+    dtype: torch.dtype = torch.float32,
     width: int = PROJECTION_DIM,
     value: float = 1.0,
     tensor_ids: list[str] | None = None,
@@ -440,10 +440,10 @@ def test_resolve_resume_start_rejects_sidecar_id_order_mismatch(
 @pytest.mark.parametrize(
     ("dtype", "width", "value", "message"),
     [
-        (torch.float32, PROJECTION_DIM, 1.0, "float16"),
-        (torch.float16, PROJECTION_DIM - 1, 1.0, "shape"),
-        (torch.float16, PROJECTION_DIM, float("nan"), "finite"),
-        (torch.float16, PROJECTION_DIM, 0.0, "non-zero"),
+        (torch.float16, PROJECTION_DIM, 1.0, "float32"),
+        (torch.float32, PROJECTION_DIM - 1, 1.0, "shape"),
+        (torch.float32, PROJECTION_DIM, float("nan"), "finite"),
+        (torch.float32, PROJECTION_DIM, 0.0, "non-zero"),
     ],
 )
 def test_resolve_resume_start_rejects_invalid_projected_tensor(
@@ -545,16 +545,81 @@ def test_build_gradient_manifest_records_all_binding_provenance(
         "trl_version": TRL_VERSION,
         "package_versions": package_versions,
         "projection": {
+            "backend": "CudaProjector",
             "dimension": PROJECTION_DIM,
             "seed": PROJECTION_SEED,
             "type": "rademacher",
-            "dtype": "float16",
+            "input_dtype": "float16",
+            "output_dtype": "float32",
             "project_interval": PROJECT_INTERVAL,
             "save_interval": SAVE_INTERVAL,
             "completion_only_loss": True,
             "full_parameter_gradients": True,
             "response_marker": ASSISTANT_RESPONSE_MARKER,
         },
+    }
+
+
+@pytest.mark.parametrize(
+    ("distribution", "actual", "message"),
+    [
+        ("traker", "0.3.3", r"traker.*expected 0\.3\.2.*got 0\.3\.3"),
+        ("fast-jl", "0.1.4", r"fast-jl.*expected 0\.1\.3.*got 0\.1\.4"),
+        ("traker", None, r"traker.*expected 0\.3\.2.*not installed"),
+        ("fast-jl", None, r"fast-jl.*expected 0\.1\.3.*not installed"),
+    ],
+)
+def test_installed_package_versions_rejects_unpinned_projection_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    distribution: str,
+    actual: str | None,
+    message: str,
+) -> None:
+    import math_eval.collect_prismatic_gradients as collection
+
+    versions = {
+        "torch": "test-torch",
+        "transformers": "test-transformers",
+        "trl": TRL_VERSION,
+        "traker": "0.3.2",
+        "fast-jl": "0.1.3",
+    }
+
+    def installed_version(name: str) -> str:
+        if name == distribution:
+            if actual is None:
+                raise collection.importlib.metadata.PackageNotFoundError(name)
+            return actual
+        return versions[name]
+
+    monkeypatch.setattr(collection.importlib.metadata, "version", installed_version)
+
+    with pytest.raises(RuntimeError, match=message):
+        collection._installed_package_versions()
+
+
+def test_installed_package_versions_accepts_and_records_exact_projection_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import math_eval.collect_prismatic_gradients as collection
+
+    versions = {
+        "torch": "test-torch",
+        "transformers": "test-transformers",
+        "trl": TRL_VERSION,
+        "traker": "0.3.2",
+        "fast-jl": "0.1.3",
+    }
+    monkeypatch.setattr(
+        collection.importlib.metadata, "version", lambda name: versions[name]
+    )
+
+    assert collection._installed_package_versions() == {
+        "torch": "test-torch",
+        "transformers": "test-transformers",
+        "trl": TRL_VERSION,
+        "trak": "0.3.2",
+        "fast_jl": "0.1.3",
     }
 
 
@@ -891,6 +956,7 @@ def test_run_collection_complete_shard_returns_before_cuda_or_model_load(
     assert result["status"] == "complete"
     assert result["resume_start"] == 2
     assert (output_dir / "gradient.manifest.json").is_file()
+    assert (output_dir / ".deepmath.shard-00000-of-00001.lock").is_file()
 
 
 def test_run_collection_calls_official_once_on_only_unresolved_suffix(
@@ -1128,6 +1194,11 @@ def test_run_collection_cleanly_skips_one_trailing_empty_shard(
         "shard_end": 1,
         "resume_start": 1,
     }
+    assert (
+        tmp_path
+        / "gradients"
+        / ".deepmath.shard-00001-of-00002.lock"
+    ).is_file()
 
 
 def test_run_collection_rejects_empty_shard_beyond_dataset(
@@ -1299,5 +1370,376 @@ def test_direct_cli_help_works_without_pythonpath(tmp_path: Path) -> None:
         "--shard-index",
         "--num-shards",
         "--device",
+        "--validate-global-only",
     ):
         assert flag in result.stdout
+
+
+def test_shard_locks_fail_fast_for_same_shard_and_allow_distinct_shards(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "gradients"
+    output_dir.mkdir()
+
+    with _exclusive_shard_lock(output_dir, "deepmath", 4, 0) as first_path:
+        with pytest.raises(RuntimeError, match="already active"):
+            with _exclusive_shard_lock(output_dir, "deepmath", 4, 0):
+                pass
+        with _exclusive_shard_lock(output_dir, "deepmath", 4, 1) as second_path:
+            assert second_path != first_path
+
+    assert first_path.is_file()
+    assert second_path.is_file()
+
+
+def test_run_collection_serializes_duplicate_logical_shard_through_postvalidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import math_eval.collect_prismatic_gradients as collection
+
+    prepared, prepared_manifest_path, rows, _ = _prepared_fixture(tmp_path, count=1)
+    reference, commit, _, _ = _official_git_repository(tmp_path)
+    output_dir = tmp_path / "gradients"
+    monkeypatch.setattr(collection, "REFERENCE_COMMIT", commit)
+    monkeypatch.setattr(collection, "validate_single_cuda_device", lambda *_: None)
+    monkeypatch.setattr(
+        collection, "load_official_gradient_computer_class", lambda *_: object
+    )
+    tokenizer = _PreflightTokenizer()
+    model = SimpleNamespace(
+        config=SimpleNamespace(max_position_embeddings=MAX_CONTEXT_TOKENS)
+    )
+    monkeypatch.setattr(
+        collection, "load_model_and_tokenizer", lambda *_: (model, tokenizer)
+    )
+
+    state_lock = threading.Lock()
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    active = 0
+    max_active = 0
+    call_count = 0
+
+    class BlockingCollector(_PreflightCollector):
+        def compute_project_store_gradients(
+            self, samples, prefix, directory, global_start
+        ) -> None:
+            nonlocal active, max_active, call_count
+            with state_lock:
+                call_count += 1
+                own_call = call_count
+                active += 1
+                max_active = max(max_active, active)
+                first_entered.set()
+            try:
+                assert release_first.wait(timeout=10)
+                if own_call == 1:
+                    _write_chunk(
+                        Path(directory),
+                        prefix=prefix,
+                        start=global_start,
+                        ids=[sample["id"] for sample in samples],
+                    )
+            finally:
+                with state_lock:
+                    active -= 1
+
+    monkeypatch.setattr(
+        collection,
+        "construct_strict_collector",
+        lambda *_args, **_kwargs: BlockingCollector({"Question 0": 8}),
+    )
+    arguments = {
+        "reference_repo": reference,
+        "prepared_jsonl": prepared,
+        "prepared_manifest": prepared_manifest_path,
+        "output_dir": output_dir,
+        "prefix": "deepmath",
+        "model_name": MODEL_NAME,
+        "model_revision": MODEL_REVISION,
+        "shard_index": 0,
+        "num_shards": 1,
+        "device": "cuda:0",
+    }
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(run_collection, **arguments)
+        assert first_entered.wait(timeout=5)
+        second = executor.submit(run_collection, **arguments)
+        try:
+            with pytest.raises(RuntimeError, match="already active"):
+                second.result(timeout=5)
+        finally:
+            release_first.set()
+        assert first.result(timeout=10)["status"] == "collected"
+
+    assert max_active == 1
+    assert call_count == 1
+    assert [row["id"] for row in rows] == _ids(1)
+
+
+@pytest.mark.parametrize("use_symlink", [False, True])
+def test_run_collection_rejects_output_inside_reference_before_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    use_symlink: bool,
+) -> None:
+    import math_eval.collect_prismatic_gradients as collection
+
+    prepared, prepared_manifest_path, _, _ = _prepared_fixture(tmp_path, count=1)
+    reference, commit, _, _ = _official_git_repository(tmp_path)
+    monkeypatch.setattr(collection, "REFERENCE_COMMIT", commit)
+    parent = reference
+    if use_symlink:
+        parent = tmp_path / "reference-alias"
+        parent.symlink_to(reference, target_is_directory=True)
+    output_dir = parent / "generated-gradients"
+
+    with pytest.raises(ValueError, match="reference repository"):
+        run_collection(
+            reference_repo=reference,
+            prepared_jsonl=prepared,
+            prepared_manifest=prepared_manifest_path,
+            output_dir=output_dir,
+            prefix="deepmath",
+            model_name=MODEL_NAME,
+            model_revision=MODEL_REVISION,
+            shard_index=1,
+            num_shards=2,
+            device="cuda:0",
+        )
+
+    assert not output_dir.exists()
+    assert _run_git(reference, "status", "--porcelain") == ""
+
+
+@pytest.mark.parametrize("input_kind", ["prepared", "manifest", "source"])
+def test_run_collection_rejects_output_equal_to_input_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    input_kind: str,
+) -> None:
+    import math_eval.collect_prismatic_gradients as collection
+
+    prepared, prepared_manifest_path, _, manifest = _prepared_fixture(
+        tmp_path, count=1
+    )
+    reference, commit, _, _ = _official_git_repository(tmp_path)
+    monkeypatch.setattr(collection, "REFERENCE_COMMIT", commit)
+    output_dir = {
+        "prepared": prepared,
+        "manifest": prepared_manifest_path,
+        "source": Path(manifest["source_parquet"]),
+    }[input_kind]
+
+    with pytest.raises(ValueError, match="input artifact"):
+        run_collection(
+            reference_repo=reference,
+            prepared_jsonl=prepared,
+            prepared_manifest=prepared_manifest_path,
+            output_dir=output_dir,
+            prefix="deepmath",
+            model_name=MODEL_NAME,
+            model_revision=MODEL_REVISION,
+            shard_index=0,
+            num_shards=1,
+            device="cuda:0",
+        )
+
+
+def test_run_collection_rejects_output_containing_input_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import math_eval.collect_prismatic_gradients as collection
+
+    prepared, prepared_manifest_path, _, _ = _prepared_fixture(tmp_path, count=1)
+    reference, commit, _, _ = _official_git_repository(tmp_path)
+    monkeypatch.setattr(collection, "REFERENCE_COMMIT", commit)
+
+    with pytest.raises(ValueError, match="contains input artifact"):
+        run_collection(
+            reference_repo=reference,
+            prepared_jsonl=prepared,
+            prepared_manifest=prepared_manifest_path,
+            output_dir=tmp_path,
+            prefix="deepmath",
+            model_name=MODEL_NAME,
+            model_revision=MODEL_REVISION,
+            shard_index=0,
+            num_shards=1,
+            device="cuda:0",
+        )
+
+
+def _write_complete_global_chunks(
+    output_dir: Path, ids: list[str], num_shards: int
+) -> int:
+    chunk_count = 0
+    for shard_index in range(num_shards):
+        shard_start, shard_end = official_shard_bounds(
+            len(ids), num_shards, shard_index
+        )
+        cursor = shard_start
+        while cursor < shard_end:
+            chunk_end = min(cursor + SAVE_INTERVAL, shard_end)
+            _write_chunk(
+                output_dir,
+                prefix="deepmath",
+                start=cursor,
+                ids=ids[cursor:chunk_end],
+            )
+            cursor = chunk_end
+            chunk_count += 1
+    return chunk_count
+
+
+def test_global_gradient_validation_proves_exact_all_shard_coverage(
+    tmp_path: Path,
+) -> None:
+    ids = _ids(4)
+    chunk_count = _write_complete_global_chunks(tmp_path, ids, num_shards=2)
+
+    result = validate_global_gradient_coverage(ids, tmp_path, "deepmath", 2)
+
+    assert result == {
+        "row_count": 4,
+        "chunk_count": chunk_count,
+        "shard_count": 2,
+    }
+
+
+def test_global_validation_refuses_to_scan_while_a_collector_is_active(
+    tmp_path: Path,
+) -> None:
+    ids = _ids(4)
+    _write_complete_global_chunks(tmp_path, ids, num_shards=2)
+
+    with _exclusive_shard_lock(tmp_path, "deepmath", 2, 0):
+        with pytest.raises(RuntimeError, match="active"):
+            validate_global_gradient_coverage(ids, tmp_path, "deepmath", 2)
+
+
+def test_global_validation_rejects_cross_shard_chunk_400_to_900(
+    tmp_path: Path,
+) -> None:
+    ids = _ids(999)
+    _write_chunk(
+        tmp_path,
+        prefix="deepmath",
+        start=400,
+        ids=ids[400:900],
+    )
+
+    with pytest.raises(ValueError, match="crosses logical shard boundary"):
+        validate_global_gradient_coverage(ids, tmp_path, "deepmath", 2)
+
+
+def test_owning_shard_rejects_chunk_extending_past_its_end(tmp_path: Path) -> None:
+    ids = _ids(999)
+    _write_chunk(
+        tmp_path,
+        prefix="deepmath",
+        start=400,
+        ids=ids[400:900],
+    )
+
+    with pytest.raises(ValueError, match="beyond logical shard end"):
+        resolve_resume_start(ids, tmp_path, "deepmath", 0, 500)
+
+
+def test_global_validation_rejects_far_out_numeric_start(tmp_path: Path) -> None:
+    ids = _ids(1)
+    _write_chunk(
+        tmp_path,
+        prefix="deepmath",
+        start=999_999,
+        ids=ids,
+    )
+
+    with pytest.raises(ValueError, match="outside dataset range"):
+        validate_global_gradient_coverage(ids, tmp_path, "deepmath", 1)
+
+
+def test_global_validation_rejects_prefix_owned_temporary_suffix(
+    tmp_path: Path,
+) -> None:
+    ids = _ids(1)
+    _write_complete_global_chunks(tmp_path, ids, num_shards=1)
+    partial = tmp_path / "deepmath.0.safetensors.tmp"
+    partial.write_bytes(b"partial")
+
+    with pytest.raises(ValueError, match="malformed gradient artifact"):
+        validate_global_gradient_coverage(ids, tmp_path, "deepmath", 1)
+
+    assert partial.is_file()
+
+
+def test_global_validation_preserves_orphan_from_crashed_writer(
+    tmp_path: Path,
+) -> None:
+    orphan = tmp_path / "deepmath.0.safetensors"
+    save_file({_ids(1)[0]: torch.ones(PROJECTION_DIM, dtype=torch.float16)}, orphan)
+
+    with pytest.raises(ValueError, match="paired"):
+        validate_global_gradient_coverage(_ids(1), tmp_path, "deepmath", 1)
+
+    assert orphan.is_file()
+
+
+def test_run_global_validation_loads_prepared_ids_and_returns_status(
+    tmp_path: Path,
+) -> None:
+    prepared, prepared_manifest_path, rows, _ = _prepared_fixture(tmp_path, count=4)
+    output_dir = tmp_path / "gradients"
+    _write_complete_global_chunks(
+        output_dir, [row["id"] for row in rows], num_shards=2
+    )
+
+    result = run_global_validation(
+        prepared_jsonl=prepared,
+        prepared_manifest=prepared_manifest_path,
+        output_dir=output_dir,
+        prefix="deepmath",
+        num_shards=2,
+    )
+
+    assert result["status"] == "validated"
+    assert result["row_count"] == 4
+
+
+def test_global_validation_cli_mode_needs_no_model_reference_or_device(
+    tmp_path: Path,
+) -> None:
+    prepared, prepared_manifest_path, rows, _ = _prepared_fixture(tmp_path, count=4)
+    output_dir = tmp_path / "gradients"
+    _write_complete_global_chunks(
+        output_dir, [row["id"] for row in rows], num_shards=2
+    )
+    script = Path(__file__).with_name("collect_prismatic_gradients.py")
+    environment = dict(os.environ)
+    environment.pop("PYTHONPATH", None)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--validate-global-only",
+            "--prepared-jsonl",
+            str(prepared),
+            "--prepared-manifest",
+            str(prepared_manifest_path),
+            "--output-dir",
+            str(output_dir),
+            "--prefix",
+            "deepmath",
+            "--num-shards",
+            "2",
+        ],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["status"] == "validated"

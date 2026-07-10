@@ -148,7 +148,7 @@ The inherited official behavior is:
 - projection dimension `1024`
 - projection seed `0`
 - projection in groups of four examples
-- float16 projected vectors
+- float16 projection inputs and float32 projected vectors under pinned TRAK/fast-JL
 - output split into resumable `.safetensors` files with ID sidecars
 
 FiRe-OPD adds only orchestration and validation:
@@ -163,6 +163,8 @@ FiRe-OPD adds only orchestration and validation:
 - preflight tokenization to ensure every prompt/completion fits the proxy context window
 - a non-empty completion-label check after the official completion-only collator runs
 - final check that the stored gradient IDs exactly equal the eligibility-report IDs
+
+The released collector passes float16 full-gradient batches into TRAK. Under the pinned runtime (`traker==0.3.2`, `fast-jl==0.1.3`), `CudaProjector` ignores the extra `dtype` keyword and fast-JL returns float32 projections; the official collector saves those tensors unchanged. A real GPU probe in `opd-CLI` confirms this behavior. The manifest and validators therefore pin stored vectors to float32 rather than adding a non-official cast.
 
 No truncation is silently applied. The hard context boundary comes from the pinned model config (`max_position_embeddings=32768`), not the tokenizer's larger advertised limit. A full-pool preflight preserves the 57,046-row prepared file and writes a separate eligibility report. The current pinned pool contains exactly one unsupported row, `deepmath-level6-038794` at 33,634 tokens; it is recorded and excluded from proxy-gradient collection without changing any stable source ID. The resulting 57,045 eligible IDs, including the gap at the excluded ID, define sharding and exact gradient coverage.
 
