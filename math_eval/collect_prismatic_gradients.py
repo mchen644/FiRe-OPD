@@ -394,8 +394,9 @@ def _canonical_json_bytes(value: Mapping) -> tuple[dict, bytes]:
 def write_or_validate_gradient_manifest(path: Path, expected: Mapping) -> dict:
     """Create one canonical manifest or validate it under a process lock."""
     manifest_path = Path(path)
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
     expected_dict, payload = _canonical_json_bytes(expected)
+    prefix = _validate_gradient_prefix(expected_dict.get("prefix"))
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = manifest_path.with_name(f".{manifest_path.name}.lock")
     lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
@@ -408,6 +409,17 @@ def write_or_validate_gradient_manifest(path: Path, expected: Mapping) -> dict:
                     "hyperparameters differ"
                 )
             return actual
+
+        prefix_artifacts = sorted(
+            candidate.name
+            for candidate in manifest_path.parent.iterdir()
+            if candidate.name.startswith(f"{prefix}.")
+        )
+        if prefix_artifacts:
+            raise ValueError(
+                "gradient manifest is missing while prefix-owned artifact exists: "
+                f"{prefix_artifacts[0]}"
+            )
 
         temporary_path: Path | None = None
         try:
@@ -427,6 +439,31 @@ def write_or_validate_gradient_manifest(path: Path, expected: Mapping) -> dict:
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)
         return expected_dict
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+
+
+@contextmanager
+def _locked_existing_gradient_manifest(path: Path):
+    """Read an existing manifest under its writer lock without creating it."""
+    manifest_path = Path(path)
+    if not manifest_path.is_file():
+        raise ValueError(f"gradient manifest does not exist: {manifest_path}")
+    lock_path = manifest_path.with_name(f".{manifest_path.name}.lock")
+    try:
+        lock_fd = os.open(lock_path, os.O_RDWR)
+    except FileNotFoundError as error:
+        raise ValueError(
+            f"gradient manifest lock does not exist: {lock_path}"
+        ) from error
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        if not manifest_path.is_file():
+            raise ValueError(f"gradient manifest does not exist: {manifest_path}")
+        yield _read_json_object(manifest_path, "gradient manifest")
     finally:
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
@@ -784,6 +821,17 @@ def _validated_shard_bounds(
     return start, end
 
 
+def _validated_all_shard_bounds(
+    total: int, num_shards: int
+) -> list[tuple[int, int]]:
+    if num_shards <= 0:
+        raise ValueError("num_shards must be positive")
+    return [
+        _validated_shard_bounds(total, num_shards, shard_index)
+        for shard_index in range(num_shards)
+    ]
+
+
 def validate_global_gradient_coverage(
     dataset_ids: Sequence[str],
     output_dir: Path,
@@ -796,12 +844,7 @@ def validate_global_gradient_coverage(
     if not directory.is_dir():
         raise ValueError(f"gradient output directory does not exist: {directory}")
     total = len(dataset_ids)
-    if num_shards <= 0:
-        raise ValueError("num_shards must be positive")
-    shard_bounds = [
-        _validated_shard_bounds(total, num_shards, shard_index)
-        for shard_index in range(num_shards)
-    ]
+    shard_bounds = _validated_all_shard_bounds(total, num_shards)
 
     with ExitStack() as locks:
         for shard_index in range(num_shards):
@@ -971,12 +1014,54 @@ def run_global_validation(
         Path(prepared_manifest),
         Path(source_manifest["source_parquet"]),
     )
-    coverage = validate_global_gradient_coverage(
-        [row["id"] for row in rows],
-        output_path,
-        prefix,
-        num_shards,
-    )
+    manifest_path = output_path / GRADIENT_MANIFEST_NAME
+    with _locked_existing_gradient_manifest(manifest_path) as gradient_manifest:
+        reference_value = gradient_manifest.get("reference_repo")
+        if not isinstance(reference_value, str) or not Path(
+            reference_value
+        ).is_absolute():
+            raise ValueError(
+                "gradient manifest mismatch: reference_repo must be an absolute path"
+            )
+        repository = Path(reference_value).resolve()
+        verify_reference_repo(repository, REFERENCE_COMMIT)
+        official_module = _official_gradient_module_path(repository)
+        if not official_module.is_file():
+            raise ValueError(
+                "gradient manifest mismatch: official GradientComputer module "
+                f"does not exist: {official_module}"
+            )
+        output_path = _validate_output_path_isolation(
+            output_path,
+            repository,
+            Path(prepared_jsonl),
+            Path(prepared_manifest),
+            Path(source_manifest["source_parquet"]),
+        )
+        expected_manifest = build_gradient_manifest(
+            Path(prepared_jsonl),
+            Path(prepared_manifest),
+            source_manifest,
+            repository,
+            REFERENCE_COMMIT,
+            _reference_tree(repository),
+            prefix=prefix,
+            num_shards=num_shards,
+            trl_version=_installed_trl_version(),
+            package_versions=_installed_package_versions(),
+        )
+        if gradient_manifest != expected_manifest:
+            raise ValueError(
+                "gradient manifest mismatch: existing provenance or "
+                "hyperparameters differ"
+            )
+        trusted_num_shards = gradient_manifest["num_shards"]
+        coverage = validate_global_gradient_coverage(
+            [row["id"] for row in rows],
+            output_path,
+            prefix,
+            trusted_num_shards,
+        )
     return {"status": "validated", **coverage}
 
 
@@ -1010,9 +1095,10 @@ def run_collection(
     rows, source_manifest = load_prepared_pool(
         Path(prepared_jsonl), Path(prepared_manifest)
     )
-    shard_start, shard_end = _validated_shard_bounds(
-        len(rows), num_shards, shard_index
-    )
+    if shard_index < 0 or shard_index >= num_shards:
+        raise ValueError("shard_index must be in [0, num_shards)")
+    shard_bounds = _validated_all_shard_bounds(len(rows), num_shards)
+    shard_start, shard_end = shard_bounds[shard_index]
     repository = Path(reference_repo).resolve()
     verify_reference_repo(repository, REFERENCE_COMMIT)
     reference_tree = _reference_tree(repository)
