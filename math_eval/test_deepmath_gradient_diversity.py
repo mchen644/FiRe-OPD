@@ -192,6 +192,29 @@ def test_join_filtered_rows_rejects_missing_or_empty_original_final_answer(answe
         join_filtered_rows([_filtered_row()], [original], expected_count=1)
 
 
+@pytest.mark.parametrize(
+    "answer",
+    [pytest.param(MISSING, id="missing"), pytest.param(None, id="none"), pytest.param("   ", id="blank")],
+)
+def test_join_filtered_rows_ignores_unrelated_incomplete_original_rows(answer):
+    incomplete_before = _original_row(question="Unrelated before.")
+    incomplete_after = _original_row(question="Unrelated after.")
+    if answer is MISSING:
+        del incomplete_before["final_answer"]
+        del incomplete_after["final_answer"]
+    else:
+        incomplete_before["final_answer"] = answer
+        incomplete_after["final_answer"] = answer
+
+    result = join_filtered_rows(
+        [_filtered_row()],
+        [incomplete_before, _original_row(), incomplete_after],
+        expected_count=1,
+    )
+
+    assert result[0]["original_dataset_index"] == 1
+
+
 def test_join_filtered_rows_rejects_malformed_chat_prompt():
     filtered = _filtered_row()
     filtered["prompt"] = [{"role": "assistant", "content": "Solve x."}]
