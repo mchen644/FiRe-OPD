@@ -60,16 +60,16 @@ def join_filtered_rows(
 
     original_indices_by_key: dict[tuple[object, str], list[int]] = {}
     original_questions: set[object] = set()
+    questions_with_complete_answers: set[object] = set()
     for original_index, original in enumerate(original_rows):
         question = original.get("question")
+        original_questions.add(question)
         if "final_answer" not in original or _is_missing_answer(
             original.get("final_answer")
         ):
-            raise ValueError(
-                f"missing or empty final_answer for original row {original_index}"
-            )
+            continue
         key = (question, normalize_math_answer(original["final_answer"]))
-        original_questions.add(question)
+        questions_with_complete_answers.add(question)
         original_indices_by_key.setdefault(key, []).append(original_index)
 
     questions: list[str] = []
@@ -90,6 +90,11 @@ def join_filtered_rows(
             if question not in original_questions:
                 raise ValueError(
                     f"no original question match for filtered row {source_index}"
+                )
+            if question not in questions_with_complete_answers:
+                raise ValueError(
+                    "missing or empty final_answer for original question matched by "
+                    f"filtered row {source_index}"
                 )
             raise ValueError(f"answer mismatch for filtered row {source_index}")
         questions.append(question)
