@@ -27,6 +27,8 @@ Produce a reproducible, gradient-diverse DeepMath coreset with:
 
 ```text
 source questions:                 57,046
+proxy-context exclusions:              1
+gradient-eligible questions:      57,045
 selected unique questions:       12,800
 intended OPD prompt batch size:      256
 intended optimizer steps:             50
@@ -160,9 +162,11 @@ FiRe-OPD adds only orchestration and validation:
 - fail-fast refusal when the official fast-JL probe would fall back to TRAK `BasicProjector`
 - preflight tokenization to ensure every prompt/completion fits the proxy context window
 - a non-empty completion-label check after the official completion-only collator runs
-- final check that the stored gradient IDs exactly equal the prepared dataset IDs
+- final check that the stored gradient IDs exactly equal the eligibility-report IDs
 
-No truncation is silently applied. The hard context boundary comes from the pinned model config (`max_position_embeddings=32768`), not the tokenizer's larger advertised limit. If a sample exceeds it, preparation stops and reports its ID and token count before gradient collection begins.
+No truncation is silently applied. The hard context boundary comes from the pinned model config (`max_position_embeddings=32768`), not the tokenizer's larger advertised limit. A full-pool preflight preserves the 57,046-row prepared file and writes a separate eligibility report. The current pinned pool contains exactly one unsupported row, `deepmath-level6-038794` at 33,634 tokens; it is recorded and excluded from proxy-gradient collection without changing any stable source ID. The resulting 57,045 eligible IDs, including the gap at the excluded ID, define sharding and exact gradient coverage.
+
+The eligibility report is bound to the prepared JSONL hash, pinned model/tokenizer revision, Transformers version, chat-template hash, and 32,768-token boundary. It records every excluded ID, source row index, original-dataset index, token count, exclusion reason, eligible-ID hash, and token-length summary. Production accepts at most one exclusion for this pinned source; a different count or identity fails before GPU work.
 
 ## Paper/code discrepancy policy
 
@@ -223,6 +227,7 @@ Runtime artifacts live under ignored `data/` and `logs/` paths:
 ```text
 data/gradient_diversity/deepmath_level6_r1_solution1.jsonl
 data/gradient_diversity/deepmath_level6_r1_solution1.manifest.json
+data/gradient_diversity/deepmath_level6_r1_solution1.eligibility.json
 data/gradient_diversity/gradients/qwen2.5-0.5b-instruct/
 data/gradient_diversity/selection/diagnostics.json
 data/gradient_diversity/selection/selected_ids.jsonl
@@ -233,7 +238,8 @@ logs/gradient_diversity/deepmath_gradient_diverse_12800.log
 The final manifest records:
 
 - SHA-256 hashes of the source parquet and prepared JSONL
-- source and selected row counts
+- SHA-256 hash of the eligibility report
+- source, excluded, eligible, and selected row counts
 - Hugging Face dataset/model revisions
 - official reference repository commit
 - all projection, clustering, and selection hyperparameters
@@ -253,7 +259,7 @@ The final manifest records:
 
 ### Gradient collection CLI
 
-`math_eval/collect_prismatic_gradients.py` validates provenance, imports the pinned official `GradientComputer`, loads one explicit data shard, and writes official-format projected-gradient chunks.
+`math_eval/build_gradient_eligibility.py` tokenizes the complete prepared pool with the pinned Qwen chat template and writes the eligibility report. `math_eval/collect_prismatic_gradients.py` validates that report, imports the pinned official `GradientComputer`, loads one explicit shard of the ordered eligible IDs, and writes official-format projected-gradient chunks.
 
 ### Selection CLI
 
@@ -275,7 +281,8 @@ Before the full job starts:
 
 1. CPU unit tests cover exact join failures, sharding, manifest mismatch, balanced selection, exact row count, uniqueness, deterministic output, and schema preservation.
 2. A tiny synthetic safetensors fixture validates gradient ID loading and finite/non-zero checks.
-3. A one-GPU smoke test computes official projected gradients for four prepared samples and verifies shape `(4, 1024)`, finite values, expected IDs, and resume behavior.
-4. A tiny GPU clustering smoke test runs both cluster ratios on fixture gradients.
+3. A real CPU token preflight verifies 57,046 prepared rows, one recorded exclusion, and 57,045 stable eligible IDs without renumbering.
+4. A one-GPU smoke test computes official projected gradients for four eligible samples and verifies shape `(4, 1024)`, finite values, expected IDs, and resume behavior.
+5. A tiny GPU clustering smoke test runs both cluster ratios on fixture gradients.
 
 The full job is considered successfully launched only after preparation completes, the pinned reference/model metadata is logged, at least one gradient safetensors chunk is written, and the process remains alive without traceback.
