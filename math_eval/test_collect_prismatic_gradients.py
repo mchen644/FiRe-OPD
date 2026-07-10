@@ -16,6 +16,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from math_eval import build_gradient_eligibility as eligibility
 from math_eval.collect_prismatic_gradients import (
     ASSISTANT_RESPONSE_MARKER,
     DATASET_NAME,
@@ -162,6 +163,82 @@ def _write_chunk(
     )
 
 
+def _sha256_lines(values: list[str]) -> str:
+    digest = hashlib.sha256()
+    for value in values:
+        digest.update(value.encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _write_test_eligibility_report(
+    prepared_manifest_path: Path,
+    rows: list[dict],
+    *,
+    excluded_indices: tuple[int, ...] = (),
+) -> tuple[Path, dict, list[dict], tuple[str, ...]]:
+    prepared_manifest = json.loads(
+        prepared_manifest_path.read_text(encoding="utf-8")
+    )
+    excluded = set(excluded_indices)
+    excluded_rows = [
+        {
+            "id": rows[index]["id"],
+            "source_row_index": rows[index]["source_row_index"],
+            "original_dataset_index": rows[index]["original_dataset_index"],
+            "token_count": eligibility.MAX_CONTEXT_TOKENS + index + 1,
+            "reason": eligibility.CONTEXT_EXCLUSION_REASON,
+        }
+        for index in excluded_indices
+    ]
+    eligible_rows = [row for index, row in enumerate(rows) if index not in excluded]
+    eligible_ids = [row["id"] for row in eligible_rows]
+    excluded_ids = tuple(row["id"] for row in excluded_rows)
+    summary_max = (
+        max(entry["token_count"] for entry in excluded_rows)
+        if excluded_rows
+        else 10
+    )
+    report = {
+        "manifest_version": eligibility.REPORT_VERSION,
+        "prepared_jsonl": prepared_manifest["prepared_jsonl"],
+        "prepared_jsonl_sha256": prepared_manifest["prepared_jsonl_sha256"],
+        "prepared_manifest": str(prepared_manifest_path.resolve()),
+        "prepared_manifest_sha256": _sha256(prepared_manifest_path),
+        "source_sha256": prepared_manifest["source_sha256"],
+        "source_row_count": len(rows),
+        "dataset_name": eligibility.DATASET_NAME,
+        "dataset_revision": eligibility.DATASET_REVISION,
+        "model_name": eligibility.MODEL_NAME,
+        "model_revision": eligibility.MODEL_REVISION,
+        "tokenizer_name": eligibility.MODEL_NAME,
+        "tokenizer_revision": eligibility.MODEL_REVISION,
+        "transformers_version": eligibility.TRANSFORMERS_VERSION,
+        "chat_template_sha256": eligibility.PINNED_CHAT_TEMPLATE_SHA256,
+        "max_context_tokens": eligibility.MAX_CONTEXT_TOKENS,
+        "max_excluded": len(excluded_ids),
+        "expected_excluded_ids": sorted(excluded_ids),
+        "eligible_row_count": len(eligible_rows),
+        "excluded_row_count": len(excluded_rows),
+        "eligible_ids_sha256": _sha256_lines(eligible_ids),
+        "excluded_rows": excluded_rows,
+        "token_length_summary": {
+            "count": len(rows),
+            "min": 10,
+            "mean": 10.0,
+            "p50": 10.0,
+            "p90": 10.0,
+            "p95": 10.0,
+            "p99": 10.0,
+            "p999": 10.0,
+            "max": summary_max,
+        },
+    }
+    report_path = prepared_manifest_path.with_name("eligibility.json")
+    report_path.write_text(json.dumps(report) + "\n", encoding="utf-8")
+    return report_path, report, eligible_rows, excluded_ids
+
+
 def _write_matching_gradient_manifest(
     output_dir: Path,
     prepared_jsonl: Path,
@@ -171,12 +248,21 @@ def _write_matching_gradient_manifest(
     *,
     prefix: str,
     num_shards: int,
+    eligibility_report_path: Path | None = None,
+    eligibility_report: dict | None = None,
 ) -> dict:
     import math_eval.collect_prismatic_gradients as collection
 
     prepared_manifest = json.loads(
         prepared_manifest_path.read_text(encoding="utf-8")
     )
+    if eligibility_report_path is None and eligibility_report is None:
+        rows, _ = load_prepared_pool(prepared_jsonl, prepared_manifest_path)
+        eligibility_report_path, eligibility_report, _, _ = (
+            _write_test_eligibility_report(prepared_manifest_path, rows)
+        )
+    if eligibility_report_path is None or eligibility_report is None:
+        raise AssertionError("test eligibility path and report must be provided together")
     expected = build_gradient_manifest(
         prepared_jsonl,
         prepared_manifest_path,
@@ -188,9 +274,25 @@ def _write_matching_gradient_manifest(
         num_shards=num_shards,
         trl_version=TRL_VERSION,
         package_versions=collection._installed_package_versions(),
+        eligibility_report_path=eligibility_report_path,
+        eligibility_report=eligibility_report,
     )
     return write_or_validate_gradient_manifest(
         output_dir / collection.GRADIENT_MANIFEST_NAME, expected
+    )
+
+
+def _run_test_collection(**arguments):
+    rows, _ = load_prepared_pool(
+        arguments["prepared_jsonl"], arguments["prepared_manifest"]
+    )
+    report_path, _, _, excluded_ids = _write_test_eligibility_report(
+        arguments["prepared_manifest"], rows
+    )
+    return run_collection(
+        **arguments,
+        eligibility_report=report_path,
+        _expected_excluded_ids=excluded_ids,
     )
 
 
@@ -579,8 +681,13 @@ def test_pinned_gradient_constants_match_the_approved_design() -> None:
 def test_build_gradient_manifest_records_all_binding_provenance(
     tmp_path: Path,
 ) -> None:
-    prepared, prepared_manifest_path, _, prepared_manifest = _prepared_fixture(
+    prepared, prepared_manifest_path, rows, prepared_manifest = _prepared_fixture(
         tmp_path
+    )
+    eligibility_path, eligibility_report, eligible_rows, _ = (
+        _write_test_eligibility_report(
+            prepared_manifest_path, rows, excluded_indices=(1,)
+        )
     )
     reference, commit, tree, source = _official_git_repository(tmp_path)
     package_versions = {
@@ -602,6 +709,8 @@ def test_build_gradient_manifest_records_all_binding_provenance(
         num_shards=4,
         trl_version=TRL_VERSION,
         package_versions=package_versions,
+        eligibility_report_path=eligibility_path,
+        eligibility_report=eligibility_report,
     )
 
     assert manifest == {
@@ -616,6 +725,11 @@ def test_build_gradient_manifest_records_all_binding_provenance(
         "dataset_revision": DATASET_REVISION,
         "model_name": MODEL_NAME,
         "model_revision": MODEL_REVISION,
+        "eligibility_report": str(eligibility_path.resolve()),
+        "eligibility_report_sha256": _sha256(eligibility_path),
+        "eligible_row_count": len(eligible_rows),
+        "excluded_row_count": 1,
+        "eligible_ids_sha256": eligibility_report["eligible_ids_sha256"],
         "reference_repo": str(reference.resolve()),
         "reference_commit": commit,
         "reference_tree": tree,
@@ -639,6 +753,256 @@ def test_build_gradient_manifest_records_all_binding_provenance(
             "response_marker": ASSISTANT_RESPONSE_MARKER,
         },
     }
+
+
+def test_run_collection_uses_ordered_eligible_rows_with_stable_id_gap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import math_eval.collect_prismatic_gradients as collection
+
+    prepared, prepared_manifest_path, rows, _ = _prepared_fixture(tmp_path, count=3)
+    eligibility_path, report, eligible_rows, excluded_ids = (
+        _write_test_eligibility_report(
+            prepared_manifest_path, rows, excluded_indices=(1,)
+        )
+    )
+    reference, commit, _, _ = _official_git_repository(tmp_path)
+    output_dir = tmp_path / "gradients"
+    recorded: list[list[str]] = []
+
+    class GapCollector(_PreflightCollector):
+        def compute_project_store_gradients(
+            self, samples, prefix, directory, global_start
+        ) -> None:
+            sample_ids = [sample["id"] for sample in samples]
+            recorded.append(sample_ids)
+            _write_chunk(
+                Path(directory), prefix=prefix, start=global_start, ids=sample_ids
+            )
+
+    collector = GapCollector({row["prompt"]: 8 for row in eligible_rows})
+    model = SimpleNamespace(
+        config=SimpleNamespace(max_position_embeddings=MAX_CONTEXT_TOKENS)
+    )
+    monkeypatch.setattr(collection, "REFERENCE_COMMIT", commit)
+    monkeypatch.setattr(collection, "validate_single_cuda_device", lambda *_: None)
+    monkeypatch.setattr(
+        collection, "load_official_gradient_computer_class", lambda *_: object
+    )
+    monkeypatch.setattr(
+        collection,
+        "load_model_and_tokenizer",
+        lambda *_: (model, collector.tokenizer),
+    )
+    monkeypatch.setattr(
+        collection, "construct_strict_collector", lambda *_args, **_kwargs: collector
+    )
+
+    result = run_collection(
+        reference_repo=reference,
+        prepared_jsonl=prepared,
+        prepared_manifest=prepared_manifest_path,
+        eligibility_report=eligibility_path,
+        output_dir=output_dir,
+        prefix="deepmath",
+        model_name=MODEL_NAME,
+        model_revision=MODEL_REVISION,
+        shard_index=0,
+        num_shards=1,
+        device="cuda:0",
+        _expected_excluded_ids=excluded_ids,
+    )
+
+    assert recorded == [[rows[0]["id"], rows[2]["id"]]]
+    assert result["shard_end"] == 2
+    gradient_manifest = json.loads(
+        (output_dir / collection.GRADIENT_MANIFEST_NAME).read_text(encoding="utf-8")
+    )
+    assert gradient_manifest["eligibility_report"] == str(
+        eligibility_path.resolve()
+    )
+    assert gradient_manifest["eligibility_report_sha256"] == _sha256(
+        eligibility_path
+    )
+    assert gradient_manifest["eligible_row_count"] == 2
+    assert gradient_manifest["excluded_row_count"] == 1
+    assert gradient_manifest["eligible_ids_sha256"] == report[
+        "eligible_ids_sha256"
+    ]
+
+
+def test_run_collection_requires_eligibility_report_before_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import math_eval.collect_prismatic_gradients as collection
+
+    prepared, prepared_manifest_path, _, _ = _prepared_fixture(tmp_path, count=1)
+    reference, commit, _, _ = _official_git_repository(tmp_path)
+    output_dir = tmp_path / "gradients"
+    monkeypatch.setattr(collection, "REFERENCE_COMMIT", commit)
+
+    with pytest.raises(ValueError, match="eligibility report.*required"):
+        run_collection(
+            reference_repo=reference,
+            prepared_jsonl=prepared,
+            prepared_manifest=prepared_manifest_path,
+            output_dir=output_dir,
+            prefix="deepmath",
+            model_name=MODEL_NAME,
+            model_revision=MODEL_REVISION,
+            shard_index=0,
+            num_shards=1,
+            device="cuda:0",
+        )
+
+    assert not output_dir.exists()
+
+
+def test_run_collection_computes_shard_topology_from_eligible_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import math_eval.collect_prismatic_gradients as collection
+
+    prepared, prepared_manifest_path, rows, _ = _prepared_fixture(tmp_path, count=3)
+    eligibility_path, _, _, excluded_ids = _write_test_eligibility_report(
+        prepared_manifest_path, rows, excluded_indices=(1,)
+    )
+    reference, commit, _, _ = _official_git_repository(tmp_path)
+    monkeypatch.setattr(collection, "REFERENCE_COMMIT", commit)
+    monkeypatch.setattr(
+        collection,
+        "validate_single_cuda_device",
+        lambda *_: (_ for _ in ()).throw(AssertionError("CUDA must not be queried")),
+    )
+
+    result = run_collection(
+        reference_repo=reference,
+        prepared_jsonl=prepared,
+        prepared_manifest=prepared_manifest_path,
+        eligibility_report=eligibility_path,
+        output_dir=tmp_path / "gradients",
+        prefix="deepmath",
+        model_name=MODEL_NAME,
+        model_revision=MODEL_REVISION,
+        shard_index=1,
+        num_shards=2,
+        device="cuda:0",
+        _expected_excluded_ids=excluded_ids,
+    )
+
+    assert result == {
+        "status": "empty",
+        "shard_start": 2,
+        "shard_end": 2,
+        "resume_start": 2,
+    }
+
+
+def test_load_validated_gradient_manifest_binds_eligibility_bytes_and_topology(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import math_eval.collect_prismatic_gradients as collection
+
+    prepared, prepared_manifest_path, rows, prepared_manifest = _prepared_fixture(
+        tmp_path, count=3
+    )
+    eligibility_path, report, _, _ = _write_test_eligibility_report(
+        prepared_manifest_path, rows, excluded_indices=(1,)
+    )
+    reference, commit, _, _ = _official_git_repository(tmp_path)
+    output_dir = tmp_path / "gradients"
+    monkeypatch.setattr(collection, "REFERENCE_COMMIT", commit)
+    expected = _write_matching_gradient_manifest(
+        output_dir,
+        prepared,
+        prepared_manifest_path,
+        reference,
+        commit,
+        prefix="deepmath",
+        num_shards=2,
+        eligibility_report_path=eligibility_path,
+        eligibility_report=report,
+    )
+
+    loaded = collection.load_validated_gradient_manifest(
+        output_dir / collection.GRADIENT_MANIFEST_NAME,
+        prepared_manifest_path=prepared_manifest_path,
+        prepared_manifest=prepared_manifest,
+        eligibility_report_path=eligibility_path,
+        eligibility_report=report,
+        reference_repo=reference,
+        expected_prefix="deepmath",
+        expected_num_shards=2,
+    )
+
+    assert loaded == expected
+
+    eligibility_path.write_text(
+        json.dumps(report, indent=2) + "\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="gradient manifest.*mismatch"):
+        collection.load_validated_gradient_manifest(
+            output_dir / collection.GRADIENT_MANIFEST_NAME,
+            prepared_manifest_path=prepared_manifest_path,
+            prepared_manifest=prepared_manifest,
+            eligibility_report_path=eligibility_path,
+            eligibility_report=report,
+            reference_repo=reference,
+            expected_prefix="deepmath",
+            expected_num_shards=2,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_path", "replacement"),
+    [
+        (("prepared_jsonl_sha256",), "0" * 64),
+        (("model_revision",), "moving-main"),
+        (("max_context_tokens",), MAX_CONTEXT_TOKENS - 1),
+        (("eligible_row_count",), 99),
+        (("eligible_ids_sha256",), "f" * 64),
+        (("excluded_rows", 0, "reason"), "wrong_reason"),
+        (("excluded_rows", 0, "id"), "deepmath-level6-000002"),
+    ],
+)
+def test_run_collection_rejects_tampered_eligibility_report_before_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field_path: tuple[str | int, ...],
+    replacement: object,
+) -> None:
+    import math_eval.collect_prismatic_gradients as collection
+
+    prepared, prepared_manifest_path, rows, _ = _prepared_fixture(tmp_path, count=3)
+    eligibility_path, report, _, excluded_ids = _write_test_eligibility_report(
+        prepared_manifest_path, rows, excluded_indices=(1,)
+    )
+    target = report
+    for field in field_path[:-1]:
+        target = target[field]
+    target[field_path[-1]] = replacement
+    eligibility_path.write_text(json.dumps(report) + "\n", encoding="utf-8")
+    reference, commit, _, _ = _official_git_repository(tmp_path)
+    output_dir = tmp_path / "gradients"
+    monkeypatch.setattr(collection, "REFERENCE_COMMIT", commit)
+
+    with pytest.raises(ValueError, match="eligibility report"):
+        run_collection(
+            reference_repo=reference,
+            prepared_jsonl=prepared,
+            prepared_manifest=prepared_manifest_path,
+            eligibility_report=eligibility_path,
+            output_dir=output_dir,
+            prefix="deepmath",
+            model_name=MODEL_NAME,
+            model_revision=MODEL_REVISION,
+            shard_index=0,
+            num_shards=1,
+            device="cuda:0",
+            _expected_excluded_ids=excluded_ids,
+        )
+
+    assert not output_dir.exists()
 
 
 @pytest.mark.parametrize(
@@ -979,7 +1343,7 @@ def test_run_collection_rejects_unsafe_prefix_without_output_side_effects(
     )
 
     with pytest.raises(ValueError, match="prefix"):
-        run_collection(
+        _run_test_collection(
             reference_repo=reference,
             prepared_jsonl=prepared,
             prepared_manifest=prepared_manifest_path,
@@ -1030,7 +1394,7 @@ def test_run_collection_complete_shard_returns_before_cuda_or_model_load(
         lambda *_: (_ for _ in ()).throw(AssertionError("model must not load")),
     )
 
-    result = run_collection(
+    result = _run_test_collection(
         reference_repo=reference,
         prepared_jsonl=prepared,
         prepared_manifest=prepared_manifest_path,
@@ -1060,6 +1424,13 @@ def test_run_collection_calls_official_once_on_only_unresolved_suffix(
     output_dir = tmp_path / "gradients"
     ids = [row["id"] for row in rows]
     reference, commit, _, _ = _official_git_repository(tmp_path)
+    eligibility_path, eligibility_report, eligible_rows, excluded_ids = (
+        _write_test_eligibility_report(
+            prepared_manifest_path,
+            rows,
+            excluded_indices=(SAVE_INTERVAL,),
+        )
+    )
     _write_matching_gradient_manifest(
         output_dir,
         prepared,
@@ -1068,6 +1439,8 @@ def test_run_collection_calls_official_once_on_only_unresolved_suffix(
         commit,
         prefix="deepmath",
         num_shards=1,
+        eligibility_report_path=eligibility_path,
+        eligibility_report=eligibility_report,
     )
     _write_chunk(
         output_dir,
@@ -1094,7 +1467,7 @@ def test_run_collection_calls_official_once_on_only_unresolved_suffix(
             )
 
     collector = FakeCollector(
-        {row["prompt"]: 10 for row in rows[SAVE_INTERVAL:]}
+        {row["prompt"]: 10 for row in eligible_rows[SAVE_INTERVAL:]}
     )
     model = SimpleNamespace(
         config=SimpleNamespace(max_position_embeddings=MAX_CONTEXT_TOKENS)
@@ -1117,6 +1490,7 @@ def test_run_collection_calls_official_once_on_only_unresolved_suffix(
         reference_repo=reference,
         prepared_jsonl=prepared,
         prepared_manifest=prepared_manifest_path,
+        eligibility_report=eligibility_path,
         output_dir=output_dir,
         prefix="deepmath",
         model_name=MODEL_NAME,
@@ -1124,17 +1498,18 @@ def test_run_collection_calls_official_once_on_only_unresolved_suffix(
         shard_index=0,
         num_shards=1,
         device="cuda:0",
+        _expected_excluded_ids=excluded_ids,
     )
 
     assert result["status"] == "collected"
     assert len(calls) == 1
     samples, called_prefix, called_directory, global_start = calls[0]
-    assert samples == rows[SAVE_INTERVAL:]
+    assert samples == [rows[SAVE_INTERVAL + 1]]
     assert called_prefix == "deepmath"
     assert called_directory == output_dir
     assert global_start == SAVE_INTERVAL
     assert result["resume_start"] == SAVE_INTERVAL
-    assert result["shard_end"] == SAVE_INTERVAL + 2
+    assert result["shard_end"] == SAVE_INTERVAL + 1
 
 
 def test_run_collection_rejects_nonpinned_model_context_before_collector(
@@ -1164,7 +1539,7 @@ def test_run_collection_rejects_nonpinned_model_context_before_collector(
     )
 
     with pytest.raises(ValueError, match="32768"):
-        run_collection(
+        _run_test_collection(
             reference_repo=tmp_path / "reference",
             prepared_jsonl=prepared,
             prepared_manifest=prepared_manifest_path,
@@ -1253,7 +1628,7 @@ def test_run_collection_complete_shard_skips_official_module_import(
         lambda *_: (_ for _ in ()).throw(AssertionError("official import must not run")),
     )
 
-    result = run_collection(
+    result = _run_test_collection(
         reference_repo=reference,
         prepared_jsonl=prepared,
         prepared_manifest=prepared_manifest_path,
@@ -1283,7 +1658,7 @@ def test_run_collection_cleanly_skips_one_trailing_empty_shard(
         lambda *_: (_ for _ in ()).throw(AssertionError("CUDA must not be queried")),
     )
 
-    result = run_collection(
+    result = _run_test_collection(
         reference_repo=reference,
         prepared_jsonl=prepared,
         prepared_manifest=prepared_manifest_path,
@@ -1320,7 +1695,7 @@ def test_run_collection_rejects_empty_shard_beyond_dataset(
     monkeypatch.setattr(collection, "REFERENCE_COMMIT", commit)
 
     with pytest.raises(ValueError, match="empty logical shard"):
-        run_collection(
+        _run_test_collection(
             reference_repo=reference,
             prepared_jsonl=prepared,
             prepared_manifest=prepared_manifest_path,
@@ -1347,7 +1722,7 @@ def test_run_collection_rejects_collectively_impossible_shard_layout_before_outp
     monkeypatch.setattr(collection, "REFERENCE_COMMIT", commit)
 
     with pytest.raises(ValueError, match="empty logical shard"):
-        run_collection(
+        _run_test_collection(
             reference_repo=reference,
             prepared_jsonl=prepared,
             prepared_manifest=prepared_manifest_path,
@@ -1381,7 +1756,7 @@ def test_run_collection_rejects_invalid_shard_arguments_without_output_side_effe
     monkeypatch.setattr(collection, "REFERENCE_COMMIT", commit)
 
     with pytest.raises(ValueError, match="num_shards|shard_index"):
-        run_collection(
+        _run_test_collection(
             reference_repo=reference,
             prepared_jsonl=prepared,
             prepared_manifest=prepared_manifest_path,
@@ -1409,7 +1784,7 @@ def test_run_collection_rejects_invalid_device_even_when_shard_is_complete(
     monkeypatch.setattr(collection, "REFERENCE_COMMIT", commit)
 
     with pytest.raises(ValueError, match="cuda:0"):
-        run_collection(
+        _run_test_collection(
             reference_repo=reference,
             prepared_jsonl=prepared,
             prepared_manifest=prepared_manifest_path,
@@ -1452,7 +1827,7 @@ def test_run_collection_revalidates_and_rejects_incomplete_official_output(
     )
 
     with pytest.raises(RuntimeError, match="complete shard coverage"):
-        run_collection(
+        _run_test_collection(
             reference_repo=reference,
             prepared_jsonl=prepared,
             prepared_manifest=prepared_manifest_path,
@@ -1498,6 +1873,7 @@ def test_direct_cli_help_works_without_pythonpath(tmp_path: Path) -> None:
         "--reference-repo",
         "--prepared-jsonl",
         "--prepared-manifest",
+        "--eligibility-report",
         "--output-dir",
         "--prefix",
         "--model-name",
@@ -1508,6 +1884,32 @@ def test_direct_cli_help_works_without_pythonpath(tmp_path: Path) -> None:
         "--validate-global-only",
     ):
         assert flag in result.stdout
+
+
+def test_collection_and_global_cli_require_eligibility_report(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import math_eval.collect_prismatic_gradients as collection
+
+    with pytest.raises(SystemExit) as error:
+        collection._parse_args(
+            [
+                "--validate-global-only",
+                "--prepared-jsonl",
+                "pool.jsonl",
+                "--prepared-manifest",
+                "pool.manifest.json",
+                "--output-dir",
+                "gradients",
+                "--prefix",
+                "deepmath",
+                "--num-shards",
+                "4",
+            ]
+        )
+
+    assert error.value.code == 2
+    assert "--eligibility-report" in capsys.readouterr().err
 
 
 def test_shard_locks_fail_fast_for_same_shard_and_allow_distinct_shards(
@@ -1584,10 +1986,14 @@ def test_run_collection_serializes_duplicate_logical_shard_through_postvalidate(
         "construct_strict_collector",
         lambda *_args, **_kwargs: BlockingCollector({"Question 0": 8}),
     )
+    eligibility_path, _, _, excluded_ids = _write_test_eligibility_report(
+        prepared_manifest_path, rows
+    )
     arguments = {
         "reference_repo": reference,
         "prepared_jsonl": prepared,
         "prepared_manifest": prepared_manifest_path,
+        "eligibility_report": eligibility_path,
         "output_dir": output_dir,
         "prefix": "deepmath",
         "model_name": MODEL_NAME,
@@ -1595,6 +2001,7 @@ def test_run_collection_serializes_duplicate_logical_shard_through_postvalidate(
         "shard_index": 0,
         "num_shards": 1,
         "device": "cuda:0",
+        "_expected_excluded_ids": excluded_ids,
     }
 
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -1631,7 +2038,7 @@ def test_run_collection_rejects_output_inside_reference_before_mutation(
     output_dir = parent / "generated-gradients"
 
     with pytest.raises(ValueError, match="reference repository"):
-        run_collection(
+        _run_test_collection(
             reference_repo=reference,
             prepared_jsonl=prepared,
             prepared_manifest=prepared_manifest_path,
@@ -1668,7 +2075,7 @@ def test_run_collection_rejects_output_equal_to_input_file(
     }[input_kind]
 
     with pytest.raises(ValueError, match="input artifact"):
-        run_collection(
+        _run_test_collection(
             reference_repo=reference,
             prepared_jsonl=prepared,
             prepared_manifest=prepared_manifest_path,
@@ -1692,7 +2099,7 @@ def test_run_collection_rejects_output_containing_input_artifacts(
     monkeypatch.setattr(collection, "REFERENCE_COMMIT", commit)
 
     with pytest.raises(ValueError, match="contains input artifact"):
-        run_collection(
+        _run_test_collection(
             reference_repo=reference,
             prepared_jsonl=prepared,
             prepared_manifest=prepared_manifest_path,
@@ -1830,6 +2237,11 @@ def test_run_global_validation_loads_prepared_ids_and_returns_status(
     output_dir = tmp_path / "gradients"
     reference, commit, _, _ = _official_git_repository(tmp_path)
     monkeypatch.setattr(collection, "REFERENCE_COMMIT", commit)
+    eligibility_path, eligibility_report, eligible_rows, excluded_ids = (
+        _write_test_eligibility_report(
+            prepared_manifest_path, rows, excluded_indices=(1,)
+        )
+    )
     _write_matching_gradient_manifest(
         output_dir,
         prepared,
@@ -1838,21 +2250,25 @@ def test_run_global_validation_loads_prepared_ids_and_returns_status(
         commit,
         prefix="deepmath",
         num_shards=2,
+        eligibility_report_path=eligibility_path,
+        eligibility_report=eligibility_report,
     )
     _write_complete_global_chunks(
-        output_dir, [row["id"] for row in rows], num_shards=2
+        output_dir, [row["id"] for row in eligible_rows], num_shards=2
     )
 
     result = run_global_validation(
         prepared_jsonl=prepared,
         prepared_manifest=prepared_manifest_path,
+        eligibility_report=eligibility_path,
         output_dir=output_dir,
         prefix="deepmath",
         num_shards=2,
+        _expected_excluded_ids=excluded_ids,
     )
 
     assert result["status"] == "validated"
-    assert result["row_count"] == 4
+    assert result["row_count"] == 3
 
 
 def test_run_global_validation_requires_existing_manifest_without_mutation(
@@ -1865,6 +2281,9 @@ def test_run_global_validation_requires_existing_manifest_without_mutation(
     _write_complete_global_chunks(
         output_dir, [row["id"] for row in rows], num_shards=2
     )
+    eligibility_path, _, _, excluded_ids = _write_test_eligibility_report(
+        prepared_manifest_path, rows
+    )
     manifest_path = output_dir / collection.GRADIENT_MANIFEST_NAME
     before = {path.name: path.read_bytes() for path in output_dir.iterdir()}
 
@@ -1872,13 +2291,59 @@ def test_run_global_validation_requires_existing_manifest_without_mutation(
         run_global_validation(
             prepared_jsonl=prepared,
             prepared_manifest=prepared_manifest_path,
+            eligibility_report=eligibility_path,
             output_dir=output_dir,
             prefix="deepmath",
             num_shards=2,
+            _expected_excluded_ids=excluded_ids,
         )
 
     assert not manifest_path.exists()
     assert {path.name: path.read_bytes() for path in output_dir.iterdir()} == before
+
+
+def test_run_global_validation_rejects_changed_eligibility_report_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import math_eval.collect_prismatic_gradients as collection
+
+    prepared, prepared_manifest_path, rows, _ = _prepared_fixture(tmp_path, count=3)
+    eligibility_path, report, eligible_rows, excluded_ids = (
+        _write_test_eligibility_report(
+            prepared_manifest_path, rows, excluded_indices=(1,)
+        )
+    )
+    reference, commit, _, _ = _official_git_repository(tmp_path)
+    output_dir = tmp_path / "gradients"
+    monkeypatch.setattr(collection, "REFERENCE_COMMIT", commit)
+    _write_matching_gradient_manifest(
+        output_dir,
+        prepared,
+        prepared_manifest_path,
+        reference,
+        commit,
+        prefix="deepmath",
+        num_shards=1,
+        eligibility_report_path=eligibility_path,
+        eligibility_report=report,
+    )
+    _write_complete_global_chunks(
+        output_dir, [row["id"] for row in eligible_rows], num_shards=1
+    )
+    eligibility_path.write_text(
+        json.dumps(report, indent=2) + "\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="gradient manifest.*mismatch"):
+        run_global_validation(
+            prepared_jsonl=prepared,
+            prepared_manifest=prepared_manifest_path,
+            eligibility_report=eligibility_path,
+            output_dir=output_dir,
+            prefix="deepmath",
+            num_shards=1,
+            _expected_excluded_ids=excluded_ids,
+        )
 
 
 @pytest.mark.parametrize(
@@ -1905,6 +2370,9 @@ def test_run_global_validation_rejects_any_manifest_provenance_mismatch(
     output_dir = tmp_path / "gradients"
     reference, commit, _, _ = _official_git_repository(tmp_path)
     monkeypatch.setattr(collection, "REFERENCE_COMMIT", commit)
+    eligibility_path, eligibility_report, _, excluded_ids = (
+        _write_test_eligibility_report(prepared_manifest_path, rows)
+    )
     _write_matching_gradient_manifest(
         output_dir,
         prepared,
@@ -1913,6 +2381,8 @@ def test_run_global_validation_rejects_any_manifest_provenance_mismatch(
         commit,
         prefix="deepmath",
         num_shards=2,
+        eligibility_report_path=eligibility_path,
+        eligibility_report=eligibility_report,
     )
     _write_complete_global_chunks(
         output_dir, [row["id"] for row in rows], num_shards=2
@@ -1929,19 +2399,28 @@ def test_run_global_validation_rejects_any_manifest_provenance_mismatch(
         run_global_validation(
             prepared_jsonl=prepared,
             prepared_manifest=prepared_manifest_path,
+            eligibility_report=eligibility_path,
             output_dir=output_dir,
             prefix="deepmath",
             num_shards=2,
+            _expected_excluded_ids=excluded_ids,
         )
 
 
 def test_global_validation_cli_mode_needs_no_model_reference_or_device(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
+    import math_eval.collect_prismatic_gradients as collection
+
     reference = Path("/home/mchen/prismatic-synthesis-reference")
     verify_reference_repo(reference, REFERENCE_COMMIT)
     prepared, prepared_manifest_path, rows, _ = _prepared_fixture(tmp_path, count=4)
     output_dir = tmp_path / "gradients"
+    eligibility_path, eligibility_report, _, _ = _write_test_eligibility_report(
+        prepared_manifest_path, rows
+    )
     _write_matching_gradient_manifest(
         output_dir,
         prepared,
@@ -1950,35 +2429,41 @@ def test_global_validation_cli_mode_needs_no_model_reference_or_device(
         REFERENCE_COMMIT,
         prefix="deepmath",
         num_shards=2,
+        eligibility_report_path=eligibility_path,
+        eligibility_report=eligibility_report,
     )
     _write_complete_global_chunks(
         output_dir, [row["id"] for row in rows], num_shards=2
     )
-    script = Path(__file__).with_name("collect_prismatic_gradients.py")
-    environment = dict(os.environ)
-    environment.pop("PYTHONPATH", None)
-
-    result = subprocess.run(
+    original_apply = eligibility.apply_eligibility_report
+    monkeypatch.setattr(
+        collection,
+        "apply_eligibility_report",
+        lambda rows, manifest, path, **kwargs: original_apply(
+            rows,
+            manifest,
+            path,
+            expected_excluded_ids=(),
+            **kwargs,
+        ),
+    )
+    exit_code = collection.main(
         [
-            sys.executable,
-            str(script),
             "--validate-global-only",
             "--prepared-jsonl",
             str(prepared),
             "--prepared-manifest",
             str(prepared_manifest_path),
+            "--eligibility-report",
+            str(eligibility_path),
             "--output-dir",
             str(output_dir),
             "--prefix",
             "deepmath",
             "--num-shards",
             "2",
-        ],
-        cwd=tmp_path,
-        env=environment,
-        capture_output=True,
-        text=True,
+        ]
     )
 
-    assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout)["status"] == "validated"
+    assert exit_code == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "validated"

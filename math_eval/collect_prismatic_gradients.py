@@ -26,6 +26,7 @@ if __package__ in (None, ""):
     if repository_root not in sys.path:
         sys.path.insert(0, repository_root)
 
+from math_eval.build_gradient_eligibility import apply_eligibility_report
 from math_eval.deepmath_gradient_diversity import official_shard_bounds, sha256_file
 
 
@@ -768,6 +769,8 @@ def build_gradient_manifest(
     num_shards: int,
     trl_version: str,
     package_versions: Mapping[str, str | None],
+    eligibility_report_path: Path,
+    eligibility_report: Mapping,
 ) -> dict:
     """Build the complete immutable provenance contract for all collectors."""
     return {
@@ -788,6 +791,11 @@ def build_gradient_manifest(
         ),
         "model_name": MODEL_NAME,
         "model_revision": MODEL_REVISION,
+        "eligibility_report": str(Path(eligibility_report_path).resolve()),
+        "eligibility_report_sha256": sha256_file(Path(eligibility_report_path)),
+        "eligible_row_count": eligibility_report["eligible_row_count"],
+        "excluded_row_count": eligibility_report["excluded_row_count"],
+        "eligible_ids_sha256": eligibility_report["eligible_ids_sha256"],
         "prefix": prefix,
         "num_shards": num_shards,
         "max_context_tokens": MAX_CONTEXT_TOKENS,
@@ -830,6 +838,78 @@ def _validated_all_shard_bounds(
         _validated_shard_bounds(total, num_shards, shard_index)
         for shard_index in range(num_shards)
     ]
+
+
+def load_validated_gradient_manifest(
+    gradient_manifest_path: Path,
+    *,
+    prepared_manifest_path: Path,
+    prepared_manifest: Mapping,
+    eligibility_report_path: Path,
+    eligibility_report: Mapping,
+    reference_repo: Path,
+    expected_prefix: str | None = None,
+    expected_num_shards: int | None = None,
+) -> dict:
+    """Load one existing manifest only after exact pinned-contract validation."""
+    manifest_path = Path(gradient_manifest_path).resolve()
+    prepared_path = Path(prepared_manifest_path).resolve()
+    eligibility_path = Path(eligibility_report_path).resolve()
+    repository = Path(reference_repo).resolve()
+    verify_reference_repo(repository, REFERENCE_COMMIT)
+    official_module = _official_gradient_module_path(repository)
+    if not official_module.is_file():
+        raise ValueError(
+            "gradient manifest mismatch: official GradientComputer module "
+            f"does not exist: {official_module}"
+        )
+
+    with _locked_existing_gradient_manifest(manifest_path) as manifest:
+        prefix_value = (
+            manifest.get("prefix") if expected_prefix is None else expected_prefix
+        )
+        prefix = _validate_gradient_prefix(prefix_value)
+        num_shards_value = (
+            manifest.get("num_shards")
+            if expected_num_shards is None
+            else expected_num_shards
+        )
+        if (
+            isinstance(num_shards_value, bool)
+            or not isinstance(num_shards_value, int)
+            or num_shards_value <= 0
+        ):
+            raise ValueError("gradient manifest num_shards must be positive")
+        eligible_count = eligibility_report.get("eligible_row_count")
+        if (
+            isinstance(eligible_count, bool)
+            or not isinstance(eligible_count, int)
+            or eligible_count < 0
+        ):
+            raise ValueError(
+                "eligibility report eligible_row_count must be non-negative"
+            )
+        _validated_all_shard_bounds(eligible_count, num_shards_value)
+        expected = build_gradient_manifest(
+            Path(prepared_manifest["prepared_jsonl"]),
+            prepared_path,
+            prepared_manifest,
+            repository,
+            REFERENCE_COMMIT,
+            _reference_tree(repository),
+            prefix=prefix,
+            num_shards=num_shards_value,
+            trl_version=_installed_trl_version(),
+            package_versions=_installed_package_versions(),
+            eligibility_report_path=eligibility_path,
+            eligibility_report=eligibility_report,
+        )
+        if manifest != expected:
+            raise ValueError(
+                "gradient manifest mismatch: existing provenance or "
+                "hyperparameters differ"
+            )
+        return dict(manifest)
 
 
 def validate_global_gradient_coverage(
@@ -962,12 +1042,14 @@ def _validate_output_path_isolation(
     reference_repo: Path | None,
     prepared_jsonl: Path,
     prepared_manifest: Path,
+    eligibility_report: Path,
     source_parquet: Path,
 ) -> Path:
     output_path = Path(output_dir).resolve()
     input_paths = (
         Path(prepared_jsonl).resolve(),
         Path(prepared_manifest).resolve(),
+        Path(eligibility_report).resolve(),
         Path(source_parquet).resolve(),
     )
     for input_path in input_paths:
@@ -998,70 +1080,72 @@ def run_global_validation(
     *,
     prepared_jsonl: Path,
     prepared_manifest: Path,
+    eligibility_report: Path | None = None,
     output_dir: Path,
     prefix: str,
     num_shards: int,
+    _expected_excluded_ids: Sequence[str] | None = None,
 ) -> dict[str, int | str]:
     """Load the prepared pool and prove exact all-shard gradient coverage."""
     prefix = _validate_gradient_prefix(prefix)
-    rows, source_manifest = load_prepared_pool(
+    if eligibility_report is None:
+        raise ValueError("eligibility report is required for global validation")
+    full_rows, source_manifest = load_prepared_pool(
         Path(prepared_jsonl), Path(prepared_manifest)
+    )
+    eligibility_path = Path(eligibility_report).resolve()
+    eligibility_arguments = {
+        "prepared_manifest_path": Path(prepared_manifest),
+    }
+    if _expected_excluded_ids is not None:
+        eligibility_arguments["expected_excluded_ids"] = _expected_excluded_ids
+    rows, eligibility_metadata = apply_eligibility_report(
+        full_rows,
+        source_manifest,
+        eligibility_path,
+        **eligibility_arguments,
     )
     output_path = _validate_output_path_isolation(
         Path(output_dir),
         None,
         Path(prepared_jsonl),
         Path(prepared_manifest),
+        eligibility_path,
         Path(source_manifest["source_parquet"]),
     )
     manifest_path = output_path / GRADIENT_MANIFEST_NAME
-    with _locked_existing_gradient_manifest(manifest_path) as gradient_manifest:
-        reference_value = gradient_manifest.get("reference_repo")
-        if not isinstance(reference_value, str) or not Path(
-            reference_value
-        ).is_absolute():
-            raise ValueError(
-                "gradient manifest mismatch: reference_repo must be an absolute path"
-            )
-        repository = Path(reference_value).resolve()
-        verify_reference_repo(repository, REFERENCE_COMMIT)
-        official_module = _official_gradient_module_path(repository)
-        if not official_module.is_file():
-            raise ValueError(
-                "gradient manifest mismatch: official GradientComputer module "
-                f"does not exist: {official_module}"
-            )
-        output_path = _validate_output_path_isolation(
-            output_path,
-            repository,
-            Path(prepared_jsonl),
-            Path(prepared_manifest),
-            Path(source_manifest["source_parquet"]),
+    with _locked_existing_gradient_manifest(manifest_path) as untrusted_manifest:
+        reference_value = untrusted_manifest.get("reference_repo")
+    if not isinstance(reference_value, str) or not Path(reference_value).is_absolute():
+        raise ValueError(
+            "gradient manifest mismatch: reference_repo must be an absolute path"
         )
-        expected_manifest = build_gradient_manifest(
-            Path(prepared_jsonl),
-            Path(prepared_manifest),
-            source_manifest,
-            repository,
-            REFERENCE_COMMIT,
-            _reference_tree(repository),
-            prefix=prefix,
-            num_shards=num_shards,
-            trl_version=_installed_trl_version(),
-            package_versions=_installed_package_versions(),
-        )
-        if gradient_manifest != expected_manifest:
-            raise ValueError(
-                "gradient manifest mismatch: existing provenance or "
-                "hyperparameters differ"
-            )
-        trusted_num_shards = gradient_manifest["num_shards"]
-        coverage = validate_global_gradient_coverage(
-            [row["id"] for row in rows],
-            output_path,
-            prefix,
-            trusted_num_shards,
-        )
+    repository = Path(reference_value).resolve()
+    gradient_manifest = load_validated_gradient_manifest(
+        manifest_path,
+        prepared_manifest_path=Path(prepared_manifest),
+        prepared_manifest=source_manifest,
+        eligibility_report_path=eligibility_path,
+        eligibility_report=eligibility_metadata,
+        reference_repo=repository,
+        expected_prefix=prefix,
+        expected_num_shards=num_shards,
+    )
+    output_path = _validate_output_path_isolation(
+        output_path,
+        repository,
+        Path(prepared_jsonl),
+        Path(prepared_manifest),
+        eligibility_path,
+        Path(source_manifest["source_parquet"]),
+    )
+    trusted_num_shards = gradient_manifest["num_shards"]
+    coverage = validate_global_gradient_coverage(
+        [row["id"] for row in rows],
+        output_path,
+        prefix,
+        trusted_num_shards,
+    )
     return {"status": "validated", **coverage}
 
 
@@ -1070,6 +1154,7 @@ def run_collection(
     reference_repo: Path,
     prepared_jsonl: Path,
     prepared_manifest: Path,
+    eligibility_report: Path | None = None,
     output_dir: Path,
     prefix: str,
     model_name: str,
@@ -1077,6 +1162,7 @@ def run_collection(
     shard_index: int,
     num_shards: int,
     device: str,
+    _expected_excluded_ids: Sequence[str] | None = None,
 ) -> dict[str, int | str]:
     """Validate, resume, and execute one explicit official logical shard."""
     prefix = _validate_gradient_prefix(prefix)
@@ -1091,9 +1177,23 @@ def run_collection(
         )
     if device != "cuda:0":
         raise ValueError("collector device must be the process-local cuda:0")
+    if eligibility_report is None:
+        raise ValueError("eligibility report is required for gradient collection")
 
-    rows, source_manifest = load_prepared_pool(
+    full_rows, source_manifest = load_prepared_pool(
         Path(prepared_jsonl), Path(prepared_manifest)
+    )
+    eligibility_path = Path(eligibility_report).resolve()
+    eligibility_arguments = {
+        "prepared_manifest_path": Path(prepared_manifest),
+    }
+    if _expected_excluded_ids is not None:
+        eligibility_arguments["expected_excluded_ids"] = _expected_excluded_ids
+    rows, eligibility_metadata = apply_eligibility_report(
+        full_rows,
+        source_manifest,
+        eligibility_path,
+        **eligibility_arguments,
     )
     if shard_index < 0 or shard_index >= num_shards:
         raise ValueError("shard_index must be in [0, num_shards)")
@@ -1113,6 +1213,7 @@ def run_collection(
         repository,
         Path(prepared_jsonl),
         Path(prepared_manifest),
+        eligibility_path,
         Path(source_manifest["source_parquet"]),
     )
     output_path.mkdir(parents=True, exist_ok=True)
@@ -1127,6 +1228,8 @@ def run_collection(
         num_shards=num_shards,
         trl_version=_installed_trl_version(),
         package_versions=_installed_package_versions(),
+        eligibility_report_path=eligibility_path,
+        eligibility_report=eligibility_metadata,
     )
     write_or_validate_gradient_manifest(
         output_path / GRADIENT_MANIFEST_NAME,
@@ -1209,6 +1312,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--reference-repo", type=Path)
     parser.add_argument("--prepared-jsonl", type=Path, required=True)
     parser.add_argument("--prepared-manifest", type=Path, required=True)
+    parser.add_argument("--eligibility-report", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--prefix", required=True)
     parser.add_argument("--model-name", default=MODEL_NAME)
@@ -1241,6 +1345,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = run_global_validation(
             prepared_jsonl=args.prepared_jsonl,
             prepared_manifest=args.prepared_manifest,
+            eligibility_report=args.eligibility_report,
             output_dir=args.output_dir,
             prefix=args.prefix,
             num_shards=args.num_shards,
@@ -1250,6 +1355,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             reference_repo=args.reference_repo,
             prepared_jsonl=args.prepared_jsonl,
             prepared_manifest=args.prepared_manifest,
+            eligibility_report=args.eligibility_report,
             output_dir=args.output_dir,
             prefix=args.prefix,
             model_name=args.model_name,
