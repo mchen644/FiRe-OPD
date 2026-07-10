@@ -27,7 +27,7 @@ def test_group_success_launcher_dry_run_prints_clean_production_contract():
     required = [
         "data.train_batch_size=256",
         "actor_rollout_ref.rollout.n=4",
-        "actor_rollout_ref.actor.ppo_mini_batch_size=1024",
+        "actor_rollout_ref.actor.ppo_mini_batch_size=256",
         "algorithm.difficulty_aware_opd.method=group_success_prompt_esr",
         "algorithm.difficulty_aware_opd.easy_esr_beta=0.20",
         "algorithm.difficulty_aware_opd.non_easy_esr_beta=0.50",
@@ -47,7 +47,14 @@ def test_group_success_launcher_rejects_inconsistent_total_trajectory_count():
     completed = _run_launcher(PROMPT_BATCH_SIZE="255")
 
     assert completed.returncode == 2
-    assert "prompt batch times rollout count must equal PPO mini-batch size" in completed.stderr
+    assert "prompt batch times rollout count must equal TOTAL_TRAJECTORIES" in completed.stderr
+
+
+def test_group_success_launcher_requires_prompt_level_ppo_mini_batch_size():
+    completed = _run_launcher(PPO_MINI_BATCH_SIZE="1024")
+
+    assert completed.returncode == 2
+    assert "PPO_MINI_BATCH_SIZE must equal PROMPT_BATCH_SIZE" in completed.stderr
 
 
 def test_group_success_launcher_rejects_non_integer_volume_setting_cleanly():

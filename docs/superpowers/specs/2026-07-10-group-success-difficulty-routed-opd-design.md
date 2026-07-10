@@ -63,8 +63,10 @@ All four rollouts remain in the batch through verifier scoring, teacher scoring,
 ```text
 data.train_batch_size=256
 actor_rollout_ref.rollout.n=4
-actor_rollout_ref.actor.ppo_mini_batch_size=1024
+actor_rollout_ref.actor.ppo_mini_batch_size=256
 ```
+
+veRL validates `ppo_mini_batch_size` against the prompt-level `train_batch_size`, then multiplies the actor value by `rollout.n` inside the worker. The effective actor mini-batch therefore still contains all `256 * 4 = 1024` trajectories.
 
 ## Difficulty computation
 
@@ -198,7 +200,8 @@ Add a dedicated launcher/wrapper for this experiment rather than overloading the
 
 ```text
 ROLLOUT_N == expected_group_size == 4
-PROMPT_BATCH_SIZE * ROLLOUT_N == PPO_MINI_BATCH_SIZE == 1024
+PROMPT_BATCH_SIZE * ROLLOUT_N == TOTAL_TRAJECTORIES == 1024
+PPO_MINI_BATCH_SIZE == PROMPT_BATCH_SIZE == 256
 ```
 
 ## Metrics
@@ -282,7 +285,7 @@ Before GPU launch, verify the resolved command contains:
 ```text
 data.train_batch_size=256
 actor_rollout_ref.rollout.n=4
-actor_rollout_ref.actor.ppo_mini_batch_size=1024
+actor_rollout_ref.actor.ppo_mini_batch_size=256
 algorithm.difficulty_aware_opd.method=group_success_prompt_esr
 algorithm.difficulty_aware_opd.easy_esr_beta=0.20
 algorithm.difficulty_aware_opd.non_easy_esr_beta=0.50

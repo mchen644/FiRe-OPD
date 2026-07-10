@@ -290,7 +290,7 @@ Use `subprocess.run` with `GROUP_SUCCESS_DRY_RUN=1` and assert the output contai
 required = [
     "data.train_batch_size=256",
     "actor_rollout_ref.rollout.n=4",
-    "actor_rollout_ref.actor.ppo_mini_batch_size=1024",
+    "actor_rollout_ref.actor.ppo_mini_batch_size=256",
     "algorithm.difficulty_aware_opd.method=group_success_prompt_esr",
     "algorithm.difficulty_aware_opd.easy_esr_beta=0.20",
     "algorithm.difficulty_aware_opd.non_easy_esr_beta=0.50",
@@ -319,7 +319,8 @@ The Bash launcher must:
 ```bash
 ROLLOUT_N=4
 PROMPT_BATCH_SIZE=256
-PPO_MINI_BATCH_SIZE=1024
+PPO_MINI_BATCH_SIZE=256
+TOTAL_TRAJECTORIES=1024
 EXPECTED_GROUP_SIZE=4
 TOTAL_TRAINING_STEPS=50
 EXPERIMENT_NAME=opd-n4-easy4of4-concise20-noneasynormal50-purerkl-step50
@@ -332,11 +333,17 @@ if (( ROLLOUT_N != EXPECTED_GROUP_SIZE )); then
   echo "ERROR: ROLLOUT_N must equal EXPECTED_GROUP_SIZE" >&2
   exit 2
 fi
-if (( PROMPT_BATCH_SIZE * ROLLOUT_N != PPO_MINI_BATCH_SIZE )); then
-  echo "ERROR: prompt batch times rollout count must equal PPO mini-batch size" >&2
+if (( PROMPT_BATCH_SIZE * ROLLOUT_N != TOTAL_TRAJECTORIES )); then
+  echo "ERROR: prompt batch times rollout count must equal TOTAL_TRAJECTORIES" >&2
+  exit 2
+fi
+if (( PPO_MINI_BATCH_SIZE != PROMPT_BATCH_SIZE )); then
+  echo "ERROR: PPO_MINI_BATCH_SIZE must equal PROMPT_BATCH_SIZE before worker rollout expansion" >&2
   exit 2
 fi
 ```
+
+veRL multiplies the configured actor mini-batch by `rollout.n` inside the worker, so the effective actor mini-batch remains 1024 trajectories.
 
 Set normal teacher style, TALE rollout-length source, hard truncation, pure-RKL flags, candidate selection disabled, probe disabled, entropy zero, compile disabled, `trainer.resume_mode=disable`, save frequency 20, and validation disabled. In dry-run mode, print the resolved environment and argument array and exit without importing Python or touching GPUs. Otherwise execute the existing strong-to-weak TALE base script with the array.
 

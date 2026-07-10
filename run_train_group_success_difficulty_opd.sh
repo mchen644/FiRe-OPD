@@ -7,14 +7,15 @@ BASE_LAUNCHER="${REPO_DIR}/verl/examples/fire_opd/run_opd_strong_to_weak_student
 
 ROLLOUT_N="${ROLLOUT_N:-4}"
 PROMPT_BATCH_SIZE="${PROMPT_BATCH_SIZE:-256}"
-PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-1024}"
+PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-256}"
+TOTAL_TRAJECTORIES="${TOTAL_TRAJECTORIES:-1024}"
 EXPECTED_GROUP_SIZE="${EXPECTED_GROUP_SIZE:-4}"
 TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-50}"
 SAVE_FREQ="${SAVE_FREQ:-20}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-opd-n4-easy4of4-concise20-noneasynormal50-purerkl-step50}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-${REPO_DIR}/checkpoints/${EXPERIMENT_NAME}}"
 
-for integer_name in ROLLOUT_N PROMPT_BATCH_SIZE PPO_MINI_BATCH_SIZE EXPECTED_GROUP_SIZE TOTAL_TRAINING_STEPS SAVE_FREQ; do
+for integer_name in ROLLOUT_N PROMPT_BATCH_SIZE PPO_MINI_BATCH_SIZE TOTAL_TRAJECTORIES EXPECTED_GROUP_SIZE TOTAL_TRAINING_STEPS SAVE_FREQ; do
   integer_value="${!integer_name}"
   if [[ ! "${integer_value}" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: ${integer_name} must be a positive integer, got ${integer_value}" >&2
@@ -26,8 +27,12 @@ if (( ROLLOUT_N != EXPECTED_GROUP_SIZE )); then
   echo "ERROR: ROLLOUT_N must equal EXPECTED_GROUP_SIZE" >&2
   exit 2
 fi
-if (( PROMPT_BATCH_SIZE * ROLLOUT_N != PPO_MINI_BATCH_SIZE )); then
-  echo "ERROR: prompt batch times rollout count must equal PPO mini-batch size" >&2
+if (( PROMPT_BATCH_SIZE * ROLLOUT_N != TOTAL_TRAJECTORIES )); then
+  echo "ERROR: prompt batch times rollout count must equal TOTAL_TRAJECTORIES" >&2
+  exit 2
+fi
+if (( PPO_MINI_BATCH_SIZE != PROMPT_BATCH_SIZE )); then
+  echo "ERROR: PPO_MINI_BATCH_SIZE must equal PROMPT_BATCH_SIZE before worker rollout expansion" >&2
   exit 2
 fi
 
@@ -93,6 +98,7 @@ if [[ "${GROUP_SUCCESS_DRY_RUN:-0}" == "1" ]]; then
   printf 'ROLLOUT_N=%s\n' "${ROLLOUT_N}"
   printf 'PROMPT_BATCH_SIZE=%s\n' "${PROMPT_BATCH_SIZE}"
   printf 'PPO_MINI_BATCH_SIZE=%s\n' "${PPO_MINI_BATCH_SIZE}"
+  printf 'TOTAL_TRAJECTORIES=%s\n' "${TOTAL_TRAJECTORIES}"
   printf 'EXPERIMENT_NAME=%s\n' "${EXPERIMENT_NAME}"
   printf 'bash %q' "${BASE_LAUNCHER}"
   printf ' %q' "$@" "${fixed_args[@]}"
