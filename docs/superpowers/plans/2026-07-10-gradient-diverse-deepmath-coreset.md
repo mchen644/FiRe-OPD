@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build and launch a reproducible offline pipeline that selects exactly 12,800 unique DeepMath level-6 questions using official Prismatic-Synthesis projected gradients while adding no OPD rollout or teacher cost.
+**Goal:** Build and launch a reproducible offline pipeline that preserves all 57,046 DeepMath level-6 source identities, excludes only explicitly recorded proxy-context-ineligible rows, and selects exactly 12,800 unique eligible questions using official Prismatic-Synthesis projected gradients while adding no OPD rollout or teacher cost.
 
-**Architecture:** A pure helper module owns exact joins, provenance, sharding, gradient validation, and balanced fixed-pool selection. Three thin CLIs prepare the R1-completion pool, invoke the pinned official `GradientComputer`, and run code-/paper-aligned clustering diagnostics before writing a schema-preserving parquet. A resumable shell launcher orchestrates the stages on explicitly chosen GPUs and is the only entry point used in `opd-CLI`.
+**Architecture:** A pure helper module owns exact joins, provenance, sharding, gradient validation, and balanced fixed-pool selection. Thin CLIs prepare the R1-completion pool, write a pinned token-eligibility report, invoke the official `GradientComputer` on eligible stable IDs, and run code-/paper-aligned clustering diagnostics before writing a schema-preserving parquet. A resumable shell launcher orchestrates the stages on explicitly chosen GPUs and is the only entry point used in `opd-CLI`.
 
 **Tech Stack:** Python 3.10, PyArrow, Hugging Face Datasets/Transformers, PyTorch, TRL, TRAK, safetensors, scikit-learn, pytest, Bash, tmux.
 
@@ -287,6 +287,63 @@ git commit -m "Wrap official Prismatic gradient collection safely"
 
 ---
 
+### Task 3B: Pinned token-eligibility report and eligible-ID collection
+
+**Files:**
+- Create: `math_eval/build_gradient_eligibility.py`
+- Create: `math_eval/test_build_gradient_eligibility.py`
+- Modify: `math_eval/collect_prismatic_gradients.py`
+- Modify: `math_eval/test_collect_prismatic_gradients.py`
+
+**Interfaces:**
+- Produces: `build_eligibility_report(rows, prepared_manifest, tokenizer, max_context_tokens, max_excluded, expected_excluded_ids) -> dict`
+- Produces: `write_or_validate_eligibility_report(path: Path, expected: Mapping) -> dict`
+- Produces: `apply_eligibility_report(rows, prepared_manifest, report_path: Path) -> tuple[list[dict], dict]`
+- CLI inputs: `--prepared-jsonl`, `--prepared-manifest`, `--output`, `--model-name`, `--model-revision`, `--max-context-tokens`, `--max-excluded`, repeatable `--expected-excluded-id`
+
+- [ ] **Step 1: Write failing tests for deterministic token eligibility**
+
+Use a recording fake tokenizer with batched Qwen chat-template calls. Assert exact token counts, source-order preservation, a stable-ID gap after excluding a middle row, no truncation argument, the pinned 32,768 boundary, at most one excluded row, and deterministic eligible-ID hashing. Assert the report binds prepared hashes, model/tokenizer revision, Transformers version, and chat-template hash.
+
+- [ ] **Step 2: Run eligibility tests and verify RED**
+
+Run:
+
+```bash
+/home/mchen/miniconda3/envs/gvendi-opd/bin/python -m pytest -q \
+  math_eval/test_build_gradient_eligibility.py
+```
+
+Expected: module import fails because the eligibility builder does not exist.
+
+- [ ] **Step 3: Implement atomic report creation and pinned CLI**
+
+Load the already validated prepared pool, `AutoConfig`, and `AutoTokenizer` at the exact model revision. Require `config.max_position_embeddings == 32768`; apply the exact user/assistant chat template in bounded batches with `truncation=False`; retain no encoded batch after counting. Require the discovered excluded stable-ID set to equal the explicitly configured production set. Write one canonical JSON report through a sibling temporary file and `Path.replace`, using a persistent lock for concurrent/idempotent creation. Existing reports are reused only after full provenance validation.
+
+- [ ] **Step 4: Run eligibility tests and verify GREEN**
+
+Expected: all builder tests pass offline with no model or CUDA allocation.
+
+- [ ] **Step 5: Write failing collector tests for applying the report**
+
+Assert that the collector derives ordered eligible rows from the full prepared list without renumbering IDs, rejects a changed prepared hash/model revision/context boundary/count/excluded ID/token reason/eligible hash, records the eligibility report hash in the gradient manifest, and computes logical shards over the eligible count. Direct collection without a report retains the existing hard-fail behavior.
+
+- [ ] **Step 6: Implement eligible-ID collection and run Task 3 regressions**
+
+Filter only by the validated excluded stable-ID set, then pass the resulting ordered eligible rows to existing sharding, resume, preflight, and official collection logic. Do not interpret eligible positions as source indices. Run Task 3 and Task 3B tests together.
+
+- [ ] **Step 7: Commit Task 3B**
+
+```bash
+git add math_eval/build_gradient_eligibility.py \
+  math_eval/test_build_gradient_eligibility.py \
+  math_eval/collect_prismatic_gradients.py \
+  math_eval/test_collect_prismatic_gradients.py
+git commit -m "Exclude unsupported proxy-context rows explicitly"
+```
+
+---
+
 ### Task 4: Code-/paper-aligned clustering diagnostics and parquet writer
 
 **Files:**
@@ -294,7 +351,7 @@ git commit -m "Wrap official Prismatic gradient collection safely"
 - Create: `math_eval/test_select_gradient_diverse_deepmath.py`
 
 **Interfaces:**
-- Consumes: official-format safetensors chunks, prepared JSONL, current source parquet
+- Consumes: official-format safetensors chunks, prepared JSONL, eligibility report, current source parquet
 - Produces: `load_projected_gradients(directory: Path, expected_ids: Sequence[str]) -> tuple[list[str], torch.Tensor]`
 - Produces: `cluster_official(gradients: torch.Tensor, ratio: float, iterations: int, seed: int, reference_repo: Path) -> np.ndarray`
 - Produces: `compute_selection_diagnostics(...) -> dict`
@@ -303,7 +360,7 @@ git commit -m "Wrap official Prismatic gradient collection safely"
 
 - [ ] **Step 1: Write failing tests for safetensors coverage and schema-preserving output**
 
-Create two safetensors chunks whose keys are deliberately unordered. Assert loading returns prepared-ID order. Assert missing/extra IDs fail. Construct a nested PyArrow table matching the training schema and assert selected output has the identical schema, requested order, exact row count, and unique prompts.
+Create two safetensors chunks whose keys are deliberately unordered and whose eligible stable IDs contain a gap for an excluded middle source row. Assert loading returns eligibility-report order and rejects missing, extra, duplicate, or excluded IDs. Construct a nested PyArrow table matching the training schema and assert selected eligible positions map through prepared metadata to original source indices; output has the identical schema including metadata, requested order, exact row count, and unique prompts.
 
 - [ ] **Step 2: Run the selector tests and verify RED**
 
@@ -363,12 +420,12 @@ git commit -m "Select exact gradient-diverse DeepMath coreset"
 - Create: `math_eval/test_gradient_diversity_launcher.py`
 
 **Interfaces:**
-- Environment: `GPU_IDS`, `PYTHON_BIN`, `REFERENCE_REPO`, `SOURCE_PARQUET`, `OUTPUT_ROOT`, `EXPECTED_SOURCE_ROWS`, `TARGET_ROWS`, `MODEL_NAME`, `MODEL_REVISION`, `DATASET_REVISION`, `PRIMARY_CLUSTER_RATIO`, `SENSITIVITY_CLUSTER_RATIO`, `CLUSTER_SEEDS`
+- Environment: `GPU_IDS`, `PYTHON_BIN`, `REFERENCE_REPO`, `SOURCE_PARQUET`, `OUTPUT_ROOT`, `EXPECTED_SOURCE_ROWS`, `EXPECTED_ELIGIBLE_ROWS`, `EXPECTED_EXCLUDED_ID`, `MAX_CONTEXT_TOKENS`, `TARGET_ROWS`, `MODEL_NAME`, `MODEL_REVISION`, `DATASET_REVISION`, `PRIMARY_CLUSTER_RATIO`, `SENSITIVITY_CLUSTER_RATIO`, `CLUSTER_SEEDS`
 - Produces: one master log and the artifact tree from the spec.
 
 - [ ] **Step 1: Write a failing static launcher contract test**
 
-Parse the shell script text and assert it contains exact pinned defaults, quotes all path variables, derives logical shard indices independently from physical `GPU_IDS`, uses `set -euo pipefail`, writes a PID lock, waits for every collector PID, and invokes selection only after the exact gradient-ID validation command succeeds.
+Parse the shell script text and assert it contains exact pinned defaults, quotes all path variables, runs and validates eligibility before any collector, derives logical shard indices independently from physical `GPU_IDS`, uses `set -euo pipefail`, writes a PID lock, waits for every collector PID, and invokes selection only after the exact eligible-gradient-ID validation command succeeds.
 
 - [ ] **Step 2: Run launcher test and verify RED**
 
@@ -387,12 +444,13 @@ Default outputs:
 
 ```text
 data/gradient_diversity/deepmath_level6_r1_solution1.jsonl
+data/gradient_diversity/deepmath_level6_r1_solution1.eligibility.json
 data/gradient_diversity/gradients/qwen2.5-0.5b-instruct
 data/gradient_diversity/DeepMath-103K/train_gradient_diverse_12800.parquet
 logs/gradient_diversity/deepmath_gradient_diverse_12800.log
 ```
 
-The launcher must echo every resolved input and revision, reject an empty GPU list, create a lock with `flock -n`, and install no packages automatically. Each collector command exposes exactly one physical GPU through `CUDA_VISIBLE_DEVICES=<physical_id>`, passes `--device cuda:0`, and passes its separately enumerated logical `--shard-index`.
+The launcher must echo every resolved input and revision, reject an empty GPU list, create a lock with `flock -n`, and install no packages automatically. It invokes Python CLIs with `-m math_eval...` from the repository root. Eligibility must report exactly 57,045 rows and only `deepmath-level6-038794` excluded before collection. Each collector command exposes exactly one physical GPU through `CUDA_VISIBLE_DEVICES=<physical_id>`, passes `--device cuda:0`, passes the eligibility report, and passes its separately enumerated logical `--shard-index`.
 
 - [ ] **Step 4: Run launcher test and verify GREEN**
 
@@ -404,6 +462,7 @@ Expected: launcher contract passes.
 /home/mchen/miniconda3/envs/verl/bin/python -m pytest -q \
   math_eval/test_deepmath_gradient_diversity.py \
   math_eval/test_prepare_deepmath_gradient_pool.py \
+  math_eval/test_build_gradient_eligibility.py \
   math_eval/test_collect_prismatic_gradients.py \
   math_eval/test_select_gradient_diverse_deepmath.py \
   math_eval/test_gradient_diversity_launcher.py
@@ -446,8 +505,8 @@ Expected: 51 tests pass.
 - [ ] **Step 2: Run real preparation only**
 
 ```bash
-/home/mchen/miniconda3/envs/verl/bin/python \
-  math_eval/prepare_deepmath_gradient_pool.py \
+/home/mchen/miniconda3/envs/gvendi-opd/bin/python \
+  -m math_eval.prepare_deepmath_gradient_pool \
   --source-parquet data/g-opd/DeepMath-103K/train_filtered_level6.parquet \
   --output-jsonl data/gradient_diversity/deepmath_level6_r1_solution1.jsonl \
   --manifest data/gradient_diversity/deepmath_level6_r1_solution1.manifest.json \
@@ -456,31 +515,35 @@ Expected: 51 tests pass.
 
 Expected: exact 57,046/57,046 join, no ambiguity, pinned revision recorded.
 
-- [ ] **Step 3: Run token-length preflight and four-sample one-GPU gradient smoke**
+- [ ] **Step 3: Run and validate the real eligibility report**
+
+Expected: 57,046 prepared rows, exactly one excluded row (`deepmath-level6-038794`, 33,634 tokens), 57,045 eligible rows, and unchanged stable IDs around the exclusion gap.
+
+- [ ] **Step 4: Run four-sample one-GPU gradient smoke**
 
 Use a free GPU identified immediately before the command. Restrict the smoke input to four copied prepared rows in a temporary ignored JSONL. Expected artifacts: one safetensors chunk with four IDs and tensor shape `(4, 1024)`; all entries finite and non-zero.
 
-- [ ] **Step 4: Verify smoke resume**
+- [ ] **Step 5: Verify smoke resume**
 
 Rerun the same four-sample command. Expected: the wrapper detects complete coverage and exits without writing or overwriting another chunk.
 
-- [ ] **Step 5: Run tiny GPU clustering smoke**
+- [ ] **Step 6: Run tiny GPU clustering smoke**
 
 Run selection against a fixture target smaller than four and both ratios with the implementation's minimum `K=2`. Expected: diagnostics and schema-preserving parquet are written without traceback.
 
-- [ ] **Step 6: Request code review and address only verified findings through TDD**
+- [ ] **Step 7: Request code review and address only verified findings through TDD**
 
 Review the committed diff against the spec, official reference behavior, resume safety, and test coverage. Any fix starts with a failing regression test.
 
-- [ ] **Step 7: Run final verification**
+- [ ] **Step 8: Run final verification**
 
 Run the feature suite, the 51-test OPD suite, `bash -n run_select_gradient_diverse_deepmath.sh`, `git diff --check`, and confirm the worktree is clean except ignored runtime artifacts.
 
-- [ ] **Step 8: Integrate the reviewed commits into the main branch without touching unrelated dirty files**
+- [ ] **Step 9: Integrate the reviewed commits into the main branch without touching unrelated dirty files**
 
 Use non-destructive cherry-picks of this branch's commits into `quality-gated-correct-compression-opd`. Stop and report if any path overlaps user modifications.
 
-- [ ] **Step 9: Launch in existing `opd-CLI`**
+- [ ] **Step 10: Launch in existing `opd-CLI`**
 
 Inspect the tmux panes and active GPU processes again. Open a new pane/window in `opd-CLI` if necessary, then run:
 
@@ -491,6 +554,6 @@ GPU_IDS=<verified-free-comma-separated-ids> \
 
 Expected before handoff: preparation succeeds, reference/model revisions appear in the master log, at least one gradient chunk is written, and all collector processes remain alive without traceback.
 
-- [ ] **Step 10: Record launch evidence**
+- [ ] **Step 11: Record launch evidence**
 
 Report the tmux target, process IDs, physical GPU IDs, master log, prepared row count, gradient chunk count, and exact resume command.
