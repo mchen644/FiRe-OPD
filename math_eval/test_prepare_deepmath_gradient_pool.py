@@ -1,5 +1,7 @@
 import json
+import multiprocessing
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -71,6 +73,48 @@ def _prepare_fixture(tmp_path: Path) -> tuple[Path, Path, Path, list[dict], dict
     return source, output, manifest, originals, result
 
 
+def _concurrent_prepare_worker(
+    source: Path,
+    output: Path,
+    manifest_path: Path,
+    originals: list[dict],
+    start_event,
+    replace_barrier,
+    result_queue,
+) -> None:
+    """Force both unlocked callers past their final absence check."""
+    original_replace = Path.replace
+    first_replace = True
+
+    def synchronized_first_replace(self: Path, target: Path) -> Path:
+        nonlocal first_replace
+        if first_replace:
+            first_replace = False
+            try:
+                replace_barrier.wait(timeout=1.0)
+            except threading.BrokenBarrierError:
+                pass
+        return original_replace(self, target)
+
+    Path.replace = synchronized_first_replace
+    if not start_event.wait(timeout=10.0):
+        result_queue.put(("worker-error", str(source.resolve()), "start timeout"))
+        return
+    try:
+        result = preparation.prepare_pool(
+            source,
+            output,
+            manifest_path,
+            originals,
+            expected_count=1,
+        )
+        result_queue.put(("success", str(source.resolve()), result))
+    except Exception as error:
+        result_queue.put(
+            ("error", str(source.resolve()), type(error).__name__, str(error))
+        )
+
+
 def test_prepare_pool_writes_pinned_rows_in_source_order(tmp_path: Path) -> None:
     source, output, manifest_path, _, manifest = _prepare_fixture(tmp_path)
 
@@ -94,6 +138,86 @@ def test_prepare_pool_writes_pinned_rows_in_source_order(tmp_path: Path) -> None
         json.dumps(record, ensure_ascii=False, separators=(",", ":"))
         for record in records
     ]
+
+
+def test_prepare_pool_serializes_concurrent_creators_and_preserves_one_source(
+    tmp_path: Path,
+) -> None:
+    context = multiprocessing.get_context("fork")
+    left_source = tmp_path / "left" / "filtered.parquet"
+    right_source = tmp_path / "right" / "filtered.parquet"
+    output = tmp_path / "cache" / "pool.jsonl"
+    manifest_path = tmp_path / "metadata" / "pool.manifest.json"
+    sources = [left_source, right_source]
+    questions = ["Left question", "Right question"]
+    originals_by_source = [
+        [_original_row(question, answer, f"Solution {answer}")]
+        for question, answer in zip(questions, ["11", "22"], strict=True)
+    ]
+    for source, question, answer in zip(
+        sources, questions, ["11", "22"], strict=True
+    ):
+        _write_source(source, [_filtered_row(question, answer, 0)])
+
+    start_event = context.Event()
+    replace_barrier = context.Barrier(2)
+    result_queue = context.Queue()
+    processes = [
+        context.Process(
+            target=_concurrent_prepare_worker,
+            args=(
+                source,
+                output,
+                manifest_path,
+                originals,
+                start_event,
+                replace_barrier,
+                result_queue,
+            ),
+        )
+        for source, originals in zip(sources, originals_by_source, strict=True)
+    ]
+
+    results = []
+    try:
+        for process in processes:
+            process.start()
+        start_event.set()
+        results = [result_queue.get(timeout=15.0) for _ in processes]
+    finally:
+        for process in processes:
+            process.join(timeout=15.0)
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5.0)
+
+    assert all(process.exitcode == 0 for process in processes)
+    successes = [result for result in results if result[0] == "success"]
+    errors = [result for result in results if result[0] == "error"]
+    assert len(successes) == 1, results
+    assert len(errors) == 1, results
+    assert "cached manifest source_parquet mismatch" in errors[0][3]
+
+    assert output.exists()
+    assert manifest_path.exists()
+    final_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    record = json.loads(output.read_text(encoding="utf-8"))
+    source_hashes = {
+        str(source.resolve()): sha256_file(source) for source in sources
+    }
+    questions_by_source = {
+        str(source.resolve()): question
+        for source, question in zip(sources, questions, strict=True)
+    }
+    winning_source = final_manifest["source_parquet"]
+    assert winning_source in source_hashes
+    assert final_manifest["source_sha256"] == source_hashes[winning_source]
+    assert final_manifest["prepared_jsonl_sha256"] == sha256_file(output)
+    assert record["prompt"] == questions_by_source[winning_source]
+    assert successes[0][1] == winning_source
+    assert successes[0][2] == final_manifest
+    assert not list(tmp_path.rglob("*.tmp"))
 
 
 def test_prepare_pool_reuses_a_fully_validated_cache(
