@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,6 +29,7 @@ from math_eval.collect_prismatic_gradients import (
     REFERENCE_COMMIT,
     SAVE_INTERVAL,
     TRL_VERSION,
+    _exclusive_shard_lock,
     build_gradient_manifest,
     construct_strict_collector,
     load_prepared_pool,
@@ -36,6 +38,8 @@ from math_eval.collect_prismatic_gradients import (
     preflight_samples,
     resolve_resume_start,
     run_collection,
+    run_global_validation,
+    validate_global_gradient_coverage,
     validate_single_cuda_device,
     verify_reference_repo,
     write_or_validate_gradient_manifest,
@@ -336,6 +340,30 @@ def test_resolve_resume_start_ignores_valid_other_shard_chunks(
     _write_chunk(tmp_path, prefix="deepmath", start=2, ids=ids[2:])
 
     assert resolve_resume_start(ids, tmp_path, "deepmath", 0, 2) == 0
+
+
+@pytest.mark.parametrize("start", [2, 999_999])
+@pytest.mark.parametrize("file_kind", ["paired", "txt", "safetensors"])
+def test_resolve_resume_start_rejects_chunks_starting_outside_dataset(
+    tmp_path: Path,
+    start: int,
+    file_kind: str,
+) -> None:
+    ids = _ids(2)
+    if file_kind == "paired":
+        _write_chunk(tmp_path, prefix="deepmath", start=start, ids=[ids[0]])
+    elif file_kind == "txt":
+        (tmp_path / f"deepmath.{start}.txt").write_text(
+            json.dumps({"id": ids[0]}) + "\n", encoding="utf-8"
+        )
+    else:
+        save_file(
+            {ids[0]: torch.ones(PROJECTION_DIM, dtype=torch.float16)},
+            tmp_path / f"deepmath.{start}.safetensors",
+        )
+
+    with pytest.raises(ValueError, match="outside dataset range"):
+        resolve_resume_start(ids, tmp_path, "deepmath", 0, 1)
 
 
 @pytest.mark.parametrize("suffix", ["txt", "safetensors"])
@@ -781,6 +809,46 @@ def test_preflight_samples_uses_pinned_limit_not_tokenizer_advertisement() -> No
     assert collector.tokenizer.calls == [{"tokenize": False}]
 
 
+@pytest.mark.parametrize(
+    "prefix",
+    ["", "../escape", "/tmp/x", "a/b", ".", "line\nbreak", "has space"],
+)
+def test_run_collection_rejects_unsafe_prefix_without_output_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    prefix: str,
+) -> None:
+    import math_eval.collect_prismatic_gradients as collection
+
+    prepared, prepared_manifest_path, _, _ = _prepared_fixture(tmp_path, count=1)
+    reference, commit, _, _ = _official_git_repository(tmp_path)
+    output_dir = tmp_path / "gradients"
+    monkeypatch.setattr(collection, "REFERENCE_COMMIT", commit)
+    monkeypatch.setattr(
+        collection,
+        "validate_single_cuda_device",
+        lambda *_: (_ for _ in ()).throw(
+            AssertionError("unsafe prefix must be rejected before CUDA")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="prefix"):
+        run_collection(
+            reference_repo=reference,
+            prepared_jsonl=prepared,
+            prepared_manifest=prepared_manifest_path,
+            output_dir=output_dir,
+            prefix=prefix,
+            model_name=MODEL_NAME,
+            model_revision=MODEL_REVISION,
+            shard_index=0,
+            num_shards=1,
+            device="cuda:0",
+        )
+
+    assert not output_dir.exists()
+
+
 def test_run_collection_complete_shard_returns_before_cuda_or_model_load(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1069,6 +1137,7 @@ def test_run_collection_rejects_empty_shard_beyond_dataset(
 
     prepared, prepared_manifest_path, _, _ = _prepared_fixture(tmp_path, count=1)
     reference, commit, _, _ = _official_git_repository(tmp_path)
+    output_dir = tmp_path / "gradients"
     monkeypatch.setattr(collection, "REFERENCE_COMMIT", commit)
 
     with pytest.raises(ValueError, match="empty logical shard"):
@@ -1076,7 +1145,7 @@ def test_run_collection_rejects_empty_shard_beyond_dataset(
             reference_repo=reference,
             prepared_jsonl=prepared,
             prepared_manifest=prepared_manifest_path,
-            output_dir=tmp_path / "gradients",
+            output_dir=output_dir,
             prefix="deepmath",
             model_name=MODEL_NAME,
             model_revision=MODEL_REVISION,
@@ -1084,6 +1153,42 @@ def test_run_collection_rejects_empty_shard_beyond_dataset(
             num_shards=3,
             device="cuda:0",
         )
+
+    assert not output_dir.exists()
+
+
+@pytest.mark.parametrize(
+    ("num_shards", "shard_index"),
+    [(0, 0), (2, -1), (2, 2)],
+)
+def test_run_collection_rejects_invalid_shard_arguments_without_output_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    num_shards: int,
+    shard_index: int,
+) -> None:
+    import math_eval.collect_prismatic_gradients as collection
+
+    prepared, prepared_manifest_path, _, _ = _prepared_fixture(tmp_path, count=1)
+    reference, commit, _, _ = _official_git_repository(tmp_path)
+    output_dir = tmp_path / "gradients"
+    monkeypatch.setattr(collection, "REFERENCE_COMMIT", commit)
+
+    with pytest.raises(ValueError, match="num_shards|shard_index"):
+        run_collection(
+            reference_repo=reference,
+            prepared_jsonl=prepared,
+            prepared_manifest=prepared_manifest_path,
+            output_dir=output_dir,
+            prefix="deepmath",
+            model_name=MODEL_NAME,
+            model_revision=MODEL_REVISION,
+            shard_index=shard_index,
+            num_shards=num_shards,
+            device="cuda:0",
+        )
+
+    assert not output_dir.exists()
 
 
 def test_run_collection_rejects_invalid_device_even_when_shard_is_complete(
