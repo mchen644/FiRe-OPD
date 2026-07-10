@@ -255,7 +255,7 @@ Expected: import fails because the wrapper does not exist.
 
 - [ ] **Step 3: Implement provenance and resume helpers without loading a model**
 
-Use `git -C <repo> rev-parse HEAD` and `git -C <repo> status --porcelain`; require the pinned commit and a clean tree. Validate sidecars form a contiguous prefix of the logical shard rather than trusting the largest filename alone.
+Use `git -C <repo> rev-parse HEAD` and `git -C <repo> status --porcelain`; require the pinned commit and a clean tree. Validate `.safetensors`/`.txt` pairs form a contiguous prefix of the logical shard rather than trusting the largest filename alone. Sidecar IDs must match the expected slice exactly; safetensors must be readable, contain the same keys, and store one finite `(1024,)` vector per ID. Intermediate chunks contain exactly 500 rows, while only a shard-final chunk may be shorter.
 
 - [ ] **Step 4: Run wrapper unit tests and verify GREEN**
 
@@ -271,7 +271,7 @@ Expected: fails because model/collector loading is not implemented.
 
 - [ ] **Step 7: Implement the minimal model and official collector loading path**
 
-Add the reference `prismatic-synthesis` directory to `sys.path`, import `GradientComputer`, load the pinned model with `torch_dtype="auto"`, move it to the explicit logical CUDA device, and call `compute_project_store_gradients` only on the unresolved shard suffix.
+Add the reference `prismatic-synthesis` directory to `sys.path`, import `GradientComputer`, load the pinned model and tokenizer with `torch_dtype="auto"` and the exact revision, and move the model to the process-local `cuda:0`. Temporarily wrap the official projector factory so a `BasicProjector` fallback raises before allocation, then assert the instantiated collector uses `CudaProjector`. Check that official completion-only labels contain at least one supervised token and that token length does not exceed the pinned model's `max_position_embeddings`. Call `compute_project_store_gradients` only on the unresolved shard suffix and revalidate complete shard coverage after it returns.
 
 - [ ] **Step 8: Run all Task 3 unit tests and verify GREEN**
 
@@ -392,7 +392,7 @@ data/gradient_diversity/DeepMath-103K/train_gradient_diverse_12800.parquet
 logs/gradient_diversity/deepmath_gradient_diverse_12800.log
 ```
 
-The launcher must echo every resolved input and revision, reject an empty GPU list, create a lock with `flock -n`, and install no packages automatically.
+The launcher must echo every resolved input and revision, reject an empty GPU list, create a lock with `flock -n`, and install no packages automatically. Each collector command exposes exactly one physical GPU through `CUDA_VISIBLE_DEVICES=<physical_id>`, passes `--device cuda:0`, and passes its separately enumerated logical `--shard-index`.
 
 - [ ] **Step 4: Run launcher test and verify GREEN**
 

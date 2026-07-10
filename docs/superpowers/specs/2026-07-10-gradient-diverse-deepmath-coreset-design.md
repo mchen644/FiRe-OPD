@@ -152,13 +152,17 @@ The inherited official behavior is:
 FiRe-OPD adds only orchestration and validation:
 
 - explicit `--shard-index` independent of physical CUDA device ID
+- one physical GPU exposed per collector process, with the process-local device fixed to `cuda:0`
 - pinned model revision
 - exact shard-bound computation compatible with the reference implementation
 - manifest validation preventing resume with a different dataset hash, proxy revision, reference commit, projection dimension, or shard count
+- strict chunk-pair, sidecar-ID, tensor-shape, and contiguous-prefix validation before resume
+- fail-fast refusal when the official fast-JL probe would fall back to TRAK `BasicProjector`
 - preflight tokenization to ensure every prompt/completion fits the proxy context window
+- a non-empty completion-label check after the official completion-only collator runs
 - final check that the stored gradient IDs exactly equal the prepared dataset IDs
 
-No truncation is silently applied. If a sample exceeds the proxy context window, preparation stops and reports its ID and token count before gradient collection begins.
+No truncation is silently applied. The hard context boundary comes from the pinned model config (`max_position_embeddings=32768`), not the tokenizer's larger advertised limit. If a sample exceeds it, preparation stops and reports its ID and token count before gradient collection begins.
 
 ## Paper/code discrepancy policy
 
