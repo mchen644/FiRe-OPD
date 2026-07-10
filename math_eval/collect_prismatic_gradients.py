@@ -41,6 +41,15 @@ MAX_CONTEXT_TOKENS = 32_768
 ASSISTANT_RESPONSE_MARKER = "<|im_start|>assistant"
 TRL_VERSION = "0.17.0"
 GRADIENT_MANIFEST_NAME = "gradient.manifest.json"
+GRADIENT_PREFIX_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
+
+
+def _validate_gradient_prefix(prefix: str) -> str:
+    if not isinstance(prefix, str) or GRADIENT_PREFIX_PATTERN.fullmatch(prefix) is None:
+        raise ValueError(
+            "gradient prefix must match [A-Za-z0-9][A-Za-z0-9_-]*"
+        )
+    return prefix
 
 
 def _git_output(repository: Path, *arguments: str) -> str:
@@ -468,8 +477,7 @@ def resolve_resume_start(
     shard_end: int,
 ) -> int:
     """Validate official chunk files and return the first unresolved index."""
-    if not isinstance(prefix, str) or not prefix:
-        raise ValueError("gradient prefix must be a nonempty string")
+    prefix = _validate_gradient_prefix(prefix)
     if shard_start < 0 or shard_end < shard_start or shard_end > len(dataset_ids):
         raise ValueError("invalid logical shard bounds")
 
@@ -492,6 +500,11 @@ def resolve_resume_start(
         if match is None:
             raise ValueError(f"malformed gradient chunk filename: {name}")
         start = int(match.group(1))
+        if not 0 <= start < len(dataset_ids):
+            raise ValueError(
+                f"gradient chunk start {start} is outside dataset range "
+                f"[0, {len(dataset_ids)})"
+            )
         if shard_start <= start < shard_end:
             files_by_start.setdefault(start, {})[match.group(2)] = path
 
@@ -732,6 +745,7 @@ def run_collection(
     device: str,
 ) -> dict[str, int | str]:
     """Validate, resume, and execute one explicit official logical shard."""
+    prefix = _validate_gradient_prefix(prefix)
     if model_name != MODEL_NAME:
         raise ValueError(
             f"pinned model name mismatch: expected {MODEL_NAME}, got {model_name}"
@@ -746,6 +760,9 @@ def run_collection(
 
     rows, source_manifest = load_prepared_pool(
         Path(prepared_jsonl), Path(prepared_manifest)
+    )
+    shard_start, shard_end = _validated_shard_bounds(
+        len(rows), num_shards, shard_index
     )
     repository = Path(reference_repo).resolve()
     verify_reference_repo(repository, REFERENCE_COMMIT)
@@ -775,9 +792,6 @@ def run_collection(
         expected_manifest,
     )
 
-    shard_start, shard_end = _validated_shard_bounds(
-        len(rows), num_shards, shard_index
-    )
     if shard_start == shard_end:
         return {
             "status": "empty",
