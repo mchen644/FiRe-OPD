@@ -14,7 +14,15 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from math_eval.deepmath_gradient_diversity import join_filtered_rows, sha256_file
+if __package__ in (None, ""):
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from math_eval.deepmath_gradient_diversity import (  # noqa: E402
+    join_filtered_rows,
+    sha256_file,
+)
 
 
 DATASET_NAME = "zwhe99/DeepMath-103K"

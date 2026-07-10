@@ -1,5 +1,7 @@
 import json
 import multiprocessing
+import os
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -529,6 +531,33 @@ def test_cli_loads_only_the_exact_pinned_dataset(
             {"split": "train", "revision": preparation.DATASET_REVISION},
         )
     ]
+
+
+def test_direct_file_cli_help_works_from_repo_root_without_pythonpath() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "math_eval" / "prepare_deepmath_gradient_pool.py"
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+
+    result = subprocess.run(
+        [sys.executable, str(script_path), "--help"],
+        cwd=repo_root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    for expected_flag in (
+        "--source-parquet",
+        "--output-jsonl",
+        "--manifest",
+        "--dataset-name",
+        "--dataset-revision",
+        "--expected-count",
+    ):
+        assert expected_flag in result.stdout
 
 
 @pytest.mark.parametrize(
