@@ -1,13 +1,16 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from verl import DataProto
 
 from verl.trainer.ppo.difficulty_aware_opd import (
+    compute_group_success_routing,
     compute_two_signal_difficulty_routing,
     rank_to_unit_interval,
+    summarize_group_success_routing,
     summarize_difficulty_routing,
 )
 
@@ -24,6 +27,118 @@ def _cfg(**overrides):
     }
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+def _group_cfg(**overrides):
+    values = {
+        "method": "group_success_prompt_esr",
+        "correct_reward_threshold": 0.5,
+        "expected_group_size": 4,
+        "easy_group_correct_count": 4,
+        "easy_prompt_style": "concise",
+        "default_prompt_style": "normal",
+        "easy_esr_beta": 0.20,
+        "non_easy_esr_beta": 0.50,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _group_success_fixture():
+    group_correct_counts = {f"g{count}": count for count in range(5)}
+    rows = []
+    for rollout_index in range(4):
+        for group_uid, correct_count in group_correct_counts.items():
+            rows.append((group_uid, rollout_index < correct_count))
+
+    uids = np.asarray([uid for uid, _ in rows], dtype=object)
+    response_mask = torch.ones((len(rows), 2), dtype=torch.float32)
+    token_level_scores = torch.zeros_like(response_mask)
+    for row_index, (_, is_correct) in enumerate(rows):
+        if is_correct:
+            token_level_scores[row_index, -1] = 1.0
+    return token_level_scores, response_mask, uids
+
+
+def test_group_success_routing_groups_shuffled_rows_by_uid_and_broadcasts_routes():
+    token_level_scores, response_mask, uids = _group_success_fixture()
+
+    result = compute_group_success_routing(
+        token_level_scores=token_level_scores,
+        response_mask=response_mask,
+        uids=uids,
+        config=_group_cfg(),
+    )
+
+    assert result.group_correct_counts.tolist() == [0, 1, 2, 3, 4]
+    for correct_count in range(4):
+        rows = np.flatnonzero(uids == f"g{correct_count}")
+        assert set(result.prompt_styles[rows]) == {"normal"}
+        assert result.esr_beta[rows].tolist() == pytest.approx([0.5] * 4)
+        assert result.easy[rows].tolist() == [0.0] * 4
+        expected_unresolved = [1.0] * 4 if correct_count == 0 else [0.0] * 4
+        expected_learnable = [0.0] * 4 if correct_count == 0 else [1.0] * 4
+        assert result.unresolved[rows].tolist() == expected_unresolved
+        assert result.learnable[rows].tolist() == expected_learnable
+
+    easy_rows = np.flatnonzero(uids == "g4")
+    assert set(result.prompt_styles[easy_rows]) == {"concise"}
+    assert result.esr_beta[easy_rows].tolist() == pytest.approx([0.2] * 4)
+    assert result.easy[easy_rows].tolist() == [1.0] * 4
+    assert result.learnable[easy_rows].tolist() == [0.0] * 4
+    assert result.unresolved[easy_rows].tolist() == [0.0] * 4
+
+
+def test_summarize_group_success_routing_reports_group_histogram_and_bucket_lengths():
+    token_level_scores, response_mask, uids = _group_success_fixture()
+    result = compute_group_success_routing(
+        token_level_scores=token_level_scores,
+        response_mask=response_mask,
+        uids=uids,
+        config=_group_cfg(),
+    )
+
+    lengths = torch.arange(1, len(uids) + 1)
+    metrics = summarize_group_success_routing(result, original_response_lengths=lengths)
+
+    assert metrics["difficulty_aware_opd/group_count"] == 5.0
+    assert metrics["difficulty_aware_opd/expected_group_size"] == 4.0
+    for correct_count in range(5):
+        assert metrics[f"difficulty_aware_opd/group_correct_count_{correct_count}_ratio"] == pytest.approx(0.2)
+    assert metrics["difficulty_aware_opd/easy_group_ratio"] == pytest.approx(0.2)
+    assert metrics["difficulty_aware_opd/learnable_group_ratio"] == pytest.approx(0.6)
+    assert metrics["difficulty_aware_opd/unresolved_group_ratio"] == pytest.approx(0.2)
+    assert metrics["difficulty_aware_opd/concise_prompt_ratio"] == pytest.approx(0.2)
+    assert metrics["difficulty_aware_opd/normal_prompt_ratio"] == pytest.approx(0.8)
+    assert metrics["difficulty_aware_opd/esr_beta_min"] == pytest.approx(0.2)
+    assert metrics["difficulty_aware_opd/esr_beta_max"] == pytest.approx(0.5)
+    assert "difficulty_aware_opd/easy_orig_response_length_mean" in metrics
+    assert "difficulty_aware_opd/learnable_orig_response_length_mean" in metrics
+    assert "difficulty_aware_opd/unresolved_orig_response_length_mean" in metrics
+
+
+@pytest.mark.parametrize(
+    ("uids", "config", "message"),
+    [
+        (np.asarray(["short"], dtype=object), _group_cfg(), "uids length"),
+        (np.asarray(["a", "a", "a", "b"], dtype=object), _group_cfg(), "expected 4 rows"),
+        (np.asarray(["a"] * 4, dtype=object), _group_cfg(expected_group_size=0), "expected_group_size"),
+        (np.asarray(["a"] * 4, dtype=object), _group_cfg(easy_group_correct_count=5), "easy_group_correct_count"),
+        (np.asarray(["a"] * 4, dtype=object), _group_cfg(easy_esr_beta=0.0), "easy_esr_beta"),
+        (np.asarray(["a"] * 4, dtype=object), _group_cfg(default_prompt_style="budgeted"), "prompt style"),
+    ],
+)
+def test_group_success_routing_rejects_malformed_groups_and_config(uids, config, message):
+    response_mask = torch.ones((4, 2), dtype=torch.float32)
+    token_level_scores = torch.zeros_like(response_mask)
+
+    with pytest.raises(ValueError, match=message):
+        compute_group_success_routing(
+            token_level_scores=token_level_scores,
+            response_mask=response_mask,
+            uids=uids,
+            config=config,
+        )
 
 
 def test_rank_to_unit_interval_handles_monotonic_ties_nan_and_singleton():
