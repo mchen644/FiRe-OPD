@@ -58,6 +58,30 @@ _CHUNK_PATTERN = re.compile(
 )
 
 
+def _reject_duplicate_json_pairs(pairs):
+    value: dict = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON key: {key}")
+        value[key] = item
+    return value
+
+
+def _reject_nonfinite_json_constant(value: str):
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
+def _strict_json_loads(payload: str, description: str):
+    try:
+        return json.loads(
+            payload,
+            object_pairs_hook=_reject_duplicate_json_pairs,
+            parse_constant=_reject_nonfinite_json_constant,
+        )
+    except (json.JSONDecodeError, ValueError) as error:
+        raise ValueError(f"invalid {description}: {error}") from error
+
+
 def _read_sidecar(path: Path) -> list[str]:
     ids: list[str] = []
     try:
@@ -65,7 +89,9 @@ def _read_sidecar(path: Path) -> list[str]:
             for line_number, line in enumerate(handle, start=1):
                 if not line.strip():
                     raise ValueError(f"blank gradient sidecar line {line_number}")
-                row = json.loads(line)
+                row = _strict_json_loads(
+                    line, f"gradient sidecar row {line_number} in {path.name}"
+                )
                 sample_id = row.get("id") if isinstance(row, Mapping) else None
                 if not isinstance(sample_id, str) or not sample_id:
                     raise ValueError(
@@ -81,7 +107,9 @@ def _read_sidecar(path: Path) -> list[str]:
     return ids
 
 
-def _discover_chunk_pairs(directory: Path) -> list[tuple[int, Path, Path]]:
+def _discover_chunk_pairs(
+    directory: Path, expected_prefix: str | None
+) -> list[tuple[int, Path, Path]]:
     files_by_start: dict[int, dict[str, Path]] = {}
     prefixes: set[str] = set()
     for path in Path(directory).iterdir():
@@ -94,6 +122,10 @@ def _discover_chunk_pairs(directory: Path) -> list[tuple[int, Path, Path]]:
         if match is None:
             raise ValueError(f"malformed gradient artifact: {path.name}")
         prefix, start_text, kind = match.groups()
+        if expected_prefix is not None and prefix != expected_prefix:
+            raise ValueError(
+                f"unexpected gradient prefix {prefix!r}; expected {expected_prefix!r}"
+            )
         prefixes.add(prefix)
         start = int(start_text)
         if kind in files_by_start.setdefault(start, {}):
@@ -115,7 +147,10 @@ def _discover_chunk_pairs(directory: Path) -> list[tuple[int, Path, Path]]:
 
 
 def load_projected_gradients(
-    directory: Path, expected_ids: Sequence[str]
+    directory: Path,
+    expected_ids: Sequence[str],
+    *,
+    prefix: str | None = None,
 ) -> tuple[list[str], torch.Tensor]:
     """Load exact official chunk coverage into eligibility-report order on CPU."""
     directory = Path(directory)
@@ -128,13 +163,17 @@ def load_projected_gradients(
         raise ValueError("expected gradient IDs must be nonempty strings")
     if len(set(ordered_ids)) != len(ordered_ids):
         raise ValueError("expected gradient IDs must be unique")
+    if prefix is not None and not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9_-]*", prefix
+    ):
+        raise ValueError("expected gradient prefix is invalid")
 
     gradients = torch.empty(
         (len(ordered_ids), PROJECTION_DIM), dtype=PROJECTED_DTYPE, device="cpu"
     )
     cursor = 0
     seen_ids: set[str] = set()
-    for start, sidecar_path, tensor_path in _discover_chunk_pairs(directory):
+    for start, sidecar_path, tensor_path in _discover_chunk_pairs(directory, prefix):
         if start != cursor:
             raise ValueError(
                 f"gradient chunk coverage gap or overlap: expected start {cursor}, "
@@ -184,6 +223,53 @@ def load_projected_gradients(
         )
     validate_gradient_matrix(ordered_ids, gradients, ordered_ids)
     return ordered_ids, gradients
+
+
+def load_globally_validated_gradients(
+    directory: Path,
+    expected_ids: Sequence[str],
+    gradient_manifest: Mapping,
+    *,
+    coverage_validator=None,
+) -> tuple[list[str], torch.Tensor, dict]:
+    """Run the collector's exact all-shard gate before loading one prefix."""
+    prefix = gradient_manifest.get("prefix")
+    if not isinstance(prefix, str) or not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9_-]*", prefix
+    ):
+        raise ValueError("gradient manifest prefix is invalid")
+    num_shards = gradient_manifest.get("num_shards")
+    if (
+        isinstance(num_shards, bool)
+        or not isinstance(num_shards, int)
+        or num_shards <= 0
+    ):
+        raise ValueError("gradient manifest num_shards must be positive")
+    if coverage_validator is None:
+        from math_eval.collect_prismatic_gradients import (
+            validate_global_gradient_coverage,
+        )
+
+        coverage_validator = validate_global_gradient_coverage
+    coverage = coverage_validator(
+        expected_ids, Path(directory), prefix, num_shards
+    )
+    expected_coverage = {
+        "row_count": len(expected_ids),
+        "shard_count": num_shards,
+    }
+    if not isinstance(coverage, Mapping) or any(
+        coverage.get(field) != expected
+        for field, expected in expected_coverage.items()
+    ):
+        raise RuntimeError("global gradient coverage summary is inconsistent")
+    chunk_count = coverage.get("chunk_count")
+    if isinstance(chunk_count, bool) or not isinstance(chunk_count, int) or chunk_count <= 0:
+        raise RuntimeError("global gradient coverage must contain positive chunk_count")
+    ids, gradients = load_projected_gradients(
+        directory, expected_ids, prefix=prefix
+    )
+    return ids, gradients, dict(coverage)
 
 
 def _validate_source_indices(source: pa.Table, indices: Sequence[int]) -> list[int]:
@@ -487,7 +573,14 @@ def compute_selection_diagnostics(
 
 def _write_json(path: Path, value: object) -> None:
     with Path(path).open("w", encoding="utf-8") as handle:
-        json.dump(value, handle, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        json.dump(
+            value,
+            handle,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
         handle.write("\n")
         handle.flush()
         os.fsync(handle.fileno())
@@ -497,7 +590,13 @@ def _write_jsonl(path: Path, rows: Sequence[Mapping]) -> None:
     with Path(path).open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(
-                json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                json.dumps(
+                    row,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
                 + "\n"
             )
         handle.flush()
@@ -515,17 +614,25 @@ def _temporary_sibling(path: Path) -> Path:
 
 
 @contextmanager
-def _selection_lock(manifest_path: Path):
-    lock_path = manifest_path.with_name(f".{manifest_path.name}.lock")
-    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+def _selection_locks(paths: Sequence[Path]):
+    descriptors: list[int] = []
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        for target in sorted({Path(path).resolve() for path in paths}, key=os.fspath):
+            lock_path = target.with_name(f".{target.name}.lock")
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+            except BaseException:
+                os.close(descriptor)
+                raise
+            descriptors.append(descriptor)
         yield
     finally:
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-        finally:
-            os.close(descriptor)
+        for descriptor in reversed(descriptors):
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
 
 
 def _validate_existing_artifacts(
@@ -540,7 +647,9 @@ def _validate_existing_artifacts(
     manifest_path: Path,
 ) -> dict:
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = _strict_json_loads(
+            manifest_path.read_text(encoding="utf-8"), "selection manifest"
+        )
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise ValueError(f"invalid existing selection manifest: {error}") from error
     if not isinstance(manifest, dict):
@@ -567,10 +676,16 @@ def _validate_existing_artifacts(
     if not selected.equals(expected_table, check_metadata=True):
         raise ValueError("existing selected parquet content mismatch")
     try:
-        stored_diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
+        stored_diagnostics = _strict_json_loads(
+            diagnostics_path.read_text(encoding="utf-8"),
+            "selection diagnostics",
+        )
         stored_rows = [
-            json.loads(line)
-            for line in selected_ids_path.read_text(encoding="utf-8").splitlines()
+            _strict_json_loads(line, f"selected IDs row {line_number}")
+            for line_number, line in enumerate(
+                selected_ids_path.read_text(encoding="utf-8").splitlines(),
+                start=1,
+            )
         ]
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise ValueError(f"invalid existing selection artifacts: {error}") from error
@@ -612,7 +727,7 @@ def publish_selection_artifacts(
         raise ValueError("selected IDs must be unique")
     validated_indices = _validate_source_indices(source, indices)
 
-    with _selection_lock(manifest_path):
+    with _selection_locks(paths):
         existence = [path.exists() for path in paths]
         if any(existence) and not all(existence):
             raise ValueError("partial selection artifact set exists")
@@ -663,22 +778,14 @@ def publish_selection_artifacts(
 
 def _read_json_object(path: Path, description: str) -> dict:
     try:
-        value = json.loads(Path(path).read_text(encoding="utf-8"))
+        value = _strict_json_loads(
+            Path(path).read_text(encoding="utf-8"), description
+        )
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise ValueError(f"invalid {description} {path}: {error}") from error
     if not isinstance(value, dict):
         raise ValueError(f"invalid {description} {path}: expected a JSON object")
     return value
-
-
-def _require_value(
-    manifest: Mapping, field: str, expected: object, *, description: str
-) -> None:
-    actual = manifest.get(field)
-    if actual != expected:
-        raise ValueError(
-            f"{description} {field} mismatch: expected {expected!r}, got {actual!r}"
-        )
 
 
 def load_validated_gradient_manifest(
@@ -689,67 +796,57 @@ def load_validated_gradient_manifest(
     eligibility_report_path: Path,
     eligibility_report: Mapping,
     reference_repo: Path,
+    expected_prefix: str | None = None,
+    expected_num_shards: int | None = None,
+    manifest_validator=None,
 ) -> dict:
-    """Bind stored gradient provenance to prepared and eligibility artifacts."""
+    """Strict-read then delegate the complete contract to the collector."""
     gradient_manifest_path = Path(gradient_manifest_path).resolve()
     prepared_manifest_path = Path(prepared_manifest_path).resolve()
     eligibility_report_path = Path(eligibility_report_path).resolve()
     reference_repo = Path(reference_repo).resolve()
-    manifest = _read_json_object(gradient_manifest_path, "gradient manifest")
-
-    expected_values = {
-        "manifest_version": 1,
-        "prepared_jsonl": str(Path(prepared_manifest["prepared_jsonl"]).resolve()),
-        "prepared_jsonl_sha256": prepared_manifest["prepared_jsonl_sha256"],
-        "prepared_manifest": str(prepared_manifest_path),
-        "prepared_manifest_sha256": sha256_file(prepared_manifest_path),
-        "prepared_row_count": prepared_manifest["prepared_row_count"],
-        "source_sha256": prepared_manifest["source_sha256"],
-        "dataset_name": DATASET_NAME,
-        "dataset_revision": DATASET_REVISION,
-        "reference_repo": str(reference_repo),
-        "reference_commit": REFERENCE_COMMIT,
-        "reference_tree": REFERENCE_TREE,
-        "model_name": MODEL_NAME,
-        "model_revision": MODEL_REVISION,
-        "eligibility_report": str(eligibility_report_path),
-        "eligibility_report_sha256": sha256_file(eligibility_report_path),
-        "eligible_row_count": eligibility_report.get("eligible_row_count"),
-        "excluded_row_count": eligibility_report.get("excluded_row_count"),
-        "eligible_ids_sha256": eligibility_report.get("eligible_ids_sha256"),
-    }
-    for field, expected in expected_values.items():
-        _require_value(manifest, field, expected, description="gradient manifest")
-
-    prefix = manifest.get("prefix")
-    if not isinstance(prefix, str) or not re.fullmatch(
-        r"[A-Za-z0-9][A-Za-z0-9_-]*", prefix
-    ):
-        raise ValueError("gradient manifest prefix is invalid")
-    num_shards = manifest.get("num_shards")
-    if isinstance(num_shards, bool) or not isinstance(num_shards, int) or num_shards <= 0:
-        raise ValueError("gradient manifest num_shards must be positive")
-
-    projection = manifest.get("projection")
-    if not isinstance(projection, Mapping):
-        raise ValueError("gradient manifest projection must be an object")
-    expected_projection = {
-        "backend": "CudaProjector",
-        "dimension": PROJECTION_DIM,
-        "seed": 0,
-        "type": "rademacher",
-        "input_dtype": "float16",
-        "output_dtype": "float32",
-        "project_interval": 4,
-        "save_interval": 500,
-        "completion_only_loss": True,
-        "full_parameter_gradients": True,
-    }
-    for field, expected in expected_projection.items():
-        _require_value(
-            projection, field, expected, description="gradient manifest projection"
+    strict_manifest = _read_json_object(
+        gradient_manifest_path, "gradient manifest"
+    )
+    if manifest_validator is None:
+        from math_eval.collect_prismatic_gradients import (
+            load_validated_gradient_manifest as collector_manifest_validator,
         )
-    return manifest
+
+        manifest_validator = collector_manifest_validator
+    validated = manifest_validator(
+        gradient_manifest_path,
+        prepared_manifest_path=prepared_manifest_path,
+        prepared_manifest=prepared_manifest,
+        eligibility_report_path=eligibility_report_path,
+        eligibility_report=eligibility_report,
+        reference_repo=reference_repo,
+        expected_prefix=expected_prefix,
+        expected_num_shards=expected_num_shards,
+    )
+    if strict_manifest != validated:
+        raise ValueError(
+            "gradient manifest changed or normalized during exact validation"
+        )
+    return dict(validated)
+
+
+def build_selection_gradient_provenance(
+    gradient_manifest_path: Path, gradient_manifest: Mapping
+) -> dict:
+    """Embed the complete validated gradient contract plus lookup fields."""
+    path = Path(gradient_manifest_path).resolve()
+    return {
+        "gradient_manifest": str(path),
+        "gradient_manifest_sha256": sha256_file(path),
+        "gradient_prefix": gradient_manifest["prefix"],
+        "gradient_num_shards": gradient_manifest["num_shards"],
+        "gradient_runtime": {
+            "trl_version": gradient_manifest["trl_version"],
+            "package_versions": dict(gradient_manifest["package_versions"]),
+        },
+        "gradient_provenance": dict(gradient_manifest),
+    }
 
 
 def _selected_id_sequence_sha256(rows: Sequence[Mapping]) -> str:
@@ -798,6 +895,27 @@ def _validate_eligible_rows(
             raise ValueError("eligible row content differs from prepared pool")
         seen.add(sample_id)
         previous_source_index = source_index
+
+
+def apply_production_eligibility_report(
+    rows: Sequence[Mapping],
+    prepared_manifest: Mapping,
+    report_path: Path,
+    *,
+    prepared_manifest_path: Path,
+    apply_report=None,
+) -> tuple[list[dict], dict]:
+    """Apply production semantics while binding the caller's manifest file."""
+    if apply_report is None:
+        from math_eval.build_gradient_eligibility import apply_eligibility_report
+
+        apply_report = apply_eligibility_report
+    return apply_report(
+        rows,
+        prepared_manifest,
+        Path(report_path).resolve(),
+        prepared_manifest_path=Path(prepared_manifest_path).resolve(),
+    )
 
 
 def run_selection(
@@ -858,12 +976,15 @@ def run_selection(
     )
 
     # Imported lazily so pure selector helpers remain usable in CPU test envs.
-    from math_eval.build_gradient_eligibility import apply_eligibility_report
     from math_eval.collect_prismatic_gradients import load_prepared_pool
 
     prepared_rows, prepared_manifest = load_prepared_pool(
         prepared_jsonl, prepared_manifest_path
     )
+    if _read_json_object(
+        prepared_manifest_path, "prepared manifest"
+    ) != prepared_manifest:
+        raise ValueError("prepared manifest changed or normalized during validation")
     if len(prepared_rows) != expected_source_count:
         raise ValueError(
             f"prepared source count mismatch: expected {expected_source_count}, "
@@ -876,9 +997,18 @@ def run_selection(
     if source.num_rows != expected_source_count:
         raise ValueError("source parquet row count mismatch")
 
-    eligible_rows, eligibility_report = apply_eligibility_report(
-        prepared_rows, prepared_manifest, eligibility_report_path
+    eligible_rows, eligibility_report = apply_production_eligibility_report(
+        prepared_rows,
+        prepared_manifest,
+        eligibility_report_path,
+        prepared_manifest_path=prepared_manifest_path,
     )
+    if _read_json_object(
+        eligibility_report_path, "eligibility report"
+    ) != eligibility_report:
+        raise ValueError(
+            "eligibility report changed or normalized during validation"
+        )
     _validate_eligible_rows(prepared_rows, eligible_rows)
     if len(eligible_rows) != expected_eligible_count:
         raise ValueError(
@@ -903,7 +1033,9 @@ def run_selection(
         reference_repo=reference_repo,
     )
     expected_ids = [str(row["id"]) for row in eligible_rows]
-    loaded_ids, gradients = load_projected_gradients(gradient_dir, expected_ids)
+    loaded_ids, gradients, gradient_coverage = load_globally_validated_gradients(
+        gradient_dir, expected_ids, gradient_manifest
+    )
     if loaded_ids != expected_ids:
         raise RuntimeError("gradient loader changed eligibility-report ID order")
 
@@ -974,15 +1106,16 @@ def run_selection(
         "excluded_row_count": eligibility_report["excluded_row_count"],
         "eligible_row_count": eligibility_report["eligible_row_count"],
         "eligible_ids_sha256": eligibility_report["eligible_ids_sha256"],
-        "gradient_manifest": str(gradient_manifest_path),
-        "gradient_manifest_sha256": sha256_file(gradient_manifest_path),
         "gradient_directory": str(gradient_dir),
+        "gradient_coverage": gradient_coverage,
+        **build_selection_gradient_provenance(
+            gradient_manifest_path, gradient_manifest
+        ),
         "dataset_name": DATASET_NAME,
         "dataset_revision": DATASET_REVISION,
         "model_name": MODEL_NAME,
         "model_revision": MODEL_REVISION,
         **reference_provenance,
-        "projection": dict(gradient_manifest["projection"]),
         "clustering": {
             "ratios": list(CLUSTER_RATIOS),
             "seeds": list(CLUSTER_SEEDS),

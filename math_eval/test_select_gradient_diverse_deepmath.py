@@ -1,4 +1,6 @@
+import hashlib
 import json
+import multiprocessing
 from pathlib import Path
 
 import numpy as np
@@ -8,11 +10,15 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from math_eval import select_gradient_diverse_deepmath as selection
 from math_eval.select_gradient_diverse_deepmath import (
     PROJECTION_DIM,
+    apply_production_eligibility_report,
+    build_selection_gradient_provenance,
     cluster_official,
     compute_selection_diagnostics,
     load_official_reference_classes,
+    load_globally_validated_gradients,
     load_projected_gradients,
     load_validated_gradient_manifest,
     main,
@@ -80,6 +86,13 @@ def _source_table() -> pa.Table:
         for index in range(4)
     ]
     return pa.Table.from_pylist(rows, schema=schema)
+
+
+def _hold_selection_locks(paths, attempting, acquired, release) -> None:
+    attempting.set()
+    with selection._selection_locks(paths):
+        acquired.set()
+        release.wait(timeout=5)
 
 
 def test_load_projected_gradients_uses_eligibility_order_with_stable_id_gap(
@@ -182,6 +195,55 @@ def test_load_projected_gradients_rejects_unfinished_chunk_artifacts(
 
     with pytest.raises(ValueError, match="malformed gradient artifact"):
         load_projected_gradients(tmp_path, expected)
+
+
+def test_load_projected_gradients_rejects_duplicate_sidecar_json_keys(
+    tmp_path: Path,
+) -> None:
+    expected = _ids(0)
+    _write_chunk(tmp_path, prefix="deepmath", start=0, sidecar_ids=expected)
+    (tmp_path / "deepmath.0.txt").write_text(
+        f'{{"id":"{expected[0]}","id":"{expected[0]}"}}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="duplicate JSON key"):
+        load_projected_gradients(tmp_path, expected)
+
+
+def test_load_projected_gradients_rejects_a_nonmanifest_prefix(
+    tmp_path: Path,
+) -> None:
+    expected = _ids(0)
+    _write_chunk(tmp_path, prefix="deepmath", start=0, sidecar_ids=expected)
+    _write_chunk(tmp_path, prefix="foreign", start=1, sidecar_ids=_ids(1))
+
+    with pytest.raises(ValueError, match="unexpected gradient prefix"):
+        load_projected_gradients(tmp_path, expected, prefix="deepmath")
+
+
+def test_load_globally_validated_gradients_uses_manifest_sharding_contract(
+    tmp_path: Path,
+) -> None:
+    expected = _ids(0, 2)
+    _write_chunk(tmp_path, prefix="deepmath", start=0, sidecar_ids=expected)
+    calls = []
+
+    def exact_validator(ids, directory, prefix, num_shards):
+        calls.append((list(ids), Path(directory), prefix, num_shards))
+        return {"row_count": 2, "chunk_count": 1, "shard_count": 4}
+
+    loaded_ids, gradients, coverage = load_globally_validated_gradients(
+        tmp_path,
+        expected,
+        {"prefix": "deepmath", "num_shards": 4},
+        coverage_validator=exact_validator,
+    )
+
+    assert calls == [(expected, tmp_path, "deepmath", 4)]
+    assert loaded_ids == expected
+    assert gradients.shape == (2, PROJECTION_DIM)
+    assert coverage == {"row_count": 2, "chunk_count": 1, "shard_count": 4}
 
 
 def test_write_selected_parquet_preserves_nested_schema_metadata_and_order(
@@ -350,76 +412,33 @@ def test_load_official_reference_classes_uses_pinned_sources() -> None:
     )
 
 
-def test_load_validated_gradient_manifest_binds_eligibility_and_projection(
+def test_load_validated_gradient_manifest_delegates_the_complete_contract(
     tmp_path: Path,
 ) -> None:
-    prepared_jsonl = tmp_path / "pool.jsonl"
-    prepared_jsonl.write_text("{}\n", encoding="utf-8")
-    source = tmp_path / "source.parquet"
-    source.write_bytes(b"source")
     prepared_manifest_path = tmp_path / "pool.manifest.json"
-    prepared_manifest = {
-        "prepared_jsonl": str(prepared_jsonl.resolve()),
-        "prepared_jsonl_sha256": __import__("hashlib").sha256(b"{}\n").hexdigest(),
-        "prepared_row_count": 4,
-        "source_sha256": __import__("hashlib").sha256(b"source").hexdigest(),
-        "dataset_name": "zwhe99/DeepMath-103K",
-        "dataset_revision": "5cf055d1fe3d7a2eb19719ac020211469736ae44",
-    }
-    prepared_manifest_path.write_text(
-        json.dumps(prepared_manifest) + "\n", encoding="utf-8"
-    )
     eligibility_path = tmp_path / "pool.eligibility.json"
-    eligibility = {
-        "eligible_row_count": 3,
-        "excluded_row_count": 1,
-        "eligible_ids_sha256": "e" * 64,
-    }
-    eligibility_path.write_text(json.dumps(eligibility) + "\n", encoding="utf-8")
+    prepared_manifest = {"prepared": "provenance"}
+    eligibility = {"eligible": "provenance"}
     reference_repo = Path("/home/mchen/prismatic-synthesis-reference").resolve()
     gradient_manifest_path = tmp_path / "gradient.manifest.json"
     gradient_manifest = {
         "manifest_version": 1,
-        "prepared_jsonl": str(prepared_jsonl.resolve()),
-        "prepared_jsonl_sha256": prepared_manifest["prepared_jsonl_sha256"],
-        "prepared_manifest": str(prepared_manifest_path.resolve()),
-        "prepared_manifest_sha256": __import__("hashlib").sha256(
-            prepared_manifest_path.read_bytes()
-        ).hexdigest(),
-        "prepared_row_count": 4,
-        "source_sha256": prepared_manifest["source_sha256"],
-        "dataset_name": prepared_manifest["dataset_name"],
-        "dataset_revision": prepared_manifest["dataset_revision"],
-        "reference_repo": str(reference_repo),
-        "reference_commit": "d9484cd3b5991030b901ac4a3a9e2472dbfac2ad",
-        "reference_tree": "a0079d8c5e15cb18bb4790f99c43cc19bb9ecd50",
-        "model_name": "Qwen/Qwen2.5-0.5B-Instruct",
-        "model_revision": "7ae557604adf67be50417f59c2c2f167def9a775",
-        "eligibility_report": str(eligibility_path.resolve()),
-        "eligibility_report_sha256": __import__("hashlib").sha256(
-            eligibility_path.read_bytes()
-        ).hexdigest(),
-        "eligible_row_count": 3,
-        "excluded_row_count": 1,
-        "eligible_ids_sha256": "e" * 64,
         "prefix": "deepmath",
         "num_shards": 4,
-        "projection": {
-            "backend": "CudaProjector",
-            "dimension": 1024,
-            "seed": 0,
-            "type": "rademacher",
-            "input_dtype": "float16",
-            "output_dtype": "float32",
-            "project_interval": 4,
-            "save_interval": 500,
-            "completion_only_loss": True,
-            "full_parameter_gradients": True,
-        },
+        "official_gradient_module": "/pinned/gradient_computer.py",
+        "max_context_tokens": 32768,
+        "trl_version": "0.17.0",
+        "package_versions": {"torch": "2.6.0", "trak": "0.3.2"},
+        "projection": {"response_marker": "<|im_start|>assistant"},
     }
     gradient_manifest_path.write_text(
         json.dumps(gradient_manifest) + "\n", encoding="utf-8"
     )
+    calls = []
+
+    def exact_validator(path, **kwargs):
+        calls.append((Path(path), kwargs))
+        return dict(gradient_manifest)
 
     loaded = load_validated_gradient_manifest(
         gradient_manifest_path,
@@ -428,19 +447,178 @@ def test_load_validated_gradient_manifest_binds_eligibility_and_projection(
         eligibility_report_path=eligibility_path,
         eligibility_report=eligibility,
         reference_repo=reference_repo,
+        manifest_validator=exact_validator,
     )
     assert loaded == gradient_manifest
-
-    eligibility["eligible_ids_sha256"] = "f" * 64
-    with pytest.raises(ValueError, match="eligible_ids_sha256"):
-        load_validated_gradient_manifest(
-            gradient_manifest_path,
-            prepared_manifest_path=prepared_manifest_path,
-            prepared_manifest=prepared_manifest,
-            eligibility_report_path=eligibility_path,
-            eligibility_report=eligibility,
-            reference_repo=reference_repo,
+    assert calls == [
+        (
+            gradient_manifest_path.resolve(),
+            {
+                "prepared_manifest_path": prepared_manifest_path.resolve(),
+                "prepared_manifest": prepared_manifest,
+                "eligibility_report_path": eligibility_path.resolve(),
+                "eligibility_report": eligibility,
+                "reference_repo": reference_repo,
+                "expected_prefix": None,
+                "expected_num_shards": None,
+            },
         )
+    ]
+
+
+def test_apply_production_eligibility_binds_the_callers_manifest_path(
+    tmp_path: Path,
+) -> None:
+    rows = [{"id": _ids(0)[0]}]
+    manifest = {"prepared": "mapping"}
+    manifest_path = tmp_path / "prepared.manifest.json"
+    report_path = tmp_path / "eligibility.json"
+    calls = []
+
+    def apply_report(received_rows, received_manifest, received_report, **kwargs):
+        calls.append(
+            (received_rows, received_manifest, Path(received_report), kwargs)
+        )
+        return list(received_rows), {"validated": True}
+
+    result = apply_production_eligibility_report(
+        rows,
+        manifest,
+        report_path,
+        prepared_manifest_path=manifest_path,
+        apply_report=apply_report,
+    )
+
+    assert result == (rows, {"validated": True})
+    assert calls == [
+        (
+            rows,
+            manifest,
+            report_path.resolve(),
+            {"prepared_manifest_path": manifest_path.resolve()},
+        )
+    ]
+
+
+def test_load_validated_gradient_manifest_rejects_duplicate_keys_before_delegate(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "gradient.manifest.json"
+    path.write_text('{"prefix":"deepmath","prefix":"deepmath"}\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="duplicate JSON key"):
+        load_validated_gradient_manifest(
+            path,
+            prepared_manifest_path=tmp_path / "pool.manifest.json",
+            prepared_manifest={},
+            eligibility_report_path=tmp_path / "eligibility.json",
+            eligibility_report={},
+            reference_repo=Path("/home/mchen/prismatic-synthesis-reference"),
+            manifest_validator=lambda *_args, **_kwargs: pytest.fail(
+                "duplicate JSON reached collector validator"
+            ),
+        )
+
+
+def test_load_validated_gradient_manifest_reuses_collector_exact_validator(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from math_eval import collect_prismatic_gradients as collector
+
+    prepared_jsonl = tmp_path / "pool.jsonl"
+    prepared_manifest_path = tmp_path / "pool.manifest.json"
+    eligibility_path = tmp_path / "eligibility.json"
+    gradient_path = tmp_path / "gradients" / collector.GRADIENT_MANIFEST_NAME
+    prepared_manifest = {
+        "prepared_jsonl": str(prepared_jsonl.resolve()),
+        "prepared_jsonl_sha256": "1" * 64,
+        "prepared_row_count": 3,
+        "source_sha256": "2" * 64,
+    }
+    prepared_manifest_path.write_text(
+        json.dumps(prepared_manifest) + "\n", encoding="utf-8"
+    )
+    eligibility = {
+        "eligible_row_count": 2,
+        "excluded_row_count": 1,
+        "eligible_ids_sha256": "3" * 64,
+    }
+    eligibility_path.write_text(json.dumps(eligibility) + "\n", encoding="utf-8")
+    reference_repo = Path("/home/mchen/prismatic-synthesis-reference").resolve()
+    package_versions = {
+        "torch": "test-torch",
+        "transformers": "test-transformers",
+        "trl": "0.17.0",
+        "trak": collector.TRAKER_VERSION,
+        "fast_jl": collector.FAST_JL_VERSION,
+    }
+    monkeypatch.setattr(collector, "_installed_trl_version", lambda: "0.17.0")
+    monkeypatch.setattr(
+        collector, "_installed_package_versions", lambda: package_versions
+    )
+    expected = collector.build_gradient_manifest(
+        prepared_jsonl,
+        prepared_manifest_path,
+        prepared_manifest,
+        reference_repo,
+        collector.REFERENCE_COMMIT,
+        collector._reference_tree(reference_repo),
+        prefix="deepmath",
+        num_shards=1,
+        trl_version="0.17.0",
+        package_versions=package_versions,
+        eligibility_report_path=eligibility_path,
+        eligibility_report=eligibility,
+    )
+    collector.write_or_validate_gradient_manifest(gradient_path, expected)
+
+    loaded = load_validated_gradient_manifest(
+        gradient_path,
+        prepared_manifest_path=prepared_manifest_path,
+        prepared_manifest=prepared_manifest,
+        eligibility_report_path=eligibility_path,
+        eligibility_report=eligibility,
+        reference_repo=reference_repo,
+    )
+
+    assert loaded == expected
+    assert loaded["projection"]["response_marker"] == "<|im_start|>assistant"
+    assert loaded["official_gradient_module"].endswith("gradient_computer.py")
+
+
+def test_build_selection_gradient_provenance_embeds_the_complete_manifest(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "gradient.manifest.json"
+    path.write_text("manifest-bytes\n", encoding="utf-8")
+    gradient_manifest = {
+        "prefix": "deepmath",
+        "num_shards": 4,
+        "official_gradient_module": "/reference/gradient_computer.py",
+        "max_context_tokens": 32768,
+        "trl_version": "0.17.0",
+        "package_versions": {
+            "torch": "2.6.0",
+            "transformers": "4.51.3",
+            "trak": "0.3.2",
+            "fast_jl": "0.1.3",
+        },
+        "projection": {"response_marker": "<|im_start|>assistant"},
+    }
+
+    provenance = build_selection_gradient_provenance(path, gradient_manifest)
+
+    assert provenance["gradient_provenance"] == gradient_manifest
+    assert provenance["gradient_manifest"] == str(path.resolve())
+    assert provenance["gradient_manifest_sha256"] == hashlib.sha256(
+        path.read_bytes()
+    ).hexdigest()
+    assert provenance["gradient_prefix"] == "deepmath"
+    assert provenance["gradient_num_shards"] == 4
+    assert provenance["gradient_runtime"] == {
+        "trl_version": "0.17.0",
+        "package_versions": gradient_manifest["package_versions"],
+    }
 
 
 def test_main_requires_the_eligibility_report() -> None:
@@ -490,6 +668,13 @@ def test_publish_selection_artifacts_is_locked_reusable_and_mismatch_closed(
     assert pq.read_table(output_parquet).to_pylist() == source.take(
         pa.array([3, 1])
     ).to_pylist()
+    for target in (
+        output_parquet,
+        selected_ids_path,
+        diagnostics_path,
+        manifest_path,
+    ):
+        assert target.with_name(f".{target.name}.lock").is_file()
 
     diagnostics_path.write_text("{}\n", encoding="utf-8")
     with pytest.raises(ValueError, match="hash"):
@@ -521,4 +706,136 @@ def test_publish_selection_artifacts_rejects_partial_existing_set(
             selected_ids_path=tmp_path / "selected_ids.jsonl",
             diagnostics_path=diagnostics_path,
             manifest_path=tmp_path / "manifest.json",
+        )
+
+
+def test_selection_locks_serialize_shared_outputs_with_different_manifests(
+    tmp_path: Path,
+) -> None:
+    context = multiprocessing.get_context("fork")
+    common = [
+        tmp_path / "selected.parquet",
+        tmp_path / "selected_ids.jsonl",
+        tmp_path / "diagnostics.json",
+    ]
+    first_attempting, second_attempting = context.Event(), context.Event()
+    first_acquired, first_release = context.Event(), context.Event()
+    second_acquired, second_release = context.Event(), context.Event()
+    first = context.Process(
+        target=_hold_selection_locks,
+        args=(
+            common + [tmp_path / "manifest-a.json"],
+            first_attempting,
+            first_acquired,
+            first_release,
+        ),
+    )
+    second = context.Process(
+        target=_hold_selection_locks,
+        args=(
+            common + [tmp_path / "manifest-b.json"],
+            second_attempting,
+            second_acquired,
+            second_release,
+        ),
+    )
+    try:
+        first.start()
+        assert first_acquired.wait(timeout=2)
+        second.start()
+        assert second_attempting.wait(timeout=2)
+        assert not second_acquired.wait(timeout=0.25)
+        first_release.set()
+        assert second_acquired.wait(timeout=2)
+        second_release.set()
+        first.join(timeout=2)
+        second.join(timeout=2)
+        assert first.exitcode == 0
+        assert second.exitcode == 0
+    finally:
+        first_release.set()
+        second_release.set()
+        for process in (first, second):
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=2)
+
+
+def test_publish_selection_artifacts_rejects_nonfinite_json(tmp_path: Path) -> None:
+    targets = {
+        "output_parquet": tmp_path / "selected.parquet",
+        "selected_ids_path": tmp_path / "selected_ids.jsonl",
+        "diagnostics_path": tmp_path / "diagnostics.json",
+        "manifest_path": tmp_path / "manifest.json",
+    }
+
+    with pytest.raises(ValueError, match="JSON"):
+        publish_selection_artifacts(
+            source=_source_table(),
+            selected_rows=[{"id": _ids(0)[0], "source_row_index": 0}],
+            diagnostics={"nonfinite": float("nan")},
+            base_manifest={"manifest_version": 1},
+            **targets,
+        )
+    assert not any(path.exists() for path in targets.values())
+
+
+@pytest.mark.parametrize("artifact", ["manifest", "diagnostics", "selected_ids"])
+def test_publish_selection_artifacts_rejects_duplicate_json_keys_on_reuse(
+    tmp_path: Path, artifact: str
+) -> None:
+    source = _source_table()
+    output_parquet = tmp_path / "selected.parquet"
+    selected_ids_path = tmp_path / "selected_ids.jsonl"
+    diagnostics_path = tmp_path / "diagnostics.json"
+    manifest_path = tmp_path / "manifest.json"
+    selected_rows = [{"id": _ids(0)[0], "source_row_index": 0}]
+    diagnostics = {"primary_ratio": 0.1}
+    base_manifest = {"manifest_version": 1}
+    publish_selection_artifacts(
+        source=source,
+        selected_rows=selected_rows,
+        diagnostics=diagnostics,
+        base_manifest=base_manifest,
+        output_parquet=output_parquet,
+        selected_ids_path=selected_ids_path,
+        diagnostics_path=diagnostics_path,
+        manifest_path=manifest_path,
+    )
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if artifact == "manifest":
+        original = manifest_path.read_text(encoding="utf-8")
+        manifest_path.write_text(
+            '{"manifest_version":1,' + original.lstrip()[1:], encoding="utf-8"
+        )
+    elif artifact == "diagnostics":
+        diagnostics_path.write_text(
+            '{"primary_ratio":0.1,"primary_ratio":0.1}\n', encoding="utf-8"
+        )
+        manifest["diagnostics_sha256"] = hashlib.sha256(
+            diagnostics_path.read_bytes()
+        ).hexdigest()
+        manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+    else:
+        selected_ids_path.write_text(
+            f'{{"id":"{_ids(0)[0]}","id":"{_ids(0)[0]}",'
+            '"source_row_index":0}\n',
+            encoding="utf-8",
+        )
+        manifest["selected_ids_sha256"] = hashlib.sha256(
+            selected_ids_path.read_bytes()
+        ).hexdigest()
+        manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="duplicate JSON key"):
+        publish_selection_artifacts(
+            source=source,
+            selected_rows=selected_rows,
+            diagnostics=diagnostics,
+            base_manifest=base_manifest,
+            output_parquet=output_parquet,
+            selected_ids_path=selected_ids_path,
+            diagnostics_path=diagnostics_path,
+            manifest_path=manifest_path,
         )
