@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Mapping, Sequence
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 import torch
@@ -35,11 +36,17 @@ DATASET_NAME = "zwhe99/DeepMath-103K"
 DATASET_REVISION = "5cf055d1fe3d7a2eb19719ac020211469736ae44"
 PROJECTION_DIM = 1024
 PROJECTION_SEED = 0
+PROJECTOR_BACKEND = "CudaProjector"
+PROJECTION_INPUT_DTYPE_NAME = "float16"
+PROJECTED_DTYPE = torch.float32
+PROJECTED_DTYPE_NAME = "float32"
 PROJECT_INTERVAL = 4
 SAVE_INTERVAL = 500
 MAX_CONTEXT_TOKENS = 32_768
 ASSISTANT_RESPONSE_MARKER = "<|im_start|>assistant"
 TRL_VERSION = "0.17.0"
+TRAKER_VERSION = "0.3.2"
+FAST_JL_VERSION = "0.1.3"
 GRADIENT_MANIFEST_NAME = "gradient.manifest.json"
 GRADIENT_PREFIX_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 
@@ -427,6 +434,44 @@ def write_or_validate_gradient_manifest(path: Path, expected: Mapping) -> dict:
             os.close(lock_fd)
 
 
+@contextmanager
+def _exclusive_shard_lock(
+    output_dir: Path,
+    prefix: str,
+    num_shards: int,
+    shard_index: int,
+):
+    """Hold one nonblocking process lock for a logical gradient shard."""
+    prefix = _validate_gradient_prefix(prefix)
+    if num_shards <= 0:
+        raise ValueError("num_shards must be positive")
+    if shard_index < 0 or shard_index >= num_shards:
+        raise ValueError("shard_index must be in [0, num_shards)")
+    directory = Path(output_dir)
+    if not directory.is_dir():
+        raise ValueError(f"gradient output directory does not exist: {directory}")
+    lock_path = directory / (
+        f".{prefix}.shard-{shard_index:05d}-of-{num_shards:05d}.lock"
+    )
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    acquired = False
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError(
+                f"logical gradient shard {shard_index}/{num_shards} is already active"
+            ) from error
+        acquired = True
+        yield lock_path
+    finally:
+        try:
+            if acquired:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+
+
 def _read_sidecar(path: Path) -> list[str]:
     sample_ids: list[str] = []
     try:
@@ -457,8 +502,10 @@ def _validate_tensor_file(path: Path, sidecar_ids: Sequence[str]) -> None:
         raise ValueError(f"gradient tensor keys do not match sidecar IDs in {path.name}")
     for sample_id in sidecar_ids:
         tensor = tensors[sample_id]
-        if tensor.dtype != torch.float16:
-            raise ValueError(f"gradient for {sample_id} must have float16 dtype")
+        if tensor.dtype != PROJECTED_DTYPE:
+            raise ValueError(
+                f"gradient for {sample_id} must have {PROJECTED_DTYPE_NAME} dtype"
+            )
         if tuple(tensor.shape) != (PROJECTION_DIM,):
             raise ValueError(
                 f"gradient for {sample_id} has invalid shape {tuple(tensor.shape)}"
@@ -516,6 +563,12 @@ def resolve_resume_start(
                 f"gradient chunk {prefix}.{chunk_start} must have paired "
                 ".txt and .safetensors files"
             )
+        sidecar_ids = _read_sidecar(files["txt"])
+        chunk_end = chunk_start + len(sidecar_ids)
+        if chunk_end > shard_end:
+            raise ValueError(
+                f"gradient chunk {chunk_start} extends beyond logical shard end"
+            )
         if chunk_start > cursor:
             raise ValueError(
                 f"gradient chunk gap: expected absolute start {cursor}, "
@@ -525,13 +578,6 @@ def resolve_resume_start(
             raise ValueError(
                 f"gradient chunk overlap: expected absolute start {cursor}, "
                 f"found {chunk_start}"
-            )
-
-        sidecar_ids = _read_sidecar(files["txt"])
-        chunk_end = chunk_start + len(sidecar_ids)
-        if chunk_end > shard_end:
-            raise ValueError(
-                f"gradient chunk {chunk_start} extends beyond logical shard end"
             )
         expected_ids = list(dataset_ids[chunk_start:chunk_end])
         if sidecar_ids != expected_ids:
@@ -656,6 +702,20 @@ def _installed_package_versions() -> dict[str, str | None]:
             versions[name] = importlib.metadata.version(distribution)
         except importlib.metadata.PackageNotFoundError:
             versions[name] = None
+    for name, distribution, expected in (
+        ("trak", "traker", TRAKER_VERSION),
+        ("fast_jl", "fast-jl", FAST_JL_VERSION),
+    ):
+        actual = versions[name]
+        if actual is None:
+            raise RuntimeError(
+                f"{distribution} version mismatch: expected {expected}, "
+                "package not installed"
+            )
+        if actual != expected:
+            raise RuntimeError(
+                f"{distribution} version mismatch: expected {expected}, got {actual}"
+            )
     return versions
 
 
@@ -697,10 +757,12 @@ def build_gradient_manifest(
         "trl_version": trl_version,
         "package_versions": dict(package_versions),
         "projection": {
+            "backend": PROJECTOR_BACKEND,
             "dimension": PROJECTION_DIM,
             "seed": PROJECTION_SEED,
             "type": "rademacher",
-            "dtype": "float16",
+            "input_dtype": PROJECTION_INPUT_DTYPE_NAME,
+            "output_dtype": PROJECTED_DTYPE_NAME,
             "project_interval": PROJECT_INTERVAL,
             "save_interval": SAVE_INTERVAL,
             "completion_only_loss": True,
@@ -722,6 +784,127 @@ def _validated_shard_bounds(
     return start, end
 
 
+def validate_global_gradient_coverage(
+    dataset_ids: Sequence[str],
+    output_dir: Path,
+    prefix: str,
+    num_shards: int,
+) -> dict[str, int]:
+    """Validate exact projected-gradient coverage across every logical shard."""
+    prefix = _validate_gradient_prefix(prefix)
+    directory = Path(output_dir)
+    if not directory.is_dir():
+        raise ValueError(f"gradient output directory does not exist: {directory}")
+    total = len(dataset_ids)
+    if num_shards <= 0:
+        raise ValueError("num_shards must be positive")
+    shard_bounds = [
+        _validated_shard_bounds(total, num_shards, shard_index)
+        for shard_index in range(num_shards)
+    ]
+
+    with ExitStack() as locks:
+        for shard_index in range(num_shards):
+            locks.enter_context(
+                _exclusive_shard_lock(
+                    directory, prefix, num_shards, shard_index
+                )
+            )
+
+        exact_pattern = re.compile(
+            rf"^{re.escape(prefix)}\.(0|[1-9][0-9]*)\."
+            r"(txt|safetensors)$"
+        )
+        files_by_start: dict[int, dict[str, Path]] = {}
+        for path in directory.iterdir():
+            name = path.name
+            if not name.startswith(f"{prefix}."):
+                continue
+            match = exact_pattern.fullmatch(name)
+            if not path.is_file() or match is None:
+                raise ValueError(f"malformed gradient artifact: {name}")
+            start = int(match.group(1))
+            if not 0 <= start < total:
+                raise ValueError(
+                    f"gradient chunk start {start} is outside dataset range "
+                    f"[0, {total})"
+                )
+            files_by_start.setdefault(start, {})[match.group(2)] = path
+
+        cursors = [start for start, _ in shard_bounds]
+        for chunk_start in sorted(files_by_start):
+            files = files_by_start[chunk_start]
+            if set(files) != {"txt", "safetensors"}:
+                raise ValueError(
+                    f"gradient chunk {prefix}.{chunk_start} must have paired "
+                    ".txt and .safetensors files"
+                )
+            sidecar_ids = _read_sidecar(files["txt"])
+            chunk_end = chunk_start + len(sidecar_ids)
+            owner = next(
+                (
+                    shard_index
+                    for shard_index, (shard_start, shard_end) in enumerate(
+                        shard_bounds
+                    )
+                    if shard_start <= chunk_start < shard_end
+                ),
+                None,
+            )
+            if owner is None or chunk_end > total:
+                raise ValueError(
+                    f"gradient chunk {chunk_start} extends outside dataset range"
+                )
+            _, owner_end = shard_bounds[owner]
+            if chunk_end > owner_end:
+                raise ValueError(
+                    f"gradient chunk {chunk_start} crosses logical shard boundary"
+                )
+            cursor = cursors[owner]
+            if chunk_start > cursor:
+                raise ValueError(
+                    f"gradient chunk gap in shard {owner}: expected {cursor}, "
+                    f"found {chunk_start}"
+                )
+            if chunk_start < cursor:
+                raise ValueError(
+                    f"gradient chunk overlap in shard {owner}: expected {cursor}, "
+                    f"found {chunk_start}"
+                )
+            expected_ids = list(dataset_ids[chunk_start:chunk_end])
+            if sidecar_ids != expected_ids:
+                raise ValueError(
+                    "gradient sidecar IDs do not match expected ordered slice at "
+                    f"absolute start {chunk_start}"
+                )
+            if len(sidecar_ids) > SAVE_INTERVAL:
+                raise ValueError(
+                    f"gradient chunk {chunk_start} exceeds save interval "
+                    f"{SAVE_INTERVAL}"
+                )
+            if len(sidecar_ids) < SAVE_INTERVAL and chunk_end != owner_end:
+                raise ValueError(
+                    f"short gradient chunk {chunk_start} is only valid at shard end"
+                )
+            _validate_tensor_file(files["safetensors"], sidecar_ids)
+            cursors[owner] = chunk_end
+
+        for shard_index, ((_, shard_end), cursor) in enumerate(
+            zip(shard_bounds, cursors)
+        ):
+            if cursor != shard_end:
+                raise ValueError(
+                    "incomplete global gradient coverage for logical shard "
+                    f"{shard_index}: expected end {shard_end}, got {cursor}"
+                )
+
+    return {
+        "row_count": total,
+        "chunk_count": len(files_by_start),
+        "shard_count": num_shards,
+    }
+
+
 def _validate_model_context(model) -> None:
     configured_context = getattr(model.config, "max_position_embeddings", None)
     if configured_context != MAX_CONTEXT_TOKENS:
@@ -729,6 +912,72 @@ def _validate_model_context(model) -> None:
             "pinned model hard context boundary mismatch: "
             f"expected {MAX_CONTEXT_TOKENS}, got {configured_context}"
         )
+
+
+def _validate_output_path_isolation(
+    output_dir: Path,
+    reference_repo: Path | None,
+    prepared_jsonl: Path,
+    prepared_manifest: Path,
+    source_parquet: Path,
+) -> Path:
+    output_path = Path(output_dir).resolve()
+    input_paths = (
+        Path(prepared_jsonl).resolve(),
+        Path(prepared_manifest).resolve(),
+        Path(source_parquet).resolve(),
+    )
+    for input_path in input_paths:
+        if output_path == input_path or input_path in output_path.parents:
+            raise ValueError(
+                f"gradient output directory overlaps input artifact: {input_path}"
+            )
+        if output_path in input_path.parents:
+            raise ValueError(
+                f"gradient output directory contains input artifact: {input_path}"
+            )
+
+    if reference_repo is not None:
+        repository = Path(reference_repo).resolve()
+        if (
+            output_path == repository
+            or repository in output_path.parents
+            or output_path in repository.parents
+        ):
+            raise ValueError(
+                "gradient output directory overlaps reference repository: "
+                f"{repository}"
+            )
+    return output_path
+
+
+def run_global_validation(
+    *,
+    prepared_jsonl: Path,
+    prepared_manifest: Path,
+    output_dir: Path,
+    prefix: str,
+    num_shards: int,
+) -> dict[str, int | str]:
+    """Load the prepared pool and prove exact all-shard gradient coverage."""
+    prefix = _validate_gradient_prefix(prefix)
+    rows, source_manifest = load_prepared_pool(
+        Path(prepared_jsonl), Path(prepared_manifest)
+    )
+    output_path = _validate_output_path_isolation(
+        Path(output_dir),
+        None,
+        Path(prepared_jsonl),
+        Path(prepared_manifest),
+        Path(source_manifest["source_parquet"]),
+    )
+    coverage = validate_global_gradient_coverage(
+        [row["id"] for row in rows],
+        output_path,
+        prefix,
+        num_shards,
+    )
+    return {"status": "validated", **coverage}
 
 
 def run_collection(
@@ -773,7 +1022,13 @@ def run_collection(
             f"official GradientComputer module does not exist: {official_module}"
         )
 
-    output_path = Path(output_dir)
+    output_path = _validate_output_path_isolation(
+        Path(output_dir),
+        repository,
+        Path(prepared_jsonl),
+        Path(prepared_manifest),
+        Path(source_manifest["source_parquet"]),
+    )
     output_path.mkdir(parents=True, exist_ok=True)
     expected_manifest = build_gradient_manifest(
         Path(prepared_jsonl),
@@ -792,104 +1047,131 @@ def run_collection(
         expected_manifest,
     )
 
-    if shard_start == shard_end:
-        return {
-            "status": "empty",
-            "shard_start": shard_start,
-            "shard_end": shard_end,
-            "resume_start": shard_start,
-        }
+    with _exclusive_shard_lock(output_path, prefix, num_shards, shard_index):
+        if shard_start == shard_end:
+            return {
+                "status": "empty",
+                "shard_start": shard_start,
+                "shard_end": shard_end,
+                "resume_start": shard_start,
+            }
 
-    dataset_ids = [row["id"] for row in rows]
-    resume_start = resolve_resume_start(
-        dataset_ids,
-        output_path,
-        prefix,
-        shard_start,
-        shard_end,
-    )
-    if resume_start == shard_end:
+        dataset_ids = [row["id"] for row in rows]
+        resume_start = resolve_resume_start(
+            dataset_ids,
+            output_path,
+            prefix,
+            shard_start,
+            shard_end,
+        )
+        if resume_start == shard_end:
+            return {
+                "status": "complete",
+                "shard_start": shard_start,
+                "shard_end": shard_end,
+                "resume_start": resume_start,
+            }
+
+        validate_single_cuda_device(device)
+        gradient_computer_class = load_official_gradient_computer_class(
+            repository, REFERENCE_COMMIT
+        )
+        model, tokenizer = load_model_and_tokenizer(
+            model_name, model_revision, device
+        )
+        _validate_model_context(model)
+        collector = construct_strict_collector(
+            gradient_computer_class,
+            model_name,
+            model,
+            tokenizer,
+        )
+        unresolved = rows[resume_start:shard_end]
+        preflight_samples(unresolved, tokenizer, collector)
+        collector.compute_project_store_gradients(
+            unresolved,
+            prefix,
+            output_path,
+            resume_start,
+        )
+
+        completed_at = resolve_resume_start(
+            dataset_ids,
+            output_path,
+            prefix,
+            shard_start,
+            shard_end,
+        )
+        if completed_at != shard_end:
+            raise RuntimeError(
+                "official gradient collection returned without complete shard coverage: "
+                f"expected {shard_end}, got {completed_at}"
+            )
         return {
-            "status": "complete",
+            "status": "collected",
             "shard_start": shard_start,
             "shard_end": shard_end,
             "resume_start": resume_start,
         }
-
-    validate_single_cuda_device(device)
-    gradient_computer_class = load_official_gradient_computer_class(
-        repository, REFERENCE_COMMIT
-    )
-    model, tokenizer = load_model_and_tokenizer(
-        model_name, model_revision, device
-    )
-    _validate_model_context(model)
-    collector = construct_strict_collector(
-        gradient_computer_class,
-        model_name,
-        model,
-        tokenizer,
-    )
-    unresolved = rows[resume_start:shard_end]
-    preflight_samples(unresolved, tokenizer, collector)
-    collector.compute_project_store_gradients(
-        unresolved,
-        prefix,
-        output_path,
-        resume_start,
-    )
-
-    completed_at = resolve_resume_start(
-        dataset_ids,
-        output_path,
-        prefix,
-        shard_start,
-        shard_end,
-    )
-    if completed_at != shard_end:
-        raise RuntimeError(
-            "official gradient collection returned without complete shard coverage: "
-            f"expected {shard_end}, got {completed_at}"
-        )
-    return {
-        "status": "collected",
-        "shard_start": shard_start,
-        "shard_end": shard_end,
-        "resume_start": resume_start,
-    }
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Collect pinned official Prismatic projected gradients"
     )
-    parser.add_argument("--reference-repo", type=Path, required=True)
+    parser.add_argument("--validate-global-only", action="store_true")
+    parser.add_argument("--reference-repo", type=Path)
     parser.add_argument("--prepared-jsonl", type=Path, required=True)
     parser.add_argument("--prepared-manifest", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--prefix", required=True)
     parser.add_argument("--model-name", default=MODEL_NAME)
     parser.add_argument("--model-revision", default=MODEL_REVISION)
-    parser.add_argument("--shard-index", type=int, required=True)
+    parser.add_argument("--shard-index", type=int)
     parser.add_argument("--num-shards", type=int, required=True)
-    parser.add_argument("--device", required=True)
-    return parser.parse_args(argv)
+    parser.add_argument("--device")
+    args = parser.parse_args(argv)
+    if not args.validate_global_only:
+        missing = [
+            flag
+            for flag, value in (
+                ("--reference-repo", args.reference_repo),
+                ("--shard-index", args.shard_index),
+                ("--device", args.device),
+            )
+            if value is None
+        ]
+        if missing:
+            parser.error(
+                "the following arguments are required for collection: "
+                + ", ".join(missing)
+            )
+    return args
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
-    result = run_collection(
-        reference_repo=args.reference_repo,
-        prepared_jsonl=args.prepared_jsonl,
-        prepared_manifest=args.prepared_manifest,
-        output_dir=args.output_dir,
-        prefix=args.prefix,
-        model_name=args.model_name,
-        model_revision=args.model_revision,
-        shard_index=args.shard_index,
-        num_shards=args.num_shards,
-        device=args.device,
-    )
+    if args.validate_global_only:
+        result = run_global_validation(
+            prepared_jsonl=args.prepared_jsonl,
+            prepared_manifest=args.prepared_manifest,
+            output_dir=args.output_dir,
+            prefix=args.prefix,
+            num_shards=args.num_shards,
+        )
+    else:
+        result = run_collection(
+            reference_repo=args.reference_repo,
+            prepared_jsonl=args.prepared_jsonl,
+            prepared_manifest=args.prepared_manifest,
+            output_dir=args.output_dir,
+            prefix=args.prefix,
+            model_name=args.model_name,
+            model_revision=args.model_revision,
+            shard_index=args.shard_index,
+            num_shards=args.num_shards,
+            device=args.device,
+        )
     print(json.dumps(result, sort_keys=True))
     return 0
 

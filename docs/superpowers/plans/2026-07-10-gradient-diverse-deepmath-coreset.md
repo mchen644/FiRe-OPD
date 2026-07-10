@@ -17,6 +17,7 @@
 - Pin `Qwen/Qwen2.5-0.5B-Instruct` to `7ae557604adf67be50417f59c2c2f167def9a775`.
 - Reuse official `GradientComputer` from `/home/mchen/prismatic-synthesis-reference` at commit `d9484cd3b5991030b901ac4a3a9e2472dbfac2ad`; do not copy its source.
 - Keep official projection dimension 1024, Rademacher seed 0, project interval 4, completion-only loss, and full-parameter gradients.
+- Pin `traker==0.3.2` and `fast-jl==0.1.3`; validate their observed official-path float32 projected output without adding a cast.
 - Use code-aligned cluster ratio 0.10 for the output and paper-aligned ratio 0.01 for diagnostics.
 - Do not use any evaluation examples or metrics during selection.
 - No production code is written before its corresponding test has failed for the expected reason.
