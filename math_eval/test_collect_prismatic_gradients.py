@@ -162,6 +162,38 @@ def _write_chunk(
     )
 
 
+def _write_matching_gradient_manifest(
+    output_dir: Path,
+    prepared_jsonl: Path,
+    prepared_manifest_path: Path,
+    reference_repo: Path,
+    reference_commit: str,
+    *,
+    prefix: str,
+    num_shards: int,
+) -> dict:
+    import math_eval.collect_prismatic_gradients as collection
+
+    prepared_manifest = json.loads(
+        prepared_manifest_path.read_text(encoding="utf-8")
+    )
+    expected = build_gradient_manifest(
+        prepared_jsonl,
+        prepared_manifest_path,
+        prepared_manifest,
+        reference_repo,
+        reference_commit,
+        _run_git(reference_repo, "rev-parse", "HEAD^{tree}"),
+        prefix=prefix,
+        num_shards=num_shards,
+        trl_version=TRL_VERSION,
+        package_versions=collection._installed_package_versions(),
+    )
+    return write_or_validate_gradient_manifest(
+        output_dir / collection.GRADIENT_MANIFEST_NAME, expected
+    )
+
+
 def test_verify_reference_repo_accepts_exact_clean_commit(tmp_path: Path) -> None:
     repository, commit = _git_repository(tmp_path)
 
@@ -258,7 +290,11 @@ def test_load_prepared_pool_rejects_duplicate_ids(tmp_path: Path) -> None:
 
 def test_write_or_validate_gradient_manifest_is_idempotent(tmp_path: Path) -> None:
     path = tmp_path / "gradient.manifest.json"
-    expected = {"prepared_sha256": "a" * 64, "num_shards": 4}
+    expected = {
+        "prepared_sha256": "a" * 64,
+        "prefix": "deepmath",
+        "num_shards": 4,
+    }
 
     first = write_or_validate_gradient_manifest(path, expected)
     second = write_or_validate_gradient_manifest(path, expected)
@@ -266,7 +302,9 @@ def test_write_or_validate_gradient_manifest_is_idempotent(tmp_path: Path) -> No
     assert first == expected
     assert second == expected
     assert path.read_text(encoding="utf-8") == (
-        '{"num_shards":4,"prepared_sha256":"' + "a" * 64 + '"}\n'
+        '{"num_shards":4,"prefix":"deepmath","prepared_sha256":"'
+        + "a" * 64
+        + '"}\n'
     )
 
 
@@ -275,16 +313,27 @@ def test_write_or_validate_gradient_manifest_rejects_any_mismatch(
 ) -> None:
     path = tmp_path / "gradient.manifest.json"
     write_or_validate_gradient_manifest(
-        path, {"prepared_sha256": "a" * 64, "num_shards": 4}
+        path,
+        {"prepared_sha256": "a" * 64, "prefix": "deepmath", "num_shards": 4},
     )
 
     with pytest.raises(ValueError, match="mismatch"):
         write_or_validate_gradient_manifest(
-            path, {"prepared_sha256": "b" * 64, "num_shards": 4}
+            path,
+            {
+                "prepared_sha256": "b" * 64,
+                "prefix": "deepmath",
+                "num_shards": 4,
+            },
         )
     with pytest.raises(ValueError, match="mismatch"):
         write_or_validate_gradient_manifest(
-            path, {"prepared_sha256": "a" * 64, "num_shards": 8}
+            path,
+            {
+                "prepared_sha256": "a" * 64,
+                "prefix": "deepmath",
+                "num_shards": 8,
+            },
         )
 
 
@@ -292,7 +341,11 @@ def test_write_or_validate_gradient_manifest_serializes_concurrent_creators(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "gradient.manifest.json"
-    expected = {"prepared_sha256": "a" * 64, "num_shards": 4}
+    expected = {
+        "prepared_sha256": "a" * 64,
+        "prefix": "deepmath",
+        "num_shards": 4,
+    }
 
     with ThreadPoolExecutor(max_workers=8) as executor:
         results = list(
@@ -304,6 +357,34 @@ def test_write_or_validate_gradient_manifest_serializes_concurrent_creators(
 
     assert results == [expected] * 16
     assert json.loads(path.read_text(encoding="utf-8")) == expected
+
+
+@pytest.mark.parametrize(
+    "artifact_name",
+    [
+        "deepmath.0.txt",
+        "deepmath.0.safetensors",
+        "deepmath.0.safetensors.tmp",
+        "deepmath.unexpected",
+    ],
+)
+def test_manifest_creation_refuses_to_retroactively_bless_prefix_artifacts(
+    tmp_path: Path, artifact_name: str
+) -> None:
+    path = tmp_path / "gradient.manifest.json"
+    artifact = tmp_path / artifact_name
+    artifact.write_bytes(b"crash artifact")
+    expected = {
+        "prepared_sha256": "a" * 64,
+        "prefix": "deepmath",
+        "num_shards": 4,
+    }
+
+    with pytest.raises(ValueError, match="manifest.*missing.*artifact"):
+        write_or_validate_gradient_manifest(path, expected)
+
+    assert not path.exists()
+    assert artifact.read_bytes() == b"crash artifact"
 
 
 def test_resolve_resume_start_returns_shard_start_without_chunks(
@@ -921,13 +1002,22 @@ def test_run_collection_complete_shard_returns_before_cuda_or_model_load(
 
     prepared, prepared_manifest_path, rows, _ = _prepared_fixture(tmp_path, count=2)
     output_dir = tmp_path / "gradients"
+    reference, commit, _, _ = _official_git_repository(tmp_path)
+    _write_matching_gradient_manifest(
+        output_dir,
+        prepared,
+        prepared_manifest_path,
+        reference,
+        commit,
+        prefix="deepmath",
+        num_shards=1,
+    )
     _write_chunk(
         output_dir,
         prefix="deepmath",
         start=0,
         ids=[row["id"] for row in rows],
     )
-    reference, commit, _, _ = _official_git_repository(tmp_path)
     monkeypatch.setattr(collection, "REFERENCE_COMMIT", commit)
     monkeypatch.setattr(
         collection,
@@ -969,6 +1059,16 @@ def test_run_collection_calls_official_once_on_only_unresolved_suffix(
     )
     output_dir = tmp_path / "gradients"
     ids = [row["id"] for row in rows]
+    reference, commit, _, _ = _official_git_repository(tmp_path)
+    _write_matching_gradient_manifest(
+        output_dir,
+        prepared,
+        prepared_manifest_path,
+        reference,
+        commit,
+        prefix="deepmath",
+        num_shards=1,
+    )
     _write_chunk(
         output_dir,
         prefix="deepmath",
@@ -996,7 +1096,6 @@ def test_run_collection_calls_official_once_on_only_unresolved_suffix(
     collector = FakeCollector(
         {row["prompt"]: 10 for row in rows[SAVE_INTERVAL:]}
     )
-    reference, commit, _, _ = _official_git_repository(tmp_path)
     model = SimpleNamespace(
         config=SimpleNamespace(max_position_embeddings=MAX_CONTEXT_TOKENS)
     )
@@ -1131,13 +1230,22 @@ def test_run_collection_complete_shard_skips_official_module_import(
 
     prepared, prepared_manifest_path, rows, _ = _prepared_fixture(tmp_path, count=1)
     output_dir = tmp_path / "gradients"
+    reference, commit, _, _ = _official_git_repository(tmp_path)
+    _write_matching_gradient_manifest(
+        output_dir,
+        prepared,
+        prepared_manifest_path,
+        reference,
+        commit,
+        prefix="deepmath",
+        num_shards=1,
+    )
     _write_chunk(
         output_dir,
         prefix="deepmath",
         start=0,
         ids=[rows[0]["id"]],
     )
-    reference, commit, _, _ = _official_git_repository(tmp_path)
     monkeypatch.setattr(collection, "REFERENCE_COMMIT", commit)
     monkeypatch.setattr(
         collection,
@@ -1221,6 +1329,33 @@ def test_run_collection_rejects_empty_shard_beyond_dataset(
             model_name=MODEL_NAME,
             model_revision=MODEL_REVISION,
             shard_index=2,
+            num_shards=3,
+            device="cuda:0",
+        )
+
+    assert not output_dir.exists()
+
+
+def test_run_collection_rejects_collectively_impossible_shard_layout_before_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import math_eval.collect_prismatic_gradients as collection
+
+    prepared, prepared_manifest_path, _, _ = _prepared_fixture(tmp_path, count=1)
+    reference, commit, _, _ = _official_git_repository(tmp_path)
+    output_dir = tmp_path / "gradients"
+    monkeypatch.setattr(collection, "REFERENCE_COMMIT", commit)
+
+    with pytest.raises(ValueError, match="empty logical shard"):
+        run_collection(
+            reference_repo=reference,
+            prepared_jsonl=prepared,
+            prepared_manifest=prepared_manifest_path,
+            output_dir=output_dir,
+            prefix="deepmath",
+            model_name=MODEL_NAME,
+            model_revision=MODEL_REVISION,
+            shard_index=0,
             num_shards=3,
             device="cuda:0",
         )
@@ -1687,10 +1822,23 @@ def test_global_validation_preserves_orphan_from_crashed_writer(
 
 
 def test_run_global_validation_loads_prepared_ids_and_returns_status(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    import math_eval.collect_prismatic_gradients as collection
+
     prepared, prepared_manifest_path, rows, _ = _prepared_fixture(tmp_path, count=4)
     output_dir = tmp_path / "gradients"
+    reference, commit, _, _ = _official_git_repository(tmp_path)
+    monkeypatch.setattr(collection, "REFERENCE_COMMIT", commit)
+    _write_matching_gradient_manifest(
+        output_dir,
+        prepared,
+        prepared_manifest_path,
+        reference,
+        commit,
+        prefix="deepmath",
+        num_shards=2,
+    )
     _write_complete_global_chunks(
         output_dir, [row["id"] for row in rows], num_shards=2
     )
@@ -1707,11 +1855,102 @@ def test_run_global_validation_loads_prepared_ids_and_returns_status(
     assert result["row_count"] == 4
 
 
+def test_run_global_validation_requires_existing_manifest_without_mutation(
+    tmp_path: Path,
+) -> None:
+    import math_eval.collect_prismatic_gradients as collection
+
+    prepared, prepared_manifest_path, rows, _ = _prepared_fixture(tmp_path, count=4)
+    output_dir = tmp_path / "gradients"
+    _write_complete_global_chunks(
+        output_dir, [row["id"] for row in rows], num_shards=2
+    )
+    manifest_path = output_dir / collection.GRADIENT_MANIFEST_NAME
+    before = {path.name: path.read_bytes() for path in output_dir.iterdir()}
+
+    with pytest.raises(ValueError, match="gradient manifest.*does not exist"):
+        run_global_validation(
+            prepared_jsonl=prepared,
+            prepared_manifest=prepared_manifest_path,
+            output_dir=output_dir,
+            prefix="deepmath",
+            num_shards=2,
+        )
+
+    assert not manifest_path.exists()
+    assert {path.name: path.read_bytes() for path in output_dir.iterdir()} == before
+
+
+@pytest.mark.parametrize(
+    ("field_path", "replacement"),
+    [
+        (("prepared_jsonl_sha256",), "0" * 64),
+        (("model_revision",), "moving-main"),
+        (("prefix",), "other-prefix"),
+        (("num_shards",), 1),
+        (("projection", "backend"), "BasicProjector"),
+        (("projection", "output_dtype"), "float16"),
+        (("package_versions", "trak"), "0.3.3"),
+    ],
+)
+def test_run_global_validation_rejects_any_manifest_provenance_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field_path: tuple[str, ...],
+    replacement: object,
+) -> None:
+    import math_eval.collect_prismatic_gradients as collection
+
+    prepared, prepared_manifest_path, rows, _ = _prepared_fixture(tmp_path, count=4)
+    output_dir = tmp_path / "gradients"
+    reference, commit, _, _ = _official_git_repository(tmp_path)
+    monkeypatch.setattr(collection, "REFERENCE_COMMIT", commit)
+    _write_matching_gradient_manifest(
+        output_dir,
+        prepared,
+        prepared_manifest_path,
+        reference,
+        commit,
+        prefix="deepmath",
+        num_shards=2,
+    )
+    _write_complete_global_chunks(
+        output_dir, [row["id"] for row in rows], num_shards=2
+    )
+    manifest_path = output_dir / collection.GRADIENT_MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    target = manifest
+    for field in field_path[:-1]:
+        target = target[field]
+    target[field_path[-1]] = replacement
+    manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="gradient manifest.*mismatch"):
+        run_global_validation(
+            prepared_jsonl=prepared,
+            prepared_manifest=prepared_manifest_path,
+            output_dir=output_dir,
+            prefix="deepmath",
+            num_shards=2,
+        )
+
+
 def test_global_validation_cli_mode_needs_no_model_reference_or_device(
     tmp_path: Path,
 ) -> None:
+    reference = Path("/home/mchen/prismatic-synthesis-reference")
+    verify_reference_repo(reference, REFERENCE_COMMIT)
     prepared, prepared_manifest_path, rows, _ = _prepared_fixture(tmp_path, count=4)
     output_dir = tmp_path / "gradients"
+    _write_matching_gradient_manifest(
+        output_dir,
+        prepared,
+        prepared_manifest_path,
+        reference,
+        REFERENCE_COMMIT,
+        prefix="deepmath",
+        num_shards=2,
+    )
     _write_complete_global_chunks(
         output_dir, [row["id"] for row in rows], num_shards=2
     )
