@@ -97,14 +97,21 @@ The current parquet stores a chat prompt whose user content is the original ques
 Please reason step by step, and put your final answer within \boxed{}.
 ```
 
-Preparation removes only this exact terminal instruction and matches the remaining question text against the original DeepMath `question` column. It must not use fuzzy matching.
+Preparation removes only this exact terminal instruction and pairs the remaining exact question with the normalized ground-truth answer. It must not use fuzzy question matching.
+
+The pinned original dataset contains duplicate question/answer keys, so row-local lookup is insufficient. The filtered parquet was produced by order-preserving filtering and must be recovered as a unique strictly increasing subsequence of original rows. Preparation computes both:
+
+- the forward greedy mapping that chooses the earliest matching original index after the previous match
+- the backward greedy mapping that chooses the latest matching original index before the next match
+
+The two mappings must exist and be identical at every filtered row. This admits duplicated original questions only when surrounding row order identifies one unique source row.
 
 Preparation fails before GPU work when:
 
 - the current parquet row count is not 57,046
 - the current Arrow schema lacks the expected prompt, reward, or index fields
-- an original question key is duplicated
-- a filtered question has zero or multiple original matches
+- a filtered `(exact question, normalized answer)` key has no original match
+- forward and backward ordered-subsequence mappings disagree, indicating genuine ambiguity
 - `r1_solution_1` is empty
 - the current ground-truth answer and original `final_answer` disagree after the existing math-answer normalization
 - prepared IDs are not unique
