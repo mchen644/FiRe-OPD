@@ -1,6 +1,9 @@
 import hashlib
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -66,11 +69,6 @@ def _build_three_row_report(tmp_path: Path, monkeypatch) -> tuple[list[dict], di
         eligibility,
         "PINNED_CHAT_TEMPLATE_SHA256",
         hashlib.sha256(tokenizer.chat_template.encode("utf-8")).hexdigest(),
-    )
-    monkeypatch.setattr(
-        eligibility,
-        "PRODUCTION_EXPECTED_EXCLUDED_IDS",
-        ("deepmath-level6-000001",),
     )
     report = eligibility.build_eligibility_report(
         rows,
@@ -167,7 +165,10 @@ def test_build_report_is_deterministic_and_preserves_stable_id_gap(
     report_path = tmp_path / "pool.eligibility.json"
     eligibility.write_or_validate_eligibility_report(report_path, first)
     eligible_rows, loaded = eligibility.apply_eligibility_report(
-        rows, manifest, report_path
+        rows,
+        manifest,
+        report_path,
+        expected_excluded_ids=["deepmath-level6-000001"],
     )
     assert loaded == first
     assert [row["id"] for row in eligible_rows] == [
@@ -275,7 +276,12 @@ def test_apply_report_rejects_provenance_or_eligibility_mutation(
     path.write_text(json.dumps(report), encoding="utf-8")
 
     with pytest.raises(ValueError, match=match):
-        eligibility.apply_eligibility_report(rows, manifest, path)
+        eligibility.apply_eligibility_report(
+            rows,
+            manifest,
+            path,
+            expected_excluded_ids=["deepmath-level6-000001"],
+        )
 
 
 def test_apply_report_binds_optional_prepared_manifest_file_hash(
@@ -292,12 +298,22 @@ def test_apply_report_binds_optional_prepared_manifest_file_hash(
     path = tmp_path / "eligibility.json"
     path.write_text(json.dumps(report), encoding="utf-8")
 
-    eligible_rows, _ = eligibility.apply_eligibility_report(rows, manifest, path)
+    eligible_rows, _ = eligibility.apply_eligibility_report(
+        rows,
+        manifest,
+        path,
+        expected_excluded_ids=["deepmath-level6-000001"],
+    )
     assert len(eligible_rows) == 2
 
     manifest_path.write_text("{}\n", encoding="utf-8")
     with pytest.raises(ValueError, match="prepared_manifest_sha256 mismatch"):
-        eligibility.apply_eligibility_report(rows, manifest, path)
+        eligibility.apply_eligibility_report(
+            rows,
+            manifest,
+            path,
+            expected_excluded_ids=["deepmath-level6-000001"],
+        )
 
 
 def test_apply_report_does_not_treat_mean_as_a_quantile(
@@ -367,6 +383,55 @@ def test_run_builder_loads_validated_pool_and_binds_manifest_file(
         eligibility,
         "PRODUCTION_EXPECTED_EXCLUDED_IDS",
         ("deepmath-level6-000001",),
+    )
+    monkeypatch.setattr(eligibility, "PRODUCTION_SOURCE_ROW_COUNT", 3)
+    monkeypatch.setattr(eligibility, "PRODUCTION_ELIGIBLE_ROW_COUNT", 2)
+    monkeypatch.setattr(eligibility, "PRODUCTION_EXCLUDED_ROW_COUNT", 1)
+    monkeypatch.setattr(eligibility, "PRODUCTION_MAX_EXCLUDED", 1)
+    monkeypatch.setattr(
+        eligibility,
+        "PRODUCTION_SOURCE_SHA256",
+        manifest["source_sha256"],
+    )
+    monkeypatch.setattr(
+        eligibility,
+        "PRODUCTION_PREPARED_JSONL_SHA256",
+        manifest["prepared_jsonl_sha256"],
+    )
+    monkeypatch.setattr(
+        eligibility,
+        "PRODUCTION_ELIGIBLE_IDS_SHA256",
+        hashlib.sha256(
+            b"deepmath-level6-000000\ndeepmath-level6-000002\n"
+        ).hexdigest(),
+    )
+    monkeypatch.setattr(
+        eligibility,
+        "PRODUCTION_EXCLUDED_ROWS",
+        (
+            {
+                "id": "deepmath-level6-000001",
+                "source_row_index": 1,
+                "original_dataset_index": 101,
+                "token_count": 32769,
+                "reason": eligibility.CONTEXT_EXCLUSION_REASON,
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        eligibility,
+        "PRODUCTION_TOKEN_LENGTH_SUMMARY",
+        {
+            "count": 3,
+            "min": 3,
+            "mean": (3 + 32769 + 4) / 3,
+            "p50": 4.0,
+            "p90": 26216.0,
+            "p95": 29492.5,
+            "p99": 32113.7,
+            "p999": 32703.47,
+            "max": 32769,
+        },
     )
     monkeypatch.setattr(
         eligibility,
@@ -469,7 +534,7 @@ def test_load_pinned_tokenizer_rejects_config_context_mismatch(monkeypatch) -> N
         )
 
 
-def test_apply_report_rejects_nonproduction_excluded_identity_by_default(
+def test_apply_report_rejects_generic_fixture_in_production_default_mode(
     tmp_path: Path, monkeypatch
 ) -> None:
     rows = [_row(index) for index in range(3)]
@@ -482,11 +547,6 @@ def test_apply_report_rejects_nonproduction_excluded_identity_by_default(
         "PINNED_CHAT_TEMPLATE_SHA256",
         hashlib.sha256(tokenizer.chat_template.encode("utf-8")).hexdigest(),
     )
-    monkeypatch.setattr(
-        eligibility,
-        "PRODUCTION_EXPECTED_EXCLUDED_IDS",
-        ("deepmath-level6-000001",),
-    )
     report = eligibility.build_eligibility_report(
         rows,
         manifest,
@@ -498,7 +558,7 @@ def test_apply_report_rejects_nonproduction_excluded_identity_by_default(
     path = tmp_path / "eligibility.json"
     path.write_text(json.dumps(report), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="production excluded stable IDs mismatch"):
+    with pytest.raises(ValueError, match="production source_row_count mismatch"):
         eligibility.apply_eligibility_report(rows, manifest, path)
 
 
@@ -522,4 +582,120 @@ def test_apply_report_binds_the_callers_actual_prepared_manifest_path(
             manifest,
             report_path,
             prepared_manifest_path=actual_path,
+            expected_excluded_ids=["deepmath-level6-000001"],
         )
+
+
+def test_direct_file_cli_help_bootstraps_without_pythonpath() -> None:
+    script = Path(eligibility.__file__).resolve()
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+    result = subprocess.run(
+        [sys.executable, str(script), "--help"],
+        cwd=script.parents[1],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--prepared-jsonl" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("mutation", "match"),
+    [
+        (lambda report: report.update(unexpected=True), "top-level fields mismatch"),
+        (lambda report: report.pop("dataset_name"), "top-level fields mismatch"),
+        (
+            lambda report: report["token_length_summary"].update(unexpected=True),
+            "token_length_summary fields mismatch",
+        ),
+        (
+            lambda report: report["token_length_summary"].pop("p999"),
+            "token_length_summary fields mismatch",
+        ),
+    ],
+)
+def test_apply_report_rejects_nonexact_report_schema(
+    tmp_path: Path, monkeypatch, mutation, match: str
+) -> None:
+    rows, manifest, report, _ = _build_three_row_report(tmp_path, monkeypatch)
+    mutation(report)
+    path = tmp_path / "eligibility.json"
+    path.write_text(json.dumps(report), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=match):
+        eligibility.apply_eligibility_report(
+            rows,
+            manifest,
+            path,
+            expected_excluded_ids=["deepmath-level6-000001"],
+        )
+
+
+def _install_tiny_production_contract(monkeypatch, manifest: dict, report: dict) -> None:
+    monkeypatch.setattr(
+        eligibility,
+        "PRODUCTION_EXPECTED_EXCLUDED_IDS",
+        ("deepmath-level6-000001",),
+    )
+    monkeypatch.setattr(eligibility, "PRODUCTION_SOURCE_ROW_COUNT", 3)
+    monkeypatch.setattr(eligibility, "PRODUCTION_ELIGIBLE_ROW_COUNT", 2)
+    monkeypatch.setattr(eligibility, "PRODUCTION_EXCLUDED_ROW_COUNT", 1)
+    monkeypatch.setattr(eligibility, "PRODUCTION_MAX_EXCLUDED", 1)
+    monkeypatch.setattr(
+        eligibility,
+        "PRODUCTION_SOURCE_SHA256",
+        manifest["source_sha256"],
+    )
+    monkeypatch.setattr(
+        eligibility,
+        "PRODUCTION_PREPARED_JSONL_SHA256",
+        manifest["prepared_jsonl_sha256"],
+    )
+    monkeypatch.setattr(
+        eligibility,
+        "PRODUCTION_ELIGIBLE_IDS_SHA256",
+        report["eligible_ids_sha256"],
+    )
+    monkeypatch.setattr(
+        eligibility,
+        "PRODUCTION_EXCLUDED_ROWS",
+        tuple(dict(entry) for entry in report["excluded_rows"]),
+    )
+    monkeypatch.setattr(
+        eligibility,
+        "PRODUCTION_TOKEN_LENGTH_SUMMARY",
+        dict(report["token_length_summary"]),
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "match"),
+    [
+        (
+            lambda report: report["excluded_rows"][0].update(token_count=32770),
+            "production excluded_rows mismatch",
+        ),
+        (
+            lambda report: report["token_length_summary"].update(p99=32768.97),
+            "production token_length_summary mismatch",
+        ),
+        (
+            lambda report: report.update(source_row_count=4),
+            "source_row_count mismatch",
+        ),
+    ],
+)
+def test_apply_production_default_rejects_semantic_tampering(
+    tmp_path: Path, monkeypatch, mutation, match: str
+) -> None:
+    rows, manifest, report, _ = _build_three_row_report(tmp_path, monkeypatch)
+    _install_tiny_production_contract(monkeypatch, manifest, report)
+    mutation(report)
+    path = tmp_path / "eligibility.json"
+    path.write_text(json.dumps(report), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=match):
+        eligibility.apply_eligibility_report(rows, manifest, path)

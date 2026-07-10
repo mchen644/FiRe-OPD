@@ -13,6 +13,11 @@ import tempfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
+if __package__ in (None, ""):
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from math_eval.deepmath_gradient_diversity import sha256_file
 
 
@@ -25,10 +30,73 @@ REPORT_VERSION = 1
 TOKENIZATION_BATCH_SIZE = 16
 CONTEXT_EXCLUSION_REASON = "token_count_exceeds_max_context"
 PRODUCTION_EXPECTED_EXCLUDED_IDS = ("deepmath-level6-038794",)
+PRODUCTION_SOURCE_ROW_COUNT = 57046
+PRODUCTION_ELIGIBLE_ROW_COUNT = 57045
+PRODUCTION_EXCLUDED_ROW_COUNT = 1
+PRODUCTION_MAX_EXCLUDED = 1
+PRODUCTION_SOURCE_SHA256 = (
+    "de3350fdd00bc0410550098ea65179e2be873da99e4075f80de575fc17670597"
+)
+PRODUCTION_PREPARED_JSONL_SHA256 = (
+    "ee8d55c943577888f14052b3953a0a8aa07d26076e50ddffa41a102b60027344"
+)
+PRODUCTION_ELIGIBLE_IDS_SHA256 = (
+    "5dbb267fed334219978d3d74610793fc8d146add15c488bcc59992779e22d8cf"
+)
+PRODUCTION_EXCLUDED_ROWS = (
+    {
+        "id": "deepmath-level6-038794",
+        "source_row_index": 38794,
+        "original_dataset_index": 62435,
+        "token_count": 33634,
+        "reason": CONTEXT_EXCLUSION_REASON,
+    },
+)
+PRODUCTION_TOKEN_LENGTH_SUMMARY = {
+    "count": 57046,
+    "min": 564,
+    "mean": 5805.74837850156,
+    "p50": 4781.0,
+    "p90": 10804.5,
+    "p95": 13336.5,
+    "p99": 18111.550000000003,
+    "p999": 23639.245000000068,
+    "max": 33634,
+}
 PINNED_CHAT_TEMPLATE_SHA256 = (
     "cd8e9439f0570856fd70470bf8889ebd8b5d1107207f67a5efb46e342330527f"
 )
 TRANSFORMERS_VERSION = importlib.metadata.version("transformers")
+REPORT_FIELDS = frozenset(
+    {
+        "manifest_version",
+        "prepared_jsonl",
+        "prepared_jsonl_sha256",
+        "prepared_manifest",
+        "prepared_manifest_sha256",
+        "source_sha256",
+        "source_row_count",
+        "dataset_name",
+        "dataset_revision",
+        "model_name",
+        "model_revision",
+        "tokenizer_name",
+        "tokenizer_revision",
+        "transformers_version",
+        "chat_template_sha256",
+        "max_context_tokens",
+        "max_excluded",
+        "expected_excluded_ids",
+        "eligible_row_count",
+        "excluded_row_count",
+        "eligible_ids_sha256",
+        "excluded_rows",
+        "token_length_summary",
+    }
+)
+TOKEN_LENGTH_SUMMARY_FIELDS = frozenset(
+    {"count", "min", "mean", "p50", "p90", "p95", "p99", "p999", "max"}
+)
 
 
 def _sha256_lines(values: Sequence[str]) -> str:
@@ -366,6 +434,12 @@ def _validate_token_summary(summary: object, source_row_count: int) -> None:
         raise ValueError(
             "eligibility report token_length_summary must be an object"
         )
+    if set(summary) != TOKEN_LENGTH_SUMMARY_FIELDS:
+        raise ValueError(
+            "eligibility report token_length_summary fields mismatch: "
+            f"expected {sorted(TOKEN_LENGTH_SUMMARY_FIELDS)!r}, "
+            f"got {sorted(summary)!r}"
+        )
     _require_equal(
         summary.get("count"),
         source_row_count,
@@ -400,6 +474,37 @@ def _validate_token_summary(summary: object, source_row_count: int) -> None:
         )
 
 
+def _validate_production_semantics(report: Mapping) -> None:
+    expected_scalars = {
+        "source_row_count": PRODUCTION_SOURCE_ROW_COUNT,
+        "eligible_row_count": PRODUCTION_ELIGIBLE_ROW_COUNT,
+        "excluded_row_count": PRODUCTION_EXCLUDED_ROW_COUNT,
+        "max_excluded": PRODUCTION_MAX_EXCLUDED,
+        "source_sha256": PRODUCTION_SOURCE_SHA256,
+        "prepared_jsonl_sha256": PRODUCTION_PREPARED_JSONL_SHA256,
+        "eligible_ids_sha256": PRODUCTION_ELIGIBLE_IDS_SHA256,
+        "expected_excluded_ids": list(PRODUCTION_EXPECTED_EXCLUDED_IDS),
+    }
+    for field, expected in expected_scalars.items():
+        _require_equal(
+            report.get(field), expected, field, description="production"
+        )
+    expected_excluded_rows = [
+        dict(entry) for entry in PRODUCTION_EXCLUDED_ROWS
+    ]
+    if report.get("excluded_rows") != expected_excluded_rows:
+        raise ValueError(
+            "production excluded_rows mismatch: expected "
+            f"{expected_excluded_rows!r}, got {report.get('excluded_rows')!r}"
+        )
+    if report.get("token_length_summary") != PRODUCTION_TOKEN_LENGTH_SUMMARY:
+        raise ValueError(
+            "production token_length_summary mismatch: expected "
+            f"{PRODUCTION_TOKEN_LENGTH_SUMMARY!r}, "
+            f"got {report.get('token_length_summary')!r}"
+        )
+
+
 def apply_eligibility_report(
     rows: Sequence[Mapping],
     prepared_manifest: Mapping,
@@ -411,6 +516,11 @@ def apply_eligibility_report(
     """Validate a report and return eligible rows in unchanged prepared order."""
     _validate_prepared_contract(rows, prepared_manifest)
     report = _read_report(Path(report_path))
+    if set(report) != REPORT_FIELDS:
+        raise ValueError(
+            "eligibility report top-level fields mismatch: "
+            f"expected {sorted(REPORT_FIELDS)!r}, got {sorted(report)!r}"
+        )
     expected_values = {
         "manifest_version": REPORT_VERSION,
         "prepared_jsonl": prepared_manifest["prepared_jsonl"],
@@ -431,6 +541,9 @@ def apply_eligibility_report(
         _require_equal(
             report.get(field), expected, field, description="eligibility report"
         )
+    production_mode = expected_excluded_ids is None
+    if production_mode:
+        _validate_production_semantics(report)
 
     manifest_path_value = report.get("prepared_manifest")
     manifest_hash_value = report.get("prepared_manifest_sha256")
@@ -548,7 +661,7 @@ def apply_eligibility_report(
         )
     required_excluded_ids = list(
         PRODUCTION_EXPECTED_EXCLUDED_IDS
-        if expected_excluded_ids is None
+        if production_mode
         else expected_excluded_ids
     )
     if (
@@ -773,7 +886,6 @@ def run_eligibility_build(
         manifest,
         report_path,
         prepared_manifest_path=manifest_path,
-        expected_excluded_ids=expected_excluded_ids,
     )
     return written
 
