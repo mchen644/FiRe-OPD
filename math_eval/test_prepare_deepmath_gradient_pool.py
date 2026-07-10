@@ -210,6 +210,59 @@ def test_prepare_pool_rejects_partial_existing_cache(
         )
 
 
+@pytest.mark.parametrize("alias_kind", ["identical", "dotdot"])
+def test_prepare_pool_rejects_overlapping_artifact_paths_before_creating_them(
+    tmp_path: Path, alias_kind: str
+) -> None:
+    source, _, _, originals = _fixture_inputs(tmp_path)
+    artifact_root = tmp_path / "overlapping-artifacts"
+    output = artifact_root / "pool.jsonl"
+    if alias_kind == "identical":
+        manifest = output
+    else:
+        manifest = artifact_root / "unused-child" / ".." / "pool.jsonl"
+    assert output.resolve() == manifest.resolve()
+
+    with pytest.raises(ValueError, match="distinct paths"):
+        preparation.prepare_pool(
+            source,
+            output,
+            manifest,
+            originals,
+            expected_count=2,
+        )
+
+    assert not artifact_root.exists()
+    assert not output.exists()
+    assert not list(tmp_path.rglob("*.tmp"))
+
+
+def test_prepare_pool_rejects_symlinked_artifact_path_alias(tmp_path: Path) -> None:
+    source, _, _, originals = _fixture_inputs(tmp_path)
+    artifact_root = tmp_path / "artifact-root"
+    artifact_alias = tmp_path / "artifact-alias"
+    artifact_root.mkdir()
+    try:
+        artifact_alias.symlink_to(artifact_root, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"directory symlinks are unavailable: {error}")
+    output = artifact_root / "pool.jsonl"
+    manifest = artifact_alias / "pool.jsonl"
+    assert output.resolve() == manifest.resolve()
+
+    with pytest.raises(ValueError, match="distinct paths"):
+        preparation.prepare_pool(
+            source,
+            output,
+            manifest,
+            originals,
+            expected_count=2,
+        )
+
+    assert not output.exists()
+    assert not list(artifact_root.glob("*.tmp"))
+
+
 def test_prepare_pool_leaves_no_targets_or_temps_when_join_fails(
     tmp_path: Path,
 ) -> None:
