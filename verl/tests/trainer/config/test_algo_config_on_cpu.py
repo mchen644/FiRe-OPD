@@ -231,6 +231,44 @@ class TestAlgoConfig(unittest.TestCase):
         assert da.min_easy_esr_beta == 0.1
         assert da.hard_entropy_coef == 0.003
 
+    def test_yaml_accepts_group_success_difficulty_overrides(self):
+        config = None
+
+        import os
+
+        from hydra import compose, initialize_config_dir
+        from hydra.core.global_hydra import GlobalHydra
+
+        GlobalHydra.instance().clear()
+        try:
+            config_dir = os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "..", "..", "..", "verl", "trainer", "config")
+            )
+            with initialize_config_dir(config_dir=config_dir):
+                config = omega_conf_to_dataclass(
+                    compose(
+                        config_name="ppo_trainer",
+                        overrides=[
+                            "algorithm.difficulty_aware_opd.enabled=True",
+                            "algorithm.difficulty_aware_opd.method=group_success_prompt_esr",
+                            "algorithm.difficulty_aware_opd.expected_group_size=4",
+                            "algorithm.difficulty_aware_opd.easy_group_correct_count=4",
+                            "algorithm.difficulty_aware_opd.easy_esr_beta=0.2",
+                            "algorithm.difficulty_aware_opd.non_easy_esr_beta=0.5",
+                        ],
+                    ).algorithm
+                )
+        finally:
+            GlobalHydra.instance().clear()
+
+        da = config.difficulty_aware_opd
+        assert da.enabled is True
+        assert da.method == "group_success_prompt_esr"
+        assert da.expected_group_size == 4
+        assert da.easy_group_correct_count == 4
+        assert da.easy_esr_beta == 0.2
+        assert da.non_easy_esr_beta == 0.5
+
 
 class TestAlgoCompute(unittest.TestCase):
     """Test the AlgoConfig dataclass and its integration with core algorithms."""

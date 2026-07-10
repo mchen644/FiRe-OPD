@@ -387,7 +387,7 @@ class RethinkingOpdProbeConfig(BaseConfig):
 
 @dataclass
 class DifficultyAwareOpdConfig(BaseConfig):
-    """Single-rollout difficulty routing for Budget20 OPD."""
+    """Single-rollout or rollout-group difficulty routing for OPD."""
 
     enabled: bool = False
     method: str = "two_signal_prompt_esr_entropy"
@@ -400,6 +400,10 @@ class DifficultyAwareOpdConfig(BaseConfig):
     min_easy_esr_beta: float = 0.10
     easy_esr_delta: float = 0.10
     hard_entropy_coef: float = 0.001
+    expected_group_size: int = 4
+    easy_group_correct_count: int = 4
+    easy_esr_beta: float = 0.20
+    non_easy_esr_beta: float = 0.50
 
 
 @dataclass

@@ -224,10 +224,10 @@ algorithm:
     # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
     _target_: verl.trainer.config.DifficultyAwareOpdConfig
 
-    # Whether to enable correctness-confidence prompt/ESR routing and hard entropy
+    # Whether to enable difficulty-aware teacher-prompt and ESR routing
     enabled: False
 
-    # Routing method; currently only two_signal_prompt_esr_entropy is supported
+    # Routing method: legacy single-rollout proxy or rollout-group success
     method: two_signal_prompt_esr_entropy
 
     # Sequence reward threshold above which a rollout is considered correct
@@ -256,6 +256,18 @@ algorithm:
 
     # Coefficient for hard-gated max-entropy loss
     hard_entropy_coef: 0.001
+
+    # Required number of rollout rows sharing each uid for group-success routing
+    expected_group_size: 4
+
+    # A group with exactly this many correct rollouts takes the easy route
+    easy_group_correct_count: 4
+
+    # ESR fraction for easy groups under group-success routing
+    easy_esr_beta: 0.20
+
+    # ESR fraction for learnable and unresolved groups under group-success routing
+    non_easy_esr_beta: 0.50
 
 # config for the trainer
 trainer:

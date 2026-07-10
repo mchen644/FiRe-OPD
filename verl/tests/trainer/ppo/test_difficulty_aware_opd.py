@@ -239,3 +239,66 @@ def test_apply_difficulty_aware_opd_routing_adds_batch_tensors_and_metrics():
     assert batch.batch["difficulty_aware_entropy_weight"][1].item() > 0.0
     assert metrics["difficulty_aware_opd/correct_rate"] == 0.5
     assert metrics["difficulty_aware_opd/concise_prompt_ratio"] == 0.5
+
+
+def test_apply_group_success_routing_dispatches_without_confidence_or_entropy_tensors():
+    from verl.trainer.ppo.ray_trainer import _apply_difficulty_aware_opd_routing
+
+    uids = np.asarray(["easy", "learnable"] * 4, dtype=object)
+    response_mask = torch.ones((8, 3), dtype=torch.float32)
+    reward_tensor = torch.zeros_like(response_mask)
+    reward_tensor[np.flatnonzero(uids == "easy"), -1] = 1.0
+    reward_tensor[1, -1] = 1.0
+    batch = DataProto.from_dict(tensors={"response_mask": response_mask})
+    batch.non_tensor_batch["uid"] = uids
+    metrics = {}
+
+    _apply_difficulty_aware_opd_routing(
+        batch=batch,
+        reward_tensor=reward_tensor,
+        difficulty_config=_group_cfg(),
+        base_esr_beta=0.20,
+        metrics=metrics,
+    )
+
+    easy_rows = np.flatnonzero(uids == "easy")
+    learnable_rows = np.flatnonzero(uids == "learnable")
+    assert batch.batch["difficulty_aware_group_correct_count"][easy_rows].tolist() == [4.0] * 4
+    assert batch.batch["difficulty_aware_group_correct_count"][learnable_rows].tolist() == [1.0] * 4
+    assert batch.batch["difficulty_aware_group_accuracy"][easy_rows].tolist() == [1.0] * 4
+    assert batch.batch["difficulty_aware_group_accuracy"][learnable_rows].tolist() == [0.25] * 4
+    assert batch.batch["difficulty_aware_esr_beta"][easy_rows].tolist() == pytest.approx([0.2] * 4)
+    assert batch.batch["difficulty_aware_esr_beta"][learnable_rows].tolist() == pytest.approx([0.5] * 4)
+    assert set(batch.non_tensor_batch["difficulty_aware_prompt_style"][easy_rows]) == {"concise"}
+    assert set(batch.non_tensor_batch["difficulty_aware_prompt_style"][learnable_rows]) == {"normal"}
+    assert "difficulty_aware_confidence_rank" not in batch.batch
+    assert "difficulty_aware_entropy_weight" not in batch.batch
+    assert metrics["difficulty_aware_opd/group_count"] == 2.0
+    assert metrics["difficulty_aware_opd/easy_group_ratio"] == pytest.approx(0.5)
+    assert metrics["difficulty_aware_opd/learnable_group_ratio"] == pytest.approx(0.5)
+
+
+def test_group_success_esr_beta_reuses_rollout_length_masking_per_row():
+    from verl.trainer.ppo.tale_budget import compute_rollout_length_tale_budget
+
+    uids = np.asarray(["easy"] * 4 + ["learnable"] * 4, dtype=object)
+    response_mask = torch.ones((8, 100), dtype=torch.float32)
+    reward_tensor = torch.zeros_like(response_mask)
+    reward_tensor[:4, -1] = 1.0
+    reward_tensor[4, -1] = 1.0
+    routing = compute_group_success_routing(
+        token_level_scores=reward_tensor,
+        response_mask=response_mask,
+        uids=uids,
+        config=_group_cfg(),
+    )
+
+    result = compute_rollout_length_tale_budget(
+        response_mask=response_mask,
+        alpha=1.0,
+        beta=routing.esr_beta,
+        min_budget=1,
+        round_to=1,
+    )
+
+    assert result.esr_tokens.tolist() == [20, 20, 20, 20, 50, 50, 50, 50]

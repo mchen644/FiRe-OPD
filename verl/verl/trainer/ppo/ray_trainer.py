@@ -429,15 +429,53 @@ def _apply_difficulty_aware_opd_routing(
     base_esr_beta: float,
     metrics: dict,
 ) -> None:
+    if "response_mask" not in batch.batch.keys():
+        raise ValueError("difficulty-aware OPD routing requires response_mask")
+
+    method = str(
+        difficulty_config.get("method", "two_signal_prompt_esr_entropy")
+        if hasattr(difficulty_config, "get")
+        else getattr(difficulty_config, "method", "two_signal_prompt_esr_entropy")
+    )
+    target_device = batch.batch["response_mask"].device
+    original_lengths = batch.batch["response_mask"].to(dtype=torch.long).sum(dim=-1)
+
+    if method == "group_success_prompt_esr":
+        from verl.trainer.ppo.difficulty_aware_opd import (
+            compute_group_success_routing,
+            summarize_group_success_routing,
+        )
+
+        if "uid" not in batch.non_tensor_batch:
+            raise ValueError("group-success difficulty-aware OPD routing requires uid")
+        result = compute_group_success_routing(
+            token_level_scores=reward_tensor,
+            response_mask=batch.batch["response_mask"],
+            uids=batch.non_tensor_batch["uid"],
+            config=difficulty_config,
+        )
+        batch.batch["difficulty_aware_correct"] = result.correct.to(device=target_device)
+        batch.batch["difficulty_aware_group_correct_count"] = result.group_correct_count.to(device=target_device)
+        batch.batch["difficulty_aware_group_accuracy"] = result.group_accuracy.to(device=target_device)
+        batch.batch["difficulty_aware_easy"] = result.easy.to(device=target_device)
+        batch.batch["difficulty_aware_learnable"] = result.learnable.to(device=target_device)
+        batch.batch["difficulty_aware_unresolved"] = result.unresolved.to(device=target_device)
+        batch.batch["difficulty_aware_esr_beta"] = result.esr_beta.to(device=target_device)
+        batch.non_tensor_batch["difficulty_aware_prompt_style"] = result.prompt_styles
+        metrics.update(
+            summarize_group_success_routing(result, original_response_lengths=original_lengths)
+        )
+        return
+
+    if method != "two_signal_prompt_esr_entropy":
+        raise ValueError(f"Unsupported difficulty_aware_opd.method={method!r}")
+    if "old_log_probs" not in batch.batch.keys():
+        raise ValueError("difficulty-aware OPD routing requires old_log_probs")
+
     from verl.trainer.ppo.difficulty_aware_opd import (
         compute_two_signal_difficulty_routing,
         summarize_difficulty_routing,
     )
-
-    if "old_log_probs" not in batch.batch.keys():
-        raise ValueError("difficulty-aware OPD routing requires old_log_probs")
-    if "response_mask" not in batch.batch.keys():
-        raise ValueError("difficulty-aware OPD routing requires response_mask")
 
     result = compute_two_signal_difficulty_routing(
         token_level_scores=reward_tensor,
@@ -446,7 +484,6 @@ def _apply_difficulty_aware_opd_routing(
         config=difficulty_config,
         base_esr_beta=base_esr_beta,
     )
-    target_device = batch.batch["response_mask"].device
     batch.batch["difficulty_aware_correct"] = result.correct.to(device=target_device)
     batch.batch["difficulty_aware_confidence_rank"] = result.confidence_rank.to(device=target_device)
     batch.batch["difficulty_aware_easy"] = result.easy.to(device=target_device)
@@ -456,7 +493,6 @@ def _apply_difficulty_aware_opd_routing(
         batch.batch["difficulty_aware_entropy_weight"] = result.entropy_weight.to(device=target_device)
     batch.non_tensor_batch["difficulty_aware_prompt_style"] = result.prompt_styles
 
-    original_lengths = batch.batch["response_mask"].to(dtype=torch.long).sum(dim=-1)
     metrics.update(summarize_difficulty_routing(result, original_response_lengths=original_lengths))
 
 
