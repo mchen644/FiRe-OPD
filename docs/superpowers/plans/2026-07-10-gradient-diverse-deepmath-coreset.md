@@ -72,7 +72,7 @@ def test_join_filtered_rows_uses_exact_question_and_r1_solution_one():
     }]
 ```
 
-Add separate tests asserting failures for a missing match, duplicate original question, empty `r1_solution_1`, answer mismatch, malformed chat prompt, and unexpected row count.
+Add separate tests asserting failures for a missing match, a genuinely ambiguous duplicate-key subsequence, empty `r1_solution_1`, answer mismatch, malformed chat prompt, and unexpected row count. Add a positive fixture in which duplicate question/answer keys are uniquely disambiguated by surrounding row order.
 
 - [ ] **Step 2: Run the join tests and verify RED**
 
@@ -87,7 +87,7 @@ Expected: collection fails because `math_eval.deepmath_gradient_diversity` does 
 
 - [ ] **Step 3: Implement the minimal exact join**
 
-Implement exact terminal-suffix removal, build a unique `question -> (original_index, row)` mapping, compare normalized answers, and construct stable prepared rows. Do not add fuzzy matching or fallback to another R1 solution.
+Implement exact terminal-suffix removal and a `(question, normalized_answer) -> sorted original indices` mapping. Recover the filtered rows with both forward-earliest and backward-latest strictly increasing subsequence passes and require identical mappings. Construct stable prepared rows from that unique mapping. Do not add fuzzy question matching or fallback to another R1 solution.
 
 - [ ] **Step 4: Run the join tests and verify GREEN**
 
