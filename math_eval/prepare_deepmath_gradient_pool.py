@@ -209,6 +209,8 @@ def prepare_pool(
     source_parquet = Path(source_parquet)
     output_jsonl = Path(output_jsonl)
     manifest_path = Path(manifest_path)
+    if output_jsonl.resolve() == manifest_path.resolve():
+        raise ValueError("output_jsonl and manifest_path must be distinct paths")
     if expected_count < 0:
         raise ValueError("expected_count must be non-negative")
 
