@@ -101,8 +101,10 @@ MASTER_LOG="$LOG_ROOT/deepmath_gradient_diverse_12800.log"
 MASTER_LOCK="$OUTPUT_ROOT/.deepmath_gradient_diverse_12800.launch.lock"
 
 mkdir -p "$OUTPUT_ROOT" "$LOG_ROOT" "$GRADIENT_DIR" "$SELECTION_DIR" "$(dirname -- "$OUTPUT_PARQUET")"
-exec 9>"$MASTER_LOCK"
+exec 9<>"$MASTER_LOCK"
 flock -n 9 || die "another launcher already holds the production lock: $MASTER_LOCK"
+: >"$MASTER_LOCK"
+printf '%s\n' "$$" >&9
 exec > >(tee -a "$MASTER_LOG") 2>&1
 
 printf '=== gradient-diverse DeepMath production launcher ===\n'
@@ -236,6 +238,11 @@ check_requested_gpu_free() {
   [[ "$reported_index" == "$physical_id" ]] || die "requested GPU $physical_id resolved to index $reported_index"
   [[ -n "$uuid" ]] || die "GPU $physical_id returned an empty UUID"
   [[ "$memory_used" =~ ^[0-9]+$ ]] || die "GPU $physical_id returned invalid memory.used=$memory_used"
+  if [[ -n "${gpu_uuid_by_id[$physical_id]+present}" ]]; then
+    [[ "${gpu_uuid_by_id[$physical_id]}" == "$uuid" ]] || \
+      die "GPU $physical_id UUID changed from ${gpu_uuid_by_id[$physical_id]} to $uuid"
+  fi
+  gpu_uuid_by_id["$physical_id"]="$uuid"
 
   if ! compute_pids="$(nvidia-smi --id="$physical_id" --query-compute-apps=pid --format=csv,noheader,nounits)"; then
     die "failed to query compute processes for requested GPU $physical_id"
@@ -248,6 +255,7 @@ check_requested_gpu_free() {
 }
 
 printf '%s\n' '--- stage: requested GPU availability gate ---'
+declare -A gpu_uuid_by_id=()
 for physical_id in "${gpu_ids[@]}"; do
   check_requested_gpu_free "$physical_id"
 done
@@ -257,10 +265,14 @@ num_shards="${#gpu_ids[@]}"
 collector_logs=()
 for logical_shard in "${!gpu_ids[@]}"; do
   physical_id="${gpu_ids[$logical_shard]}"
+  gpu_uuid="${gpu_uuid_by_id[$physical_id]}"
   shard_log="$LOG_ROOT/deepmath_gradient_shard_${logical_shard}_gpu_${physical_id}.log"
   collector_logs+=("$shard_log")
+  printf '\n=== collector attempt utc=%s logical_shard=%s physical_gpu=%s uuid=%s ===\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$logical_shard" "$physical_id" "$gpu_uuid" \
+    >>"$shard_log"
   (
-    export CUDA_VISIBLE_DEVICES="$physical_id"
+    export CUDA_VISIBLE_DEVICES="$gpu_uuid"
     "$PYTHON_BIN" -m math_eval.collect_prismatic_gradients \
       --reference-repo "$REFERENCE_REPO" \
       --prepared-jsonl "$PREPARED_JSONL" \
@@ -273,26 +285,53 @@ for logical_shard in "${!gpu_ids[@]}"; do
       --shard-index "$logical_shard" \
       --num-shards "$num_shards" \
       --device cuda:0
-  ) >"$shard_log" 2>&1 &
+  ) >>"$shard_log" 2>&1 &
   collector_pids+=("$!")
   printf 'collector_started logical_shard=%s physical_gpu=%s pid=%s log=%s\n' \
     "$logical_shard" "$physical_id" "$!" "$shard_log"
 done
 
-collector_failed=0
+declare -A collector_log_by_pid=()
 for collector_index in "${!collector_pids[@]}"; do
-  pid="${collector_pids[$collector_index]}"
-  if wait "$pid"; then
-    printf 'collector_finished pid=%s log=%s\n' "$pid" "${collector_logs[$collector_index]}"
+  collector_log_by_pid["${collector_pids[$collector_index]}"]="${collector_logs[$collector_index]}"
+done
+active_collector_pids=("${collector_pids[@]}")
+while (( ${#active_collector_pids[@]} > 0 )); do
+  finished_pid=""
+  if wait -n -p finished_pid "${active_collector_pids[@]}"; then
+    finished_status=0
   else
-    status=$?
-    printf 'collector_failed pid=%s status=%s log=%s\n' \
-      "$pid" "$status" "${collector_logs[$collector_index]}" >&2
-    collector_failed=1
+    finished_status=$?
   fi
+  [[ -n "$finished_pid" ]] || die "wait -n returned without a collector PID"
+
+  remaining_collector_pids=()
+  for pid in "${active_collector_pids[@]}"; do
+    [[ "$pid" == "$finished_pid" ]] || remaining_collector_pids+=("$pid")
+  done
+  active_collector_pids=("${remaining_collector_pids[@]}")
+  collector_pids=("${active_collector_pids[@]}")
+
+  if (( finished_status == 0 )); then
+    printf 'collector_finished pid=%s log=%s\n' \
+      "$finished_pid" "${collector_log_by_pid[$finished_pid]}"
+    continue
+  fi
+
+  printf 'collector_failed pid=%s status=%s log=%s\n' \
+    "$finished_pid" "$finished_status" "${collector_log_by_pid[$finished_pid]}" >&2
+  for pid in "${active_collector_pids[@]}"; do
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -TERM "$pid" 2>/dev/null || true
+    fi
+  done
+  for pid in "${active_collector_pids[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+  collector_pids=()
+  die "one or more gradient collectors failed; remaining collectors were terminated"
 done
 collector_pids=()
-(( collector_failed == 0 )) || die "one or more gradient collectors failed; global validation was not run"
 
 printf '%s\n' '--- stage: exact global gradient coverage validation ---'
 "$PYTHON_BIN" -m math_eval.collect_prismatic_gradients \
@@ -305,7 +344,10 @@ printf '%s\n' '--- stage: exact global gradient coverage validation ---'
   --num-shards "$num_shards"
 
 printf '%s\n' '--- stage: exact fixed-pool selection ---'
-export CUDA_VISIBLE_DEVICES="${gpu_ids[0]}"
+selection_physical_gpu="${gpu_ids[0]}"
+printf '%s\n' '--- stage: selection GPU availability recheck ---'
+check_requested_gpu_free "$selection_physical_gpu"
+export CUDA_VISIBLE_DEVICES="${gpu_uuid_by_id[$selection_physical_gpu]}"
 "$PYTHON_BIN" -m math_eval.select_gradient_diverse_deepmath \
   --source-parquet "$SOURCE_PARQUET" \
   --prepared-jsonl "$PREPARED_JSONL" \

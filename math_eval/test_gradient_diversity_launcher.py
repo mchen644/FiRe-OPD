@@ -71,7 +71,11 @@ elif sys.argv[1:3] == ["-m", "math_eval.build_gradient_eligibility"]:
 elif sys.argv[1:3] == ["-m", "math_eval.collect_prismatic_gradients"]:
     if "--validate-global-only" not in sys.argv:
         shard = option("--shard-index")
-        time.sleep(float(os.environ.get("COLLECT_SLEEP", "0")))
+        sleep_seconds = os.environ.get(
+            f"COLLECT_SLEEP_SHARD_{shard}",
+            os.environ.get("COLLECT_SLEEP", "0"),
+        )
+        time.sleep(float(sleep_seconds))
         if shard == os.environ.get("FAIL_SHARD"):
             raise SystemExit(23)
 elif sys.argv[1:3] == ["-m", "math_eval.select_gradient_diverse_deepmath"]:
@@ -204,8 +208,8 @@ def test_launcher_fake_cli_runs_stages_in_order_and_maps_logical_shards(tmp_path
         call["argv"][call["argv"].index("--shard-index") + 1]: call
         for call in collector_calls
     }
-    assert by_shard["0"]["cuda_visible_devices"] == "7"
-    assert by_shard["1"]["cuda_visible_devices"] == "2"
+    assert by_shard["0"]["cuda_visible_devices"] == "GPU-fake-7"
+    assert by_shard["1"]["cuda_visible_devices"] == "GPU-fake-2"
     for shard, call in by_shard.items():
         assert call["argv"][call["argv"].index("--num-shards") + 1] == "2"
         assert call["argv"][call["argv"].index("--device") + 1] == "cuda:0"
@@ -221,7 +225,7 @@ def test_launcher_fake_cli_runs_stages_in_order_and_maps_logical_shards(tmp_path
     assert global_index > max(calls.index(call) for call in collector_calls)
     assert selection_index > global_index
     assert "--eligibility-report" in calls[global_index]["argv"]
-    assert calls[selection_index]["cuda_visible_devices"] == "7"
+    assert calls[selection_index]["cuda_visible_devices"] == "GPU-fake-7"
 
     gpu_calls = _read_jsonl(gpu_calls_path)
     assert {call["gpu_id"] for call in gpu_calls} == {"7", "2"}
@@ -229,6 +233,9 @@ def test_launcher_fake_cli_runs_stages_in_order_and_maps_logical_shards(tmp_path
         queries = [call["argv"] for call in gpu_calls if call["gpu_id"] == gpu_id]
         assert any("--query-gpu=index,uuid,memory.used" in args for args in queries)
         assert any("--query-compute-apps=pid" in args for args in queries)
+    gpu_7_queries = [call for call in gpu_calls if call["gpu_id"] == "7"]
+    assert len(gpu_7_queries) == 4  # collection gate plus selection recheck
+    assert len([call for call in gpu_calls if call["gpu_id"] == "2"]) == 2
 
     assert "GPU-fake-7" in result.stdout
     assert "GPU-fake-2" in result.stdout
@@ -249,6 +256,31 @@ def test_launcher_propagates_collector_failure_before_global_validation(tmp_path
     )
 
     assert result.returncode != 0
+    calls = _read_jsonl(calls_path)
+    assert not any("--validate-global-only" in call["argv"] for call in calls)
+    assert "math_eval.select_gradient_diverse_deepmath" not in _module_call_names(calls)
+
+
+def test_launcher_detects_later_shard_failure_without_waiting_for_earlier_shard(
+    tmp_path,
+):
+    env, calls_path, _ = _fake_runtime(tmp_path)
+    env["FAIL_SHARD"] = "1"
+    env["COLLECT_SLEEP_SHARD_0"] = "5"
+
+    started = time.monotonic()
+    result = subprocess.run(
+        ["bash", str(LAUNCHER)],
+        cwd=REPOSITORY_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=4,
+    )
+    elapsed = time.monotonic() - started
+
+    assert result.returncode != 0
+    assert elapsed < 2.0
     calls = _read_jsonl(calls_path)
     assert not any("--validate-global-only" in call["argv"] for call in calls)
     assert "math_eval.select_gradient_diverse_deepmath" not in _module_call_names(calls)
@@ -326,6 +358,8 @@ def test_launcher_master_lock_rejects_duplicate_concurrent_launch(tmp_path):
         )
         assert second.returncode != 0
         assert "already holds" in second.stdout + second.stderr
+        lock_path = Path(env["OUTPUT_ROOT"]) / ".deepmath_gradient_diverse_12800.launch.lock"
+        assert lock_path.read_text(encoding="utf-8").strip() == str(first.pid)
         assert first.wait(timeout=10) == 0
     finally:
         if first.poll() is None:
@@ -352,3 +386,8 @@ def test_launcher_can_resume_by_rerunning_the_same_cli_contract(tmp_path):
     assert names.count("math_eval.build_gradient_eligibility") == 2
     assert names.count("math_eval.collect_prismatic_gradients") == 6
     assert names.count("math_eval.select_gradient_diverse_deepmath") == 2
+
+    shard_log = (
+        Path(env["LOG_ROOT"]) / "deepmath_gradient_shard_0_gpu_7.log"
+    ).read_text(encoding="utf-8")
+    assert shard_log.count("collector attempt") == 2
