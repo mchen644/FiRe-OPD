@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import statistics
@@ -81,15 +82,22 @@ def _load_eval_rows(path: Path) -> list[dict]:
 
 def summarize_eval_file(
     path: Path, expected_samples: int
-) -> dict[str, float | int]:
+) -> dict[str, float | int | str]:
     """Validate one evaluation JSONL file and summarize all sampled responses."""
     _require_positive_sample_count(expected_samples)
     rows = _load_eval_rows(path)
     per_problem_accuracy: list[list[bool]] = []
     flat_accuracy: list[bool] = []
     flat_lengths: list[int | float] = []
+    benchmark_identity: list[tuple[str, str]] = []
 
     for row_number, row in enumerate(rows, start=1):
+        problem = row.get("problem")
+        answer = row.get("answer")
+        if not isinstance(problem, str) or not problem:
+            raise ValueError(f"row {row_number} problem must be a nonempty string")
+        if not isinstance(answer, str) or not answer:
+            raise ValueError(f"row {row_number} answer must be a nonempty string")
         accuracy = row.get("acc_list")
         response_lengths = row.get("response_lengths")
         if not isinstance(accuracy, list):
@@ -123,13 +131,20 @@ def summarize_eval_file(
         per_problem_accuracy.append(accuracy)
         flat_accuracy.extend(accuracy)
         flat_lengths.extend(response_lengths)
+        benchmark_identity.append((problem, answer))
 
     problem_count = len(per_problem_accuracy)
     pass_at_k_name = f"pass_at_{expected_samples}"
+    identity_payload = json.dumps(
+        benchmark_identity,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
     return {
         "problems": problem_count,
         "samples": len(flat_accuracy),
         "samples_per_problem": expected_samples,
+        "benchmark_identity_sha256": hashlib.sha256(identity_payload).hexdigest(),
         "pass_at_1": sum(flat_accuracy) / len(flat_accuracy),
         pass_at_k_name: sum(any(row) for row in per_problem_accuracy)
         / problem_count,
@@ -205,6 +220,21 @@ def compare_runs(
         try:
             baseline_datasets = baseline["datasets"]
             baseline_macro = baseline["macro"]
+            for dataset in dataset_order:
+                candidate_dataset = candidate_datasets[dataset]
+                baseline_dataset = baseline_datasets[dataset]
+                if candidate_dataset["problems"] != baseline_dataset["problems"]:
+                    raise ValueError(
+                        f"baseline {label!r} dataset {dataset!r} problem count mismatch"
+                    )
+                if (
+                    candidate_dataset["benchmark_identity_sha256"]
+                    != baseline_dataset["benchmark_identity_sha256"]
+                ):
+                    raise ValueError(
+                        f"baseline {label!r} dataset {dataset!r} "
+                        "benchmark identity mismatch"
+                    )
             per_dataset_deltas = {
                 dataset: {
                     metric: candidate_datasets[dataset][metric]

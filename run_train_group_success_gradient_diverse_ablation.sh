@@ -18,13 +18,18 @@ REPO_DIR="${REPO_DIR:-${PRODUCTION_ROOT}}"
 GROUP_LAUNCHER="${REPO_DIR}/run_train_group_success_difficulty_opd.sh"
 BASE_LAUNCHER="${REPO_DIR}/verl/examples/fire_opd/run_opd_strong_to_weak_student_raw_teacher_tale_budget30b.sh"
 PYTHON_BIN="${PYTHON_BIN:-/home/mchen/miniconda3/envs/verl/bin/python}"
+REPORT_PARSER_PYTHON="/home/mchen/miniconda3/envs/verl/bin/python"
 
 SOURCE_DATA="${PRODUCTION_ROOT}/data/g-opd/DeepMath-103K/train_filtered_level6.parquet"
 SELECTED_DATA="${PRODUCTION_ROOT}/data/gradient_diversity/DeepMath-103K/train_gradient_diverse_12800.parquet"
 SELECTION_MANIFEST="${PRODUCTION_ROOT}/data/gradient_diversity/selection/manifest.json"
 SELECTED_IDS="${PRODUCTION_ROOT}/data/gradient_diversity/selection/selected_ids.jsonl"
+DIAGNOSTICS="${PRODUCTION_ROOT}/data/gradient_diversity/selection/diagnostics.json"
 SELECTED_SHA256="caf303c5d151fdaed2e21eebc257917f13660c589906e3da0e569ffdfd59b059"
 SOURCE_SHA256="de3350fdd00bc0410550098ea65179e2be873da99e4075f80de575fc17670597"
+MANIFEST_SHA256="a1a45382ee577e24f9b455386f9f3adcab210ff40a83ea760c2110fb96f8f90a"
+SELECTED_IDS_SHA256="a78c04cff10c148f45bf9c828e07cc9cf01398b48efeb707253273af359a037e"
+DIAGNOSTICS_SHA256="d2105179f2ce5a7c796aef07136bbc1dce79b07b5bc2de4d2319b18b47ea761f"
 
 BASELINE_EXPERIMENT="opd-n4-easy4of4-concise20-noneasynormal50-purerkl-step50"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-opd-n4-graddiv12800-easy4of4-concise20-noneasynormal50-purerkl-step50}"
@@ -152,23 +157,157 @@ if [[ "${ABLATION_DRY_RUN:-0}" == "1" ]]; then
   exit 0
 fi
 
+if [[ "${ABLATION_PREFLIGHT_ONLY:-0}" != "1" ]]; then
+  LAUNCH_LOCK_PATH="/tmp/fire-opd-${UID}-${EXPERIMENT_NAME}.launch.lock"
+  exec 9>"${LAUNCH_LOCK_PATH}" || die "cannot open training launch lock: ${LAUNCH_LOCK_PATH}"
+  flock -n 9 || die "training launch lock is already held: ${LAUNCH_LOCK_PATH}"
+fi
+
 [[ -x "${PYTHON_BIN}" ]] || die "PYTHON_BIN must be executable: ${PYTHON_BIN}"
-artifact_report="$(
+[[ -x "${REPORT_PARSER_PYTHON}" ]] || \
+  die "pinned report parser must be executable: ${REPORT_PARSER_PYTHON}"
+artifact_report_path="${tmpdir}/artifact-report.json"
+if ! (
   cd "${REPO_DIR}" || die "cannot change directory to REPO_DIR: ${REPO_DIR}"
   "${PYTHON_BIN}" -m math_eval.validate_gradient_diverse_training_data \
     --selected-parquet "${SELECTED_DATA}" \
     --source-parquet "${SOURCE_DATA}" \
     --selection-manifest "${SELECTION_MANIFEST}" \
     --selected-ids "${SELECTED_IDS}" \
+    --diagnostics "${DIAGNOSTICS}" \
     --tokenizer-path "${STUDENT_MODEL}" \
     --expected-selected-sha256 "${SELECTED_SHA256}" \
     --expected-source-sha256 "${SOURCE_SHA256}" \
+    --expected-manifest-sha256 "${MANIFEST_SHA256}" \
+    --expected-selected-ids-sha256 "${SELECTED_IDS_SHA256}" \
+    --expected-diagnostics-sha256 "${DIAGNOSTICS_SHA256}" \
     --expected-rows 12800 \
     --expected-source-rows 57046 \
     --expected-eligible-rows 57045 \
     --max-prompt-tokens 2048 \
-    --checkpoint-dir "${CHECKPOINT_DIR}"
-)"
+    --checkpoint-dir "${CHECKPOINT_DIR}" \
+    >"${artifact_report_path}"
+); then
+  die "artifact validator failed"
+fi
+
+if ! artifact_report="$(
+  "${REPORT_PARSER_PYTHON}" - \
+    "${artifact_report_path}" \
+    "${SELECTED_DATA}" "${SELECTED_SHA256}" \
+    "${SOURCE_DATA}" "${SOURCE_SHA256}" \
+    "${SELECTION_MANIFEST}" "${MANIFEST_SHA256}" \
+    "${SELECTED_IDS}" "${SELECTED_IDS_SHA256}" \
+    "${DIAGNOSTICS}" "${DIAGNOSTICS_SHA256}" <<'PY'
+import json
+import math
+from pathlib import Path
+import sys
+
+
+def reject_constant(value):
+    raise ValueError(f"non-standard JSON constant: {value}")
+
+
+def strict_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON field: {key}")
+        result[key] = value
+    return result
+
+
+(
+    report_path,
+    selected_path,
+    selected_hash,
+    source_path,
+    source_hash,
+    manifest_path,
+    manifest_hash,
+    selected_ids_path,
+    selected_ids_hash,
+    diagnostics_path,
+    diagnostics_hash,
+) = sys.argv[1:]
+
+try:
+    raw_report = Path(report_path).read_text(encoding="utf-8")
+    report = json.loads(
+        raw_report,
+        parse_constant=reject_constant,
+        object_pairs_hook=strict_object,
+    )
+    if type(report) is not dict:
+        raise ValueError("top-level value must be an object")
+
+    expected = {
+        "selected_parquet": selected_path,
+        "selected_sha256": selected_hash,
+        "selected_rows": 12800,
+        "source_parquet": source_path,
+        "source_sha256": source_hash,
+        "source_rows": 57046,
+        "selection_manifest": manifest_path,
+        "selection_manifest_sha256": manifest_hash,
+        "selected_ids_path": selected_ids_path,
+        "selected_ids_sha256": selected_ids_hash,
+        "selected_ids": 12800,
+        "diagnostics": diagnostics_path,
+        "diagnostics_sha256": diagnostics_hash,
+        "eligible_rows": 57045,
+        "unique_prompts": 12800,
+        "schema_equal": True,
+        "source_rows_equal": True,
+        "max_prompt_tokens": 668,
+        "prompt_token_limit": 2048,
+        "prompts_over_limit": 0,
+    }
+    statistic_keys = {
+        "min_prompt_tokens",
+        "median_prompt_tokens",
+        "p95_prompt_tokens",
+        "p99_prompt_tokens",
+    }
+    expected_keys = set(expected) | statistic_keys
+    if set(report) != expected_keys:
+        missing = sorted(expected_keys - set(report))
+        unexpected = sorted(set(report) - expected_keys)
+        raise ValueError(
+            f"field mismatch: missing={missing}, unexpected={unexpected}"
+        )
+    for key, expected_value in expected.items():
+        actual = report[key]
+        if type(actual) is not type(expected_value) or actual != expected_value:
+            raise ValueError(
+                f"{key} mismatch: expected {expected_value!r}, got {actual!r}"
+            )
+    for key in statistic_keys:
+        value = report[key]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise ValueError(f"{key} must be a finite non-negative number")
+    if not (
+        report["min_prompt_tokens"]
+        <= report["median_prompt_tokens"]
+        <= report["p95_prompt_tokens"]
+        <= report["p99_prompt_tokens"]
+        <= report["max_prompt_tokens"]
+    ):
+        raise ValueError("prompt token statistics are not monotonically ordered")
+except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+    raise SystemExit(f"validator report validation failed: {error}") from error
+
+print(json.dumps(report, allow_nan=False, separators=(",", ":"), sort_keys=True))
+PY
+)"; then
+  die "validator report validation failed"
+fi
 
 GIT_HEAD="$(git -C "${REPO_DIR}" rev-parse HEAD)"
 GIT_DIFF_SHA256="$(git -C "${REPO_DIR}" diff --no-ext-diff --binary HEAD -- | sha256sum | awk '{print $1}')"

@@ -67,6 +67,7 @@ def _artifacts(tmp_path: Path, source_rows: list[dict], selected_indices: list[i
     source_path = tmp_path / "source.parquet"
     selected_path = tmp_path / "selected.parquet"
     ids_path = tmp_path / "selected_ids.jsonl"
+    diagnostics_path = tmp_path / "diagnostics.json"
     manifest_path = tmp_path / "manifest.json"
     source = pa.Table.from_pylist(source_rows, schema=SCHEMA)
     selected = source.take(pa.array(selected_indices, type=pa.int64()))
@@ -86,6 +87,11 @@ def _artifacts(tmp_path: Path, source_rows: list[dict], selected_indices: list[i
         encoding="utf-8",
     )
     id_sequence = "".join(row["id"] + "\n" for row in id_rows).encode("utf-8")
+    diagnostics = {
+        "fixture": "gradient-diverse-ablation",
+        "selected_row_count": len(selected_indices),
+    }
+    diagnostics_path.write_text(json.dumps(diagnostics) + "\n", encoding="utf-8")
     manifest = {
         "manifest_version": 1,
         "source_parquet": str(source_path.resolve()),
@@ -98,13 +104,23 @@ def _artifacts(tmp_path: Path, source_rows: list[dict], selected_indices: list[i
         "selected_ids": str(ids_path.resolve()),
         "selected_ids_sha256": _sha256(ids_path),
         "selected_id_sequence_sha256": hashlib.sha256(id_sequence).hexdigest(),
+        "diagnostics": str(diagnostics_path.resolve()),
+        "diagnostics_sha256": _sha256(diagnostics_path),
+        "diagnostic_results": diagnostics,
     }
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-    return source_path, selected_path, ids_path, manifest_path, manifest
+    return (
+        source_path,
+        selected_path,
+        ids_path,
+        diagnostics_path,
+        manifest_path,
+        manifest,
+    )
 
 
 def test_validate_training_artifact_accepts_exact_source_subset(tmp_path: Path):
-    source, selected, ids, manifest_path, manifest = _artifacts(
+    source, selected, ids, diagnostics, manifest_path, manifest = _artifacts(
         tmp_path, [_row(0), _row(1), _row(2)], [2, 0]
     )
     tokenizer = FakeTokenizer()
@@ -114,9 +130,13 @@ def test_validate_training_artifact_accepts_exact_source_subset(tmp_path: Path):
         source,
         manifest_path,
         ids,
+        diagnostics,
         tokenizer,
         expected_selected_sha256=manifest["output_parquet_sha256"],
         expected_source_sha256=manifest["source_sha256"],
+        expected_manifest_sha256=_sha256(manifest_path),
+        expected_selected_ids_sha256=_sha256(ids),
+        expected_diagnostics_sha256=_sha256(diagnostics),
         expected_rows=2,
         expected_source_rows=3,
         expected_eligible_rows=3,
@@ -129,6 +149,12 @@ def test_validate_training_artifact_accepts_exact_source_subset(tmp_path: Path):
     assert report["prompts_over_limit"] == 0
     assert report["schema_equal"] is True
     assert report["source_rows_equal"] is True
+    assert report["selection_manifest"] == str(manifest_path.resolve())
+    assert report["selection_manifest_sha256"] == _sha256(manifest_path)
+    assert report["selected_ids_path"] == str(ids.resolve())
+    assert report["selected_ids_sha256"] == _sha256(ids)
+    assert report["diagnostics"] == str(diagnostics.resolve())
+    assert report["diagnostics_sha256"] == _sha256(diagnostics)
     assert tokenizer.calls == [
         {
             "tokenize": True,
@@ -141,10 +167,13 @@ def test_validate_training_artifact_accepts_exact_source_subset(tmp_path: Path):
 
 
 def _validate_fixture(paths, manifest, tokenizer, **overrides):
-    source, selected, ids, manifest_path = paths
+    source, selected, ids, diagnostics, manifest_path = paths
     arguments = {
         "expected_selected_sha256": manifest["output_parquet_sha256"],
         "expected_source_sha256": manifest["source_sha256"],
+        "expected_manifest_sha256": _sha256(manifest_path),
+        "expected_selected_ids_sha256": _sha256(ids),
+        "expected_diagnostics_sha256": _sha256(diagnostics),
         "expected_rows": manifest["selected_row_count"],
         "expected_source_rows": manifest["source_row_count"],
         "expected_eligible_rows": manifest["eligible_row_count"],
@@ -152,17 +181,17 @@ def _validate_fixture(paths, manifest, tokenizer, **overrides):
     }
     arguments.update(overrides)
     return validation.validate_training_artifact(
-        selected, source, manifest_path, ids, tokenizer, **arguments
+        selected, source, manifest_path, ids, diagnostics, tokenizer, **arguments
     )
 
 
 def test_validator_rejects_pinned_selected_hash_mismatch(tmp_path: Path):
-    source, selected, ids, manifest_path, manifest = _artifacts(
+    source, selected, ids, diagnostics, manifest_path, manifest = _artifacts(
         tmp_path, [_row(0), _row(1)], [0]
     )
     with pytest.raises(ValueError, match="selected parquet SHA-256 mismatch"):
         _validate_fixture(
-            (source, selected, ids, manifest_path),
+            (source, selected, ids, diagnostics, manifest_path),
             manifest,
             FakeTokenizer(),
             expected_selected_sha256="0" * 64,
@@ -173,27 +202,31 @@ def test_validator_rejects_duplicate_exact_prompts(tmp_path: Path):
     duplicate = _row(0)
     second = _row(1)
     second["prompt"] = duplicate["prompt"]
-    source, selected, ids, manifest_path, manifest = _artifacts(
+    source, selected, ids, diagnostics, manifest_path, manifest = _artifacts(
         tmp_path, [duplicate, second], [0, 1]
     )
     with pytest.raises(ValueError, match="exact prompts must be unique"):
         _validate_fixture(
-            (source, selected, ids, manifest_path), manifest, FakeTokenizer()
+            (source, selected, ids, diagnostics, manifest_path),
+            manifest,
+            FakeTokenizer(),
         )
 
 
 def test_validator_rejects_prompt_over_training_limit(tmp_path: Path):
-    source, selected, ids, manifest_path, manifest = _artifacts(
+    source, selected, ids, diagnostics, manifest_path, manifest = _artifacts(
         tmp_path, [_row(0, token_count=11)], [0]
     )
     with pytest.raises(ValueError, match="prompt token limit exceeded"):
         _validate_fixture(
-            (source, selected, ids, manifest_path), manifest, FakeTokenizer()
+            (source, selected, ids, diagnostics, manifest_path),
+            manifest,
+            FakeTokenizer(),
         )
 
 
 def test_validator_rejects_selected_row_not_named_by_source_index(tmp_path: Path):
-    source, selected, ids, manifest_path, manifest = _artifacts(
+    source, selected, ids, diagnostics, manifest_path, manifest = _artifacts(
         tmp_path, [_row(0), _row(1)], [0]
     )
     pq.write_table(pa.Table.from_pylist([_row(1)], schema=SCHEMA), selected)
@@ -201,19 +234,94 @@ def test_validator_rejects_selected_row_not_named_by_source_index(tmp_path: Path
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(ValueError, match="selected parquet does not equal source.take"):
         _validate_fixture(
-            (source, selected, ids, manifest_path), manifest, FakeTokenizer()
+            (source, selected, ids, diagnostics, manifest_path),
+            manifest,
+            FakeTokenizer(),
         )
 
 
 def test_validator_rejects_manifest_selected_id_hash_mismatch(tmp_path: Path):
-    source, selected, ids, manifest_path, manifest = _artifacts(
+    source, selected, ids, diagnostics, manifest_path, manifest = _artifacts(
         tmp_path, [_row(0), _row(1)], [0]
     )
     manifest["selected_ids_sha256"] = "f" * 64
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(ValueError, match="selected IDs SHA-256 mismatch"):
         _validate_fixture(
-            (source, selected, ids, manifest_path), manifest, FakeTokenizer()
+            (source, selected, ids, diagnostics, manifest_path),
+            manifest,
+            FakeTokenizer(),
+        )
+
+
+def test_validator_rejects_independently_pinned_manifest_hash_mismatch(
+    tmp_path: Path,
+):
+    source, selected, ids, diagnostics, manifest_path, manifest = _artifacts(
+        tmp_path, [_row(0), _row(1)], [0]
+    )
+
+    with pytest.raises(ValueError, match="selection manifest SHA-256 mismatch"):
+        _validate_fixture(
+            (source, selected, ids, diagnostics, manifest_path),
+            manifest,
+            FakeTokenizer(),
+            expected_manifest_sha256="0" * 64,
+        )
+
+
+def test_validator_rejects_independently_pinned_selected_ids_hash_mismatch(
+    tmp_path: Path,
+):
+    source, selected, ids, diagnostics, manifest_path, manifest = _artifacts(
+        tmp_path, [_row(0), _row(1)], [0]
+    )
+
+    with pytest.raises(ValueError, match="selected IDs SHA-256 mismatch"):
+        _validate_fixture(
+            (source, selected, ids, diagnostics, manifest_path),
+            manifest,
+            FakeTokenizer(),
+            expected_selected_ids_sha256="0" * 64,
+        )
+
+
+def test_validator_rejects_independently_pinned_diagnostics_hash_mismatch(
+    tmp_path: Path,
+):
+    source, selected, ids, diagnostics, manifest_path, manifest = _artifacts(
+        tmp_path, [_row(0), _row(1)], [0]
+    )
+
+    with pytest.raises(ValueError, match="diagnostics SHA-256 mismatch"):
+        _validate_fixture(
+            (source, selected, ids, diagnostics, manifest_path),
+            manifest,
+            FakeTokenizer(),
+            expected_diagnostics_sha256="0" * 64,
+        )
+
+
+def test_validator_rejects_self_consistent_fabricated_stable_id(tmp_path: Path):
+    source, selected, ids, diagnostics, manifest_path, manifest = _artifacts(
+        tmp_path, [_row(0), _row(1)], [0]
+    )
+    id_rows = [json.loads(line) for line in ids.read_text(encoding="utf-8").splitlines()]
+    id_rows[0]["id"] = "fabricated-but-self-consistent"
+    ids.write_text(
+        "".join(json.dumps(row, separators=(",", ":")) + "\n" for row in id_rows),
+        encoding="utf-8",
+    )
+    manifest["selected_ids_sha256"] = _sha256(ids)
+    id_sequence = "".join(row["id"] + "\n" for row in id_rows).encode("utf-8")
+    manifest["selected_id_sequence_sha256"] = hashlib.sha256(id_sequence).hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="stable ID mismatch"):
+        _validate_fixture(
+            (source, selected, ids, diagnostics, manifest_path),
+            manifest,
+            FakeTokenizer(),
         )
 
 
