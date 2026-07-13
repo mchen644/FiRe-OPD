@@ -137,10 +137,14 @@ def validate_training_artifact(
     source_parquet: Path,
     selection_manifest: Path,
     selected_ids_path: Path,
+    diagnostics_path: Path,
     tokenizer: object,
     *,
     expected_selected_sha256: str,
     expected_source_sha256: str,
+    expected_manifest_sha256: str,
+    expected_selected_ids_sha256: str,
+    expected_diagnostics_sha256: str,
     expected_rows: int,
     expected_source_rows: int,
     expected_eligible_rows: int,
@@ -152,6 +156,7 @@ def validate_training_artifact(
         "source parquet": source_parquet,
         "selection manifest": selection_manifest,
         "selected IDs": selected_ids_path,
+        "diagnostics": diagnostics_path,
     }
     for label, path in artifact_paths.items():
         if not path.is_file():
@@ -159,6 +164,9 @@ def validate_training_artifact(
 
     selected_sha256 = sha256_file(selected_parquet)
     source_sha256 = sha256_file(source_parquet)
+    manifest_sha256 = sha256_file(selection_manifest)
+    selected_ids_sha256 = sha256_file(selected_ids_path)
+    diagnostics_sha256 = sha256_file(diagnostics_path)
     if selected_sha256 != expected_selected_sha256:
         raise ValueError(
             "selected parquet SHA-256 mismatch: "
@@ -168,6 +176,21 @@ def validate_training_artifact(
         raise ValueError(
             "source parquet SHA-256 mismatch: "
             f"expected {expected_source_sha256}, got {source_sha256}"
+        )
+    if manifest_sha256 != expected_manifest_sha256:
+        raise ValueError(
+            "selection manifest SHA-256 mismatch: "
+            f"expected {expected_manifest_sha256}, got {manifest_sha256}"
+        )
+    if selected_ids_sha256 != expected_selected_ids_sha256:
+        raise ValueError(
+            "selected IDs SHA-256 mismatch: "
+            f"expected {expected_selected_ids_sha256}, got {selected_ids_sha256}"
+        )
+    if diagnostics_sha256 != expected_diagnostics_sha256:
+        raise ValueError(
+            "diagnostics SHA-256 mismatch: "
+            f"expected {expected_diagnostics_sha256}, got {diagnostics_sha256}"
         )
 
     manifest = _load_manifest(selection_manifest)
@@ -183,6 +206,7 @@ def validate_training_artifact(
         "output_parquet": selected_parquet,
         "source_parquet": source_parquet,
         "selected_ids": selected_ids_path,
+        "diagnostics": diagnostics_path,
     }
     for key, path in expected_paths.items():
         expected_path = str(path.resolve())
@@ -196,9 +220,10 @@ def validate_training_artifact(
     _require_manifest_count(manifest, "source_row_count", expected_source_rows)
     _require_manifest_count(manifest, "eligible_row_count", expected_eligible_rows)
 
-    selected_ids_sha256 = sha256_file(selected_ids_path)
     if manifest.get("selected_ids_sha256") != selected_ids_sha256:
-        raise ValueError("selected IDs SHA-256 mismatch")
+        raise ValueError("manifest selected IDs SHA-256 mismatch")
+    if manifest.get("diagnostics_sha256") != diagnostics_sha256:
+        raise ValueError("manifest diagnostics SHA-256 mismatch")
 
     id_rows = _load_selected_ids(selected_ids_path)
     if len(id_rows) != expected_rows:
@@ -221,6 +246,12 @@ def validate_training_artifact(
         if source_index < 0 or source_index >= expected_source_rows:
             raise ValueError(
                 f"selected ID row {row_index} source_row_index is out of range"
+            )
+        expected_id = f"deepmath-level6-{source_index:06d}"
+        if selected_id != expected_id:
+            raise ValueError(
+                f"selected ID row {row_index} stable ID mismatch: "
+                f"expected {expected_id!r}, got {selected_id!r}"
             )
         eligible_position = row.get("eligible_position")
         if isinstance(eligible_position, bool) or not isinstance(eligible_position, int):
@@ -319,6 +350,12 @@ def validate_training_artifact(
         "source_parquet": str(source_parquet.resolve()),
         "source_sha256": source_sha256,
         "source_rows": source.num_rows,
+        "selection_manifest": str(selection_manifest.resolve()),
+        "selection_manifest_sha256": manifest_sha256,
+        "selected_ids_path": str(selected_ids_path.resolve()),
+        "selected_ids_sha256": selected_ids_sha256,
+        "diagnostics": str(diagnostics_path.resolve()),
+        "diagnostics_sha256": diagnostics_sha256,
         "eligible_rows": manifest["eligible_row_count"],
         "selected_ids": len(id_rows),
         "unique_prompts": len(set(serialized_prompts)),
@@ -340,9 +377,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-parquet", type=Path, required=True)
     parser.add_argument("--selection-manifest", type=Path, required=True)
     parser.add_argument("--selected-ids", type=Path, required=True)
+    parser.add_argument("--diagnostics", type=Path, required=True)
     parser.add_argument("--tokenizer-path", required=True)
     parser.add_argument("--expected-selected-sha256", required=True)
     parser.add_argument("--expected-source-sha256", required=True)
+    parser.add_argument("--expected-manifest-sha256", required=True)
+    parser.add_argument("--expected-selected-ids-sha256", required=True)
+    parser.add_argument("--expected-diagnostics-sha256", required=True)
     parser.add_argument("--expected-rows", type=int, required=True)
     parser.add_argument("--expected-source-rows", type=int, required=True)
     parser.add_argument("--expected-eligible-rows", type=int, required=True)
@@ -366,9 +407,13 @@ def main() -> None:
         args.source_parquet,
         args.selection_manifest,
         args.selected_ids,
+        args.diagnostics,
         tokenizer,
         expected_selected_sha256=args.expected_selected_sha256,
         expected_source_sha256=args.expected_source_sha256,
+        expected_manifest_sha256=args.expected_manifest_sha256,
+        expected_selected_ids_sha256=args.expected_selected_ids_sha256,
+        expected_diagnostics_sha256=args.expected_diagnostics_sha256,
         expected_rows=args.expected_rows,
         expected_source_rows=args.expected_source_rows,
         expected_eligible_rows=args.expected_eligible_rows,
