@@ -209,7 +209,10 @@ def test_ablation_delegates_to_existing_group_success_launcher():
 
 
 def test_ablation_preflight_rejects_nonproduction_repo_before_validator(tmp_path):
-    completed, invocation_record = _run_preflight(tmp_path, REPO_DIR=str(REPO_DIR))
+    nonproduction_repo = tmp_path / "not-production-repo"
+    completed, invocation_record = _run_preflight(
+        tmp_path, REPO_DIR=str(nonproduction_repo)
+    )
 
     assert completed.returncode == 2
     assert "REPO_DIR must remain pinned to /home/mchen/FiRe-OPD" in completed.stderr
