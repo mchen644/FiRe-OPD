@@ -50,6 +50,9 @@ MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-2048}"
 require_pinned_value PRODUCTION_ROOT "${PRODUCTION_ROOT}" /home/mchen/FiRe-OPD
 if [[ "${ABLATION_DRY_RUN:-0}" != "1" ]]; then
   require_pinned_value REPO_DIR "${REPO_DIR}" "${PRODUCTION_ROOT}"
+  if [[ -n "${GROUP_SUCCESS_DRY_RUN:-}" && "${GROUP_SUCCESS_DRY_RUN:-0}" != "0" ]]; then
+    die "GROUP_SUCCESS_DRY_RUN must be unset or 0 outside ABLATION_DRY_RUN=1 (got ${GROUP_SUCCESS_DRY_RUN})"
+  fi
 fi
 require_pinned_value TRAIN_DATA "${TRAIN_DATA}" "${SELECTED_DATA}"
 require_pinned_value EXPERIMENT_NAME "${EXPERIMENT_NAME}" \
@@ -151,6 +154,7 @@ fi
 
 [[ -x "${PYTHON_BIN}" ]] || die "PYTHON_BIN must be executable: ${PYTHON_BIN}"
 artifact_report="$(
+  cd "${REPO_DIR}" || die "cannot change directory to REPO_DIR: ${REPO_DIR}"
   "${PYTHON_BIN}" -m math_eval.validate_gradient_diverse_training_data \
     --selected-parquet "${SELECTED_DATA}" \
     --source-parquet "${SOURCE_DATA}" \
@@ -199,4 +203,5 @@ print_provenance
 rm -rf "${tmpdir}"
 trap - EXIT
 cd "${REPO_DIR}"
+unset GROUP_SUCCESS_DRY_RUN
 exec bash "${GROUP_LAUNCHER}"
