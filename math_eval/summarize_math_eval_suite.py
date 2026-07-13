@@ -41,6 +41,10 @@ def _require_positive_sample_count(expected_samples: int) -> None:
         raise ValueError("expected_samples must be a positive integer")
 
 
+def _reject_non_standard_json_constant(value: str) -> None:
+    raise ValueError(f"non-standard JSON constant: {value}")
+
+
 def _load_eval_rows(path: Path) -> list[dict]:
     if not path.is_file():
         raise ValueError(f"evaluation file is missing or not a regular file: {path}")
@@ -54,10 +58,15 @@ def _load_eval_rows(path: Path) -> list[dict]:
         if not line.strip():
             continue
         try:
-            row = json.loads(line)
-        except json.JSONDecodeError as error:
+            row = json.loads(
+                line, parse_constant=_reject_non_standard_json_constant
+            )
+        except (json.JSONDecodeError, ValueError) as error:
+            reason = (
+                error.msg if isinstance(error, json.JSONDecodeError) else str(error)
+            )
             raise ValueError(
-                f"malformed JSON in {path} on line {line_number}: {error.msg}"
+                f"malformed JSON in {path} on line {line_number}: {reason}"
             ) from error
         if not isinstance(row, dict):
             raise ValueError(
@@ -234,7 +243,7 @@ def _parse_baselines(values: Sequence[str]) -> dict[str, str]:
 
 
 def _write_json_atomic(path: Path, payload: str) -> None:
-    if path.exists() and not path.is_file():
+    if (path.exists() or path.is_symlink()) and not path.is_file():
         raise ValueError(f"--output-json must be a file path: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Path | None = None
@@ -275,7 +284,9 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     baseline_models = _parse_baselines(args.baseline)
-    if args.output_json.exists() and not args.output_json.is_file():
+    if (
+        args.output_json.exists() or args.output_json.is_symlink()
+    ) and not args.output_json.is_file():
         raise ValueError(f"--output-json must be a file path: {args.output_json}")
 
     candidate = summarize_suite(
