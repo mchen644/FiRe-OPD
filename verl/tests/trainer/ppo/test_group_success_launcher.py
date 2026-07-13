@@ -43,6 +43,41 @@ def test_group_success_launcher_dry_run_prints_clean_production_contract():
         assert value in completed.stdout
 
 
+def test_group_success_launcher_dry_run_prints_inherited_scientific_environment():
+    completed = _run_launcher(
+        TRAIN_DATA="/tmp/selected.parquet",
+        CHECKPOINT_DIR="/tmp/checkpoints/run",
+        STUDENT_MODEL="/tmp/models/student",
+        TEACHER_MODEL="/tmp/models/teacher",
+        MAX_PROMPT_LENGTH="2048",
+        TEACHER_PROMPT_KEY="teacher_prompt",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "TRAIN_DATA=/tmp/selected.parquet\n" in completed.stdout
+    assert "CHECKPOINT_DIR=/tmp/checkpoints/run\n" in completed.stdout
+    assert "STUDENT_MODEL=/tmp/models/student\n" in completed.stdout
+    assert "TEACHER_MODEL=/tmp/models/teacher\n" in completed.stdout
+    assert "MAX_PROMPT_LENGTH=2048\n" in completed.stdout
+    assert "TEACHER_PROMPT_KEY=teacher_prompt\n" in completed.stdout
+    assert "N_GPUS_PER_NODE=4\n" in completed.stdout
+    assert "ROLLOUT_TP_SIZE=4\n" in completed.stdout
+
+
+def test_group_success_launcher_dry_run_reports_validation_data_without_changing_train_data():
+    completed = _run_launcher(
+        DATA_ROOT="/tmp/g-opd",
+        TRAIN_DATA="/tmp/coreset.parquet",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "TRAIN_DATA=/tmp/coreset.parquet\n" in completed.stdout
+    assert (
+        "VAL_DATA=['/tmp/g-opd/AIME2024/test.parquet', "
+        "'/tmp/g-opd/AIME2025/test.parquet']\n"
+    ) in completed.stdout
+
+
 def test_group_success_launcher_rejects_inconsistent_total_trajectory_count():
     completed = _run_launcher(PROMPT_BATCH_SIZE="255")
 

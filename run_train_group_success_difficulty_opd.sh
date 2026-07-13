@@ -46,6 +46,11 @@ export TALE_ROLLOUT_MAX_BUDGET=null
 export TALE_TEACHER_PROMPT_STYLE=normal
 export DATA_ROOT="${DATA_ROOT:-${REPO_DIR}/data/g-opd}"
 export TRAIN_DATA="${TRAIN_DATA:-${DATA_ROOT}/DeepMath-103K/train_filtered_level6.parquet}"
+export VAL_DATA="${VAL_DATA:-['${DATA_ROOT}/AIME2024/test.parquet', '${DATA_ROOT}/AIME2025/test.parquet']}"
+export STUDENT_MODEL="${STUDENT_MODEL:-${REPO_DIR}/models/Qwen3-4B}"
+export TEACHER_MODEL="${TEACHER_MODEL:-${REPO_DIR}/models/Qwen3-30B-A3B-Instruct-2507}"
+export MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-2048}"
+export TEACHER_PROMPT_KEY="${TEACHER_PROMPT_KEY:-teacher_prompt}"
 export N_GPUS_PER_NODE="${N_GPUS_PER_NODE:-4}"
 export ROLLOUT_TP_SIZE="${ROLLOUT_TP_SIZE:-4}"
 export EXPERIMENT_NAME
@@ -100,6 +105,16 @@ if [[ "${GROUP_SUCCESS_DRY_RUN:-0}" == "1" ]]; then
   printf 'PPO_MINI_BATCH_SIZE=%s\n' "${PPO_MINI_BATCH_SIZE}"
   printf 'TOTAL_TRAJECTORIES=%s\n' "${TOTAL_TRAJECTORIES}"
   printf 'EXPERIMENT_NAME=%s\n' "${EXPERIMENT_NAME}"
+  printf 'DATA_ROOT=%s\n' "${DATA_ROOT}"
+  printf 'TRAIN_DATA=%s\n' "${TRAIN_DATA}"
+  printf 'VAL_DATA=%s\n' "${VAL_DATA}"
+  printf 'STUDENT_MODEL=%s\n' "${STUDENT_MODEL}"
+  printf 'TEACHER_MODEL=%s\n' "${TEACHER_MODEL}"
+  printf 'MAX_PROMPT_LENGTH=%s\n' "${MAX_PROMPT_LENGTH}"
+  printf 'TEACHER_PROMPT_KEY=%s\n' "${TEACHER_PROMPT_KEY}"
+  printf 'N_GPUS_PER_NODE=%s\n' "${N_GPUS_PER_NODE}"
+  printf 'ROLLOUT_TP_SIZE=%s\n' "${ROLLOUT_TP_SIZE}"
+  printf 'CHECKPOINT_DIR=%s\n' "${CHECKPOINT_DIR}"
   printf 'bash %q' "${BASE_LAUNCHER}"
   printf ' %q' "$@" "${fixed_args[@]}"
   printf '\n'
