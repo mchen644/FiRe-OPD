@@ -48,6 +48,20 @@ def test_summarize_eval_file_rejects_wrong_or_misaligned_sample_count(tmp_path: 
         summary.summarize_eval_file(misaligned, expected_samples=2)
 
 
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_summarize_eval_file_rejects_non_standard_json_constants(
+    tmp_path: Path, constant: str
+):
+    path = tmp_path / "non_standard.jsonl"
+    path.write_text(
+        f'{{"acc_list": [true], "response_lengths": [1], "unused": {constant}}}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="malformed JSON"):
+        summary.summarize_eval_file(path, expected_samples=1)
+
+
 def test_suite_macro_is_unweighted_and_delta_is_candidate_minus_baseline(tmp_path: Path):
     datasets = ("small", "large")
     candidate = "candidate"
@@ -73,3 +87,34 @@ def test_suite_macro_is_unweighted_and_delta_is_candidate_minus_baseline(tmp_pat
     assert candidate_summary["macro"]["pass_at_2"] == 1.0
     assert compared["deltas"]["group_success"]["pass_at_1"] == 0.5
     assert compared["deltas"]["group_success"]["mean_response_length"] == -3.0
+
+
+def test_atomic_writer_rejects_dangling_output_symlink(tmp_path: Path):
+    output_path = tmp_path / "report.json"
+    output_path.symlink_to(tmp_path / "missing-target.json")
+
+    with pytest.raises(ValueError, match="--output-json must be a file path"):
+        summary._write_json_atomic(output_path, "{}\n")
+
+    assert output_path.is_symlink()
+
+
+def test_main_rejects_dangling_output_symlink_before_reading_inputs(tmp_path: Path):
+    output_path = tmp_path / "report.json"
+    output_path.symlink_to(tmp_path / "missing-target.json")
+
+    with pytest.raises(ValueError, match="--output-json must be a file path"):
+        summary.main(
+            [
+                "--candidate",
+                "candidate",
+                "--output-root",
+                str(tmp_path / "missing-evaluations"),
+                "--expected-samples",
+                "1",
+                "--output-json",
+                str(output_path),
+            ]
+        )
+
+    assert output_path.is_symlink()
