@@ -218,6 +218,10 @@ class ReplayVector:
     opd_signal_rms: torch.Tensor
     verifier_correct_count: torch.Tensor | None = None
     verifier_total: torch.Tensor | None = None
+    prompt_token_count: int | None = None
+    completion_token_count: int | None = None
+    supervised_label_count: int | None = None
+    full_token_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1028,6 +1032,17 @@ def _validate_replay_vector(record: ReplayVector, representation: str) -> None:
         raise ValueError("replay vector count/length/RMS scalars are invalid")
     if (record.verifier_correct_count is None) != (record.verifier_total is None):
         raise ValueError("replay verifier tensors must be present together")
+    for count_field in (
+        "prompt_token_count",
+        "completion_token_count",
+        "supervised_label_count",
+        "full_token_count",
+    ):
+        count = getattr(record, count_field)
+        if count is not None and (
+            isinstance(count, bool) or not isinstance(count, int) or count <= 0
+        ):
+            raise ValueError(f"replay vector {count_field} must be positive")
     if record.verifier_total is not None and (
         float(record.verifier_total.item()) <= 0
         or float(record.verifier_correct_count.item()) < 0
@@ -1072,13 +1087,23 @@ def _chunk_payload(records: Sequence[ReplayVector]) -> tuple[dict[str, torch.Ten
             "stable_id": record.stable_id,
             "split": record.split,
             "representation": record.representation,
-            "engine_seed": record.engine_seed,
             "aggregation": record.aggregation,
             "source_capture_sha256": record.source_capture_sha256,
             "tensor_row": tensor_row,
         }
+        if record.representation in {"T", "P"}:
+            sidecar["engine_seed"] = record.engine_seed
         if record.rollout_slot is not None:
             sidecar["rollout_slot"] = record.rollout_slot
+        for count_field in (
+            "prompt_token_count",
+            "completion_token_count",
+            "supervised_label_count",
+            "full_token_count",
+        ):
+            count = getattr(record, count_field)
+            if count is not None:
+                sidecar[count_field] = count
         sidecars.append(sidecar)
     return tensors, b"".join(canonical_json_bytes(row) for row in sidecars)
 

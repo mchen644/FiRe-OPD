@@ -77,6 +77,10 @@ _VECTOR_SIDECAR_OPTIONAL_FIELDS = frozenset(
         "rollout_slot",
         "aggregation",
         "source_capture_sha256",
+        "prompt_token_count",
+        "completion_token_count",
+        "supervised_label_count",
+        "full_token_count",
     }
 )
 _VECTOR_TENSOR_FIELDS = frozenset(
@@ -729,6 +733,14 @@ def _load_sidecar(path: Path, expected_rows: int) -> list[dict[str, object]]:
                 for integer_field in ("engine_seed", "rollout_slot"):
                     if integer_field in value:
                         _require_int(value[integer_field], integer_field)
+                for count_field in (
+                    "prompt_token_count",
+                    "completion_token_count",
+                    "supervised_label_count",
+                    "full_token_count",
+                ):
+                    if count_field in value:
+                        _require_int(value[count_field], count_field, minimum=1)
                 for text_field in ("split", "representation", "aggregation"):
                     if text_field in value and (
                         not isinstance(value[text_field], str) or not value[text_field]
