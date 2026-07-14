@@ -2,20 +2,32 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
+import pyarrow.parquet as pq
 import pytest
 
-from math_eval.opd_proxy_gradient_verify_artifacts import sha256_file
+from math_eval.opd_proxy_gradient_verify_artifacts import sha256_file, sha256_id_lines
 from math_eval.prepare_opd_proxy_gradient_verify import (
     OPD_SUFFIX,
+    SamplingContract,
     build_decontamination_audit,
     build_production_contract,
+    build_raw_opd_prompt,
     build_sampling_contract,
+    build_stage_rows,
     normalize_question,
+    preflight_stage_rows,
     publish_root_contract,
     stage_layout,
+    validate_materialized_revision,
+    validate_publication_provenance,
+    validate_stage_parent,
+    validate_tokenizer_compatibility,
+    write_stage_artifacts,
     ten_token_gram_hashes,
 )
 
@@ -303,3 +315,502 @@ def test_root_contract_publication_is_create_once_and_detects_changed_bytes(
     with pytest.raises(ValueError, match="existing artifact mismatch"):
         publish_root_contract(tmp_path, audit, contract)
     assert hits.read_text(encoding="utf-8") == "corrupted\n"
+
+
+class _FakeQwenTokenizer:
+    def __init__(
+        self,
+        vocab: dict[str, int] | None = None,
+        *,
+        eos: int = 2,
+        pad: int = 3,
+        raw_length: int = 5,
+        sft_extra: int = 3,
+        completion_length: int = 2,
+    ):
+        self._vocab = dict(vocab or {"a": 0, "b": 1, "<eos>": eos, "<pad>": pad})
+        self.eos_token_id = eos
+        self.pad_token_id = pad
+        self.raw_length = raw_length
+        self.sft_extra = sft_extra
+        self.completion_length = completion_length
+        self.embedding_call: dict[str, object] | None = None
+        self.chat_template = "fake-qwen-template"
+
+    def get_vocab(self):
+        return dict(self._vocab)
+
+    def __len__(self):
+        return max(self._vocab.values(), default=-1) + 1
+
+    def apply_chat_template(self, messages, **kwargs):
+        if len(messages) == 1 and kwargs.get("add_generation_prompt") is True:
+            self.embedding_call = dict(kwargs)
+            # IDs 3,4 are the assistant response marker. Any later IDs model
+            # Qwen3's disabled-thinking generation-only suffix.
+            return [0, 1, 2, 3, 4] + list(range(90, 90 + self.raw_length - 5))
+        if len(messages) == 2 and kwargs.get("add_generation_prompt") is False:
+            # A supplied assistant response starts immediately after the marker;
+            # it does not contain the generation-only disabled-thinking suffix.
+            return [0, 1, 2, 3, 4] + list(range(10, 10 + self.sft_extra))
+        raise AssertionError((messages, kwargs))
+
+    def __call__(self, text, **kwargs):
+        assert kwargs == {"add_special_tokens": False}
+        if text == "<|im_start|>assistant":
+            return {"input_ids": [3, 4]}
+        return {"input_ids": list(range(self.completion_length))}
+
+
+PREPARED_ROW = {
+    "id": "deepmath-level6-000000",
+    "prompt": "What is one plus one?",
+    "completion": "It is two.",
+    "source_row_index": 0,
+    "original_dataset_index": 9,
+    "topic": "Mathematics -> Arithmetic -> Other",
+    "difficulty": 1.0,
+    "reward_model": {"ground_truth": "2", "style": "rule"},
+}
+
+
+def test_tokenizer_compatibility_checks_every_id_and_special_token():
+    left = _FakeQwenTokenizer({"a": 0, "b": 1, "<eos>": 2, "<pad>": 3})
+    right = _FakeQwenTokenizer({"a": 0, "b": 4, "<eos>": 2, "<pad>": 3})
+    with pytest.raises(ValueError, match="token ID mismatch for 'b'"):
+        validate_tokenizer_compatibility(left, right, pair_name="proxy")
+
+    right = _FakeQwenTokenizer({"a": 0, "b": 1, "<eos>": 2, "<pad>": 3}, eos=5)
+    with pytest.raises(ValueError, match="EOS"):
+        validate_tokenizer_compatibility(left, right, pair_name="target")
+
+
+def test_stage_rows_use_raw_prompt_and_completion_only_sft_labels():
+    tokenizer = _FakeQwenTokenizer()
+    rows = preflight_stage_rows([PREPARED_ROW], tokenizer, tokenizer)
+    assert rows[0]["raw_opd_messages"] == [
+        {
+            "role": "user",
+            "content": PREPARED_ROW["prompt"].rstrip() + "\n" + OPD_SUFFIX,
+        }
+    ]
+    assert rows[0]["leaf_topic"] == "Other"
+    assert rows[0]["sft_supervised_label_count"] == 3
+    assert rows[0]["sft_full_token_count_0_6b"] == 8
+    assert tokenizer.embedding_call == {
+        "tokenize": True,
+        "add_generation_prompt": True,
+        "enable_thinking": False,
+    }
+
+
+def test_completion_mask_uses_response_marker_not_generation_only_thinking_suffix():
+    tokenizer = _FakeQwenTokenizer(raw_length=7, sft_extra=3)
+    rows = preflight_stage_rows(
+        [PREPARED_ROW], tokenizer, tokenizer, max_prompt_length=10
+    )
+    assert rows[0]["prompt_token_count_0_6b"] == 7
+    assert rows[0]["sft_full_token_count_0_6b"] == 8
+    assert rows[0]["sft_supervised_label_count"] == 3
+
+
+def test_raw_prompt_builder_appends_exactly_one_newline_and_one_suffix():
+    assert build_raw_opd_prompt("question   \n")[0]["content"] == (
+        "question\n" + OPD_SUFFIX
+    )
+
+
+@pytest.mark.parametrize(
+    ("tokenizer_4b", "tokenizer_small", "max_sft_tokens", "message"),
+    [
+        (_FakeQwenTokenizer(raw_length=7), _FakeQwenTokenizer(), 20, "4B prompt"),
+        (_FakeQwenTokenizer(), _FakeQwenTokenizer(raw_length=7), 20, "0.6B prompt"),
+        (
+            _FakeQwenTokenizer(),
+            _FakeQwenTokenizer(raw_length=5, sft_extra=6),
+            10,
+            "SFT context",
+        ),
+    ],
+)
+def test_stage_preflight_rejects_prompt_and_sft_overflow(
+    tokenizer_4b, tokenizer_small, max_sft_tokens, message
+):
+    with pytest.raises(ValueError, match=message):
+        preflight_stage_rows(
+            [PREPARED_ROW],
+            tokenizer_4b,
+            tokenizer_small,
+            max_prompt_length=6,
+            max_sft_tokens=max_sft_tokens,
+        )
+
+
+def test_stage_preflight_rejects_empty_topic_component_and_zero_supervised_labels():
+    malformed = {**PREPARED_ROW, "topic": "Mathematics ->  -> Other"}
+    with pytest.raises(ValueError, match="topic"):
+        preflight_stage_rows([malformed], _FakeQwenTokenizer(), _FakeQwenTokenizer())
+    with pytest.raises(ValueError, match="supervised label"):
+        preflight_stage_rows(
+            [PREPARED_ROW],
+            _FakeQwenTokenizer(),
+            _FakeQwenTokenizer(sft_extra=0),
+        )
+
+
+def _stage_contract() -> SamplingContract:
+    ids = tuple(f"q{index:04d}" for index in range(2048))
+    stage0 = ids[:24] + ids[768:776]
+    stage1_candidate = ids[:768]
+    stage1_held_out = ids[768:1024]
+    stage2_candidate = stage1_candidate + ids[1024:1792]
+    stage2_held_out = stage1_held_out + ids[1792:2048]
+    return SamplingContract(
+        first_2048_ids=ids,
+        first_2048_ids_sha256=sha256_id_lines(ids),
+        first_2048_eligible_positions=tuple(range(2048)),
+        first_2048_permutation_positions=tuple(range(2048)),
+        scanned_permutation_stop=2048,
+        skipped_before_cutoff=(),
+        stage_hashes={
+            "stage0_all": sha256_id_lines(stage0),
+            "stage1_candidate": sha256_id_lines(stage1_candidate),
+            "stage1_held_out": sha256_id_lines(stage1_held_out),
+            "stage1_all": sha256_id_lines(stage1_candidate + stage1_held_out),
+            "stage2_candidate": sha256_id_lines(stage2_candidate),
+            "stage2_held_out": sha256_id_lines(stage2_held_out),
+            "stage2_all": sha256_id_lines(stage2_candidate + stage2_held_out),
+        },
+    )
+
+
+def _eligible_and_source_rows():
+    eligible = []
+    source = []
+    for index in range(2048):
+        question = f"question {index}"
+        eligible.append(
+            {
+                "id": f"q{index:04d}",
+                "prompt": question,
+                "completion": f"solution {index}",
+                "source_row_index": index,
+                "original_dataset_index": index + 10_000,
+                "topic": "Mathematics -> Other",
+                "difficulty": 1.0,
+            }
+        )
+        source.append(
+            {
+                "prompt": [{"role": "user", "content": question + "\n" + OPD_SUFFIX}],
+                "reward_model": {"ground_truth": str(index), "style": "rule"},
+            }
+        )
+    return eligible, source
+
+
+def test_build_stage_rows_joins_source_by_stable_contract_and_rejects_collision():
+    eligible, source = _eligible_and_source_rows()
+    contract = _stage_contract()
+    rows = build_stage_rows(
+        stage=0,
+        eligible_rows=eligible,
+        source_rows=source,
+        sampling_contract=contract,
+        tokenizer_4b=_FakeQwenTokenizer(),
+        tokenizer_0_6b=_FakeQwenTokenizer(),
+    )
+    assert len(rows) == 32
+    assert [row["split"] for row in rows].count("candidate") == 24
+    assert [row["split"] for row in rows].count("held_out") == 8
+    assert rows[24]["clean_sample_position"] == 768
+    assert rows[0]["reward_model"] == source[0]["reward_model"]
+
+    with pytest.raises(ValueError, match="benchmark collision"):
+        build_stage_rows(
+            stage=0,
+            eligible_rows=eligible,
+            source_rows=source,
+            sampling_contract=contract,
+            tokenizer_4b=_FakeQwenTokenizer(),
+            tokenizer_0_6b=_FakeQwenTokenizer(),
+            rejected_ids={"q0000"},
+        )
+
+
+def test_build_stage_rows_rejects_source_prompt_drift():
+    eligible, source = _eligible_and_source_rows()
+    source[0]["prompt"][0]["content"] = "different\n" + OPD_SUFFIX
+    with pytest.raises(ValueError, match="source prompt"):
+        build_stage_rows(
+            stage=0,
+            eligible_rows=eligible,
+            source_rows=source,
+            sampling_contract=_stage_contract(),
+            tokenizer_4b=_FakeQwenTokenizer(),
+            tokenizer_0_6b=_FakeQwenTokenizer(),
+        )
+
+
+def _run_git(repository: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(repository), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def _git_repository(tmp_path: Path) -> tuple[Path, str]:
+    repository = tmp_path / "source"
+    repository.mkdir(parents=True)
+    _run_git(repository, "init", "--quiet")
+    _run_git(repository, "config", "user.email", "test@example.com")
+    _run_git(repository, "config", "user.name", "Test User")
+    (repository / "tracked.py").write_text("VALUE = 1\n", encoding="utf-8")
+    _run_git(repository, "add", ".")
+    _run_git(repository, "commit", "--quiet", "-m", "fixture")
+    return repository, _run_git(repository, "rev-parse", "HEAD")
+
+
+def test_publication_provenance_rejects_missing_dirty_wrong_and_bad_reference(
+    tmp_path: Path,
+):
+    source, commit = _git_repository(tmp_path)
+    reference = Path("/home/mchen/prismatic-synthesis-reference")
+    output = tmp_path / "output"
+    canonical = tmp_path / "canonical"
+
+    with pytest.raises(ValueError, match="required"):
+        validate_publication_provenance(
+            output_root=output,
+            repository_root=source,
+            expected_source_commit=None,
+            reference_repo=None,
+            disposable_preflight=False,
+            canonical_output_root=canonical,
+        )
+    with pytest.raises(ValueError, match="source commit"):
+        validate_publication_provenance(
+            output_root=output,
+            repository_root=source,
+            expected_source_commit="0" * 40,
+            reference_repo=reference,
+            disposable_preflight=False,
+            canonical_output_root=canonical,
+        )
+
+    (source / "untracked.py").write_text("dirty\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="clean"):
+        validate_publication_provenance(
+            output_root=output,
+            repository_root=source,
+            expected_source_commit=commit,
+            reference_repo=reference,
+            disposable_preflight=False,
+            canonical_output_root=canonical,
+        )
+    (source / "untracked.py").unlink()
+
+    bad_reference, _ = _git_repository(tmp_path / "bad")
+    with pytest.raises(ValueError, match="reference commit"):
+        validate_publication_provenance(
+            output_root=output,
+            repository_root=source,
+            expected_source_commit=commit,
+            reference_repo=bad_reference,
+            disposable_preflight=False,
+            canonical_output_root=canonical,
+        )
+
+
+def test_disposable_preflight_rejects_canonical_output_root(tmp_path: Path):
+    source, _ = _git_repository(tmp_path)
+    canonical = tmp_path / "canonical"
+    with pytest.raises(ValueError, match="disposable.*canonical"):
+        validate_publication_provenance(
+            output_root=canonical / "nested",
+            repository_root=source,
+            expected_source_commit=None,
+            reference_repo=None,
+            disposable_preflight=True,
+            canonical_output_root=canonical,
+        )
+
+
+def test_stage2_parent_requires_exact_complete_report_hash(tmp_path: Path):
+    report = tmp_path / "report.json"
+    report.write_text('{"classification":"pass"}\n', encoding="utf-8")
+    digest = sha256_file(report)
+    assert validate_stage_parent(2, report, digest)["sha256"] == digest
+    with pytest.raises(ValueError, match="parent report hash"):
+        validate_stage_parent(2, report, "0" * 64)
+    with pytest.raises(ValueError, match="requires.*parent report"):
+        validate_stage_parent(2, None, None)
+    with pytest.raises(ValueError, match="not accept"):
+        validate_stage_parent(1, report, digest)
+
+
+def test_stage_artifacts_write_manifest_and_target_proxy_capture_parquets(
+    tmp_path: Path,
+):
+    eligible, source = _eligible_and_source_rows()
+    contract = _stage_contract()
+    rows = build_stage_rows(
+        stage=0,
+        eligible_rows=eligible,
+        source_rows=source,
+        sampling_contract=contract,
+        tokenizer_4b=_FakeQwenTokenizer(),
+        tokenizer_0_6b=_FakeQwenTokenizer(),
+    )
+    manifest = write_stage_artifacts(
+        output_root=tmp_path,
+        stage=0,
+        rows=rows,
+        sampling_contract=contract,
+        provenance={"canonical": False, "mode": "disposable_preflight"},
+    )
+    stage_dir = tmp_path / "stage_0"
+    target = pq.read_table(stage_dir / "capture_target.parquet").to_pylist()
+    proxy = pq.read_table(stage_dir / "capture_proxy.parquet").to_pylist()
+    assert len(target) == 32
+    assert len(proxy) == 24
+    assert target[0]["opd_verify_stable_id"] == "q0000"
+    assert target[0]["opd_verify_split"] == "candidate"
+    assert target[0]["extra_info"]["index"] == 10_000
+    assert manifest["candidate_count"] == 24
+    assert manifest["held_out_count"] == 8
+    assert manifest["selected_size"] == 5
+    assert json.loads((stage_dir / "manifest.json").read_text()) == manifest
+
+    # Matching create-once publication validates; changed rows cannot overwrite it.
+    assert (
+        write_stage_artifacts(
+            output_root=tmp_path,
+            stage=0,
+            rows=rows,
+            sampling_contract=contract,
+            provenance={"canonical": False, "mode": "disposable_preflight"},
+        )
+        == manifest
+    )
+    changed = [dict(row) for row in rows]
+    changed[0] = {**changed[0], "difficulty": 9.0}
+    with pytest.raises(
+        ValueError, match="existing artifact mismatch|manifest mismatch"
+    ):
+        write_stage_artifacts(
+            output_root=tmp_path,
+            stage=0,
+            rows=changed,
+            sampling_contract=contract,
+            provenance={"canonical": False, "mode": "disposable_preflight"},
+        )
+
+
+def test_stage_artifacts_reject_a_wrong_frozen_stage_hash(tmp_path: Path):
+    eligible, source = _eligible_and_source_rows()
+    contract = _stage_contract()
+    rows = build_stage_rows(
+        stage=0,
+        eligible_rows=eligible,
+        source_rows=source,
+        sampling_contract=contract,
+        tokenizer_4b=_FakeQwenTokenizer(),
+        tokenizer_0_6b=_FakeQwenTokenizer(),
+    )
+    bad_contract = replace(
+        contract,
+        stage_hashes={**contract.stage_hashes, "stage0_all": "0" * 64},
+    )
+    with pytest.raises(ValueError, match="stage0_all.*hash"):
+        write_stage_artifacts(
+            output_root=tmp_path,
+            stage=0,
+            rows=rows,
+            sampling_contract=bad_contract,
+            provenance={"canonical": False},
+        )
+    assert not (tmp_path / "stage_0/sample_manifest.jsonl").exists()
+
+
+def test_stage2_capture_parquets_contain_only_appended_rows(tmp_path: Path):
+    eligible, source = _eligible_and_source_rows()
+    contract = _stage_contract()
+    rows = build_stage_rows(
+        stage=2,
+        eligible_rows=eligible,
+        source_rows=source,
+        sampling_contract=contract,
+        tokenizer_4b=_FakeQwenTokenizer(),
+        tokenizer_0_6b=_FakeQwenTokenizer(),
+    )
+    report = tmp_path / "stage1_report.json"
+    report.write_text('{"stage":1,"classification":"pass"}\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="Stage-1 manifest"):
+        write_stage_artifacts(
+            output_root=tmp_path,
+            stage=2,
+            rows=rows,
+            sampling_contract=contract,
+            provenance={"canonical": False},
+            parent_report=report,
+            expected_parent_report_sha256=sha256_file(report),
+        )
+    assert not (tmp_path / "stage_2/sample_manifest.jsonl").exists()
+
+    stage1_rows = build_stage_rows(
+        stage=1,
+        eligible_rows=eligible,
+        source_rows=source,
+        sampling_contract=contract,
+        tokenizer_4b=_FakeQwenTokenizer(),
+        tokenizer_0_6b=_FakeQwenTokenizer(),
+    )
+    write_stage_artifacts(
+        output_root=tmp_path,
+        stage=1,
+        rows=stage1_rows,
+        sampling_contract=contract,
+        provenance={"canonical": False},
+    )
+    manifest = write_stage_artifacts(
+        output_root=tmp_path,
+        stage=2,
+        rows=rows,
+        sampling_contract=contract,
+        provenance={"canonical": False},
+        parent_report=report,
+        expected_parent_report_sha256=sha256_file(report),
+    )
+    assert manifest["target_capture_count"] == 1024
+    assert manifest["proxy_capture_count"] == 768
+    stage_dir = tmp_path / "stage_2"
+    target = pq.read_table(stage_dir / "capture_target.parquet").to_pylist()
+    proxy = pq.read_table(stage_dir / "capture_proxy.parquet").to_pylist()
+    assert len(target) == 1024
+    assert len(proxy) == 768
+    assert {row["opd_verify_stable_id"] for row in target}.isdisjoint(
+        {f"q{index:04d}" for index in range(1024)}
+    )
+
+
+def test_materialized_revision_requires_matching_download_metadata(tmp_path: Path):
+    model = tmp_path / "model"
+    metadata = model / ".cache/huggingface/download"
+    metadata.mkdir(parents=True)
+    revision = "c1899de289a04d12100db370d81485cdf75e47ca"
+    for name in ("config.json", "tokenizer_config.json", "model.safetensors"):
+        (metadata / f"{name}.metadata").write_text(
+            revision + "\nblob\ntimestamp\n", encoding="utf-8"
+        )
+    result = validate_materialized_revision(model, revision)
+    assert result["revision"] == revision
+    assert result["metadata_file_count"] == 3
+    (metadata / "config.json.metadata").write_text(
+        "0" * 40 + "\nblob\ntimestamp\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="materialized revision mismatch"):
+        validate_materialized_revision(model, revision)
