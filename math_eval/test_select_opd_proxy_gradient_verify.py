@@ -17,11 +17,13 @@ from math_eval.select_opd_proxy_gradient_verify import (
     KMEANS_SEEDS,
     ROUND_ROBIN_SEED,
     build_length_quartiles,
+    build_selection_vector_view,
     generate_random_schedules,
     largest_remainder_allocation,
     load_random_schedules,
     load_selection_bundle,
     run_selection,
+    selection_vector_id,
 )
 from math_eval.select_gradient_diverse_deepmath import cluster_official
 
@@ -114,6 +116,55 @@ def test_stage1_selector_uses_both_kmeans_seeds_and_fixed_round_robin_seed():
     assert len(_FakeClusterManager.calls) == 14 * 2 * 2
     assert {call[1] for call in _FakeClusterManager.calls} == {76, 7}
     assert all(call[2:] == (20, False) for call in _FakeClusterManager.calls)
+
+
+def test_selection_vector_view_joins_shards_and_restores_candidate_order():
+    rows = _rows(24)
+    name = "P_n1:seed=42:slot=0"
+
+    def shard(positions):
+        stable_ids = tuple(str(rows[position]["stable_id"]) for position in positions)
+        vector_ids = tuple(selection_vector_id(name, stable_id) for stable_id in stable_ids)
+        vectors = np.stack(
+            [np.full(4, position + 1, dtype=np.float32) for position in positions]
+        )
+        manifest = {
+            "schema_version": 1,
+            "artifact_type": "vector_set",
+            "representation": "P",
+            "vector_count": len(positions),
+            "vector_dimension": 4,
+            "vector_ids_sha256": sha256_id_lines(vector_ids),
+            "stable_ids_sha256": sha256_id_lines(stable_ids),
+        }
+        return VectorSet(
+            vector_ids=vector_ids,
+            stable_ids=stable_ids,
+            vectors=vectors,
+            full_gradient_norm=np.asarray(positions, dtype=np.float32) + 1,
+            projected_gradient_norm=None,
+            valid_token_count=None,
+            response_length=None,
+            sampled_reverse_kl=None,
+            opd_signal_rms=None,
+            verifier_correct_count=None,
+            verifier_total=None,
+            manifest=manifest,
+        )
+
+    view = build_selection_vector_view(
+        (shard(range(12, 24)), shard(range(12))),
+        name,
+        [str(row["stable_id"]) for row in rows],
+    )
+    assert view.vector_ids == tuple(
+        selection_vector_id(name, str(row["stable_id"])) for row in rows
+    )
+    assert view.stable_ids == tuple(str(row["stable_id"]) for row in rows)
+    assert view.vectors[:, 0].tolist() == list(range(1, 25))
+    assert view.full_gradient_norm.tolist() == list(range(1, 25))
+    assert view.manifest["artifact_type"] == "opd_proxy_selection_vector_view"
+    assert len(view.manifest["source_vector_manifest_sha256"]) == 2
 
 
 def test_selector_passes_normalized_seeded_permutations_and_restores_labels():

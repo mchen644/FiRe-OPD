@@ -1179,7 +1179,7 @@ def load_selection_bundle(
     )
 
 
-def _expected_vector_id(representation: str, stable_id: str) -> str:
+def selection_vector_id(representation: str, stable_id: str) -> str:
     if representation.startswith("P_n1:"):
         match = re.fullmatch(r"P_n1:seed=(42|43):slot=([0-3])", representation)
         if match is None:
@@ -1194,24 +1194,93 @@ def _expected_vector_id(representation: str, stable_id: str) -> str:
     return f"{representation}:{stable_id}"
 
 
-def _slice_vector_set(
-    source: VectorSet, representation: str, candidate_ids: Sequence[str]
+def build_selection_vector_view(
+    sources: Sequence[VectorSet],
+    representation: str,
+    stable_ids: Sequence[str],
 ) -> VectorSet:
-    expected_ids = [
-        _expected_vector_id(representation, stable_id) for stable_id in candidate_ids
-    ]
-    positions = {vector_id: index for index, vector_id in enumerate(source.vector_ids)}
-    if len(positions) != len(source.vector_ids) or any(
-        vector_id not in positions for vector_id in expected_ids
+    """Join immutable source shards and extract one aligned representation view."""
+    source_sets = tuple(sources)
+    ordered_stable_ids = tuple(stable_ids)
+    if not source_sets:
+        raise ValueError("selection vector view requires at least one source")
+    if (
+        not ordered_stable_ids
+        or len(set(ordered_stable_ids)) != len(ordered_stable_ids)
+        or any(not isinstance(value, str) or not value for value in ordered_stable_ids)
     ):
-        raise ValueError(f"source vector set lacks exact {representation} candidate coverage")
-    order = np.asarray([positions[vector_id] for vector_id in expected_ids], dtype=np.int64)
+        raise ValueError("selection vector view stable IDs must be nonempty and unique")
+    expected_ids = tuple(
+        selection_vector_id(representation, stable_id)
+        for stable_id in ordered_stable_ids
+    )
+    if (
+        len(source_sets) == 1
+        and source_sets[0].vector_ids == expected_ids
+        and source_sets[0].stable_ids == ordered_stable_ids
+    ):
+        return source_sets[0]
 
-    def optional(value):
-        return None if value is None else np.ascontiguousarray(value[order])
+    locations: dict[str, tuple[int, int]] = {}
+    source_hashes: list[str] = []
+    vector_dimension: int | None = None
+    for source_index, source in enumerate(source_sets):
+        if not isinstance(source, VectorSet):
+            raise TypeError("selection vector sources must be VectorSet objects")
+        source_hashes.append(
+            hashlib.sha256(canonical_json_bytes(source.manifest)).hexdigest()
+        )
+        vectors = np.asarray(source.vectors)
+        if vectors.ndim != 2 or vectors.shape[0] != len(source.vector_ids):
+            raise ValueError("selection vector source shape mismatch")
+        if vector_dimension is None:
+            vector_dimension = vectors.shape[1]
+        elif vectors.shape[1] != vector_dimension:
+            raise ValueError("selection vector source dimensions differ")
+        if len(source.vector_ids) != len(source.stable_ids):
+            raise ValueError("selection vector source ID arrays differ in length")
+        for row_index, vector_id in enumerate(source.vector_ids):
+            if vector_id in locations:
+                raise ValueError(f"duplicate vector ID across source shards: {vector_id}")
+            locations[vector_id] = (source_index, row_index)
+    missing = [vector_id for vector_id in expected_ids if vector_id not in locations]
+    if missing:
+        raise ValueError(
+            f"source vector sets lack exact {representation} candidate coverage"
+        )
+    selected_locations = [locations[vector_id] for vector_id in expected_ids]
+    for stable_id, (source_index, row_index) in zip(
+        ordered_stable_ids, selected_locations
+    ):
+        if source_sets[source_index].stable_ids[row_index] != stable_id:
+            raise ValueError("selection vector source stable ID/vector ID mismatch")
 
-    source_hash = hashlib.sha256(canonical_json_bytes(source.manifest)).hexdigest()
-    vectors = np.ascontiguousarray(source.vectors[order])
+    vectors = np.ascontiguousarray(
+        np.stack(
+            [
+                source_sets[source_index].vectors[row_index]
+                for source_index, row_index in selected_locations
+            ]
+        ),
+        dtype=np.float32,
+    )
+
+    def optional(field: str) -> np.ndarray | None:
+        selected_values = []
+        presence = []
+        for source_index, row_index in selected_locations:
+            value = getattr(source_sets[source_index], field)
+            presence.append(value is not None)
+            if value is not None:
+                selected_values.append(value[row_index])
+        if not any(presence):
+            return None
+        if not all(presence):
+            raise ValueError(
+                f"selection vector sources disagree on optional field {field}"
+            )
+        return np.ascontiguousarray(np.asarray(selected_values))
+
     manifest = {
         "schema_version": 1,
         "artifact_type": "opd_proxy_selection_vector_view",
@@ -1219,21 +1288,21 @@ def _slice_vector_set(
         "vector_count": len(expected_ids),
         "vector_dimension": vectors.shape[1],
         "vector_ids_sha256": sha256_id_lines(expected_ids),
-        "stable_ids_sha256": sha256_id_lines(tuple(candidate_ids)),
-        "source_vector_manifest_sha256": source_hash,
+        "stable_ids_sha256": sha256_id_lines(ordered_stable_ids),
+        "source_vector_manifest_sha256": source_hashes,
     }
     return VectorSet(
-        vector_ids=tuple(expected_ids),
-        stable_ids=tuple(candidate_ids),
+        vector_ids=expected_ids,
+        stable_ids=ordered_stable_ids,
         vectors=vectors,
-        full_gradient_norm=optional(source.full_gradient_norm),
-        projected_gradient_norm=optional(source.projected_gradient_norm),
-        valid_token_count=optional(source.valid_token_count),
-        response_length=optional(source.response_length),
-        sampled_reverse_kl=optional(source.sampled_reverse_kl),
-        opd_signal_rms=optional(source.opd_signal_rms),
-        verifier_correct_count=optional(source.verifier_correct_count),
-        verifier_total=optional(source.verifier_total),
+        full_gradient_norm=optional("full_gradient_norm"),
+        projected_gradient_norm=optional("projected_gradient_norm"),
+        valid_token_count=optional("valid_token_count"),
+        response_length=optional("response_length"),
+        sampled_reverse_kl=optional("sampled_reverse_kl"),
+        opd_signal_rms=optional("opd_signal_rms"),
+        verifier_correct_count=optional("verifier_correct_count"),
+        verifier_total=optional("verifier_total"),
         manifest=manifest,
     )
 
@@ -1261,15 +1330,13 @@ def _read_stage_inputs(stage_directory: Path) -> tuple[dict[str, object], list[d
     return manifest, rows
 
 
-def _parse_vector_specs(values: Sequence[str]) -> dict[str, Path]:
-    specs: dict[str, Path] = {}
+def _parse_vector_specs(values: Sequence[str]) -> dict[str, list[Path]]:
+    specs: dict[str, list[Path]] = {}
     for value in values:
         name, separator, path = value.partition("=")
         if separator != "=" or name not in EXPECTED_REPRESENTATIONS or not path:
             raise ValueError("--vector must be REPRESENTATION=VECTOR_DIRECTORY")
-        if name in specs:
-            raise ValueError(f"duplicate vector representation: {name}")
-        specs[name] = Path(path)
+        specs.setdefault(name, []).append(Path(path))
     if set(specs) != set(EXPECTED_REPRESENTATIONS):
         raise ValueError("--vector specifications must cover all representations")
     return specs
@@ -1285,7 +1352,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="append",
         default=[],
         metavar="REPRESENTATION=PATH",
-        help="repeat once per declared representation; paths may be shared",
+        help="repeat for every representation/source shard; paths may be shared",
     )
     args = parser.parse_args(argv)
     stage_manifest, rows = _read_stage_inputs(args.stage_directory)
@@ -1297,10 +1364,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     source_cache: dict[Path, VectorSet] = {}
     vectors: dict[str, VectorSet] = {}
     for name in EXPECTED_REPRESENTATIONS:
-        source_path = specs[name].resolve()
-        if source_path not in source_cache:
-            source_cache[source_path] = load_vector_set(source_path)
-        vectors[name] = _slice_vector_set(source_cache[source_path], name, candidate_ids)
+        sources: list[VectorSet] = []
+        for declared_path in specs[name]:
+            source_path = declared_path.resolve()
+            if source_path not in source_cache:
+                source_cache[source_path] = load_vector_set(source_path)
+            sources.append(source_cache[source_path])
+        vectors[name] = build_selection_vector_view(sources, name, candidate_ids)
     vector_hashes = {
         name: hashlib.sha256(canonical_json_bytes(vector.manifest)).hexdigest()
         for name, vector in vectors.items()
@@ -1339,11 +1409,13 @@ __all__ = [
     "RandomSchedules",
     "SelectionBundle",
     "build_length_quartiles",
+    "build_selection_vector_view",
     "generate_random_schedules",
     "largest_remainder_allocation",
     "load_random_schedules",
     "load_selection_bundle",
     "run_selection",
+    "selection_vector_id",
 ]
 
 
