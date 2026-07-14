@@ -226,6 +226,17 @@ def sha256_id_lines(ids: Sequence[str]) -> str:
     return digest.hexdigest()
 
 
+def sha256_ordered_id_lines(ids: Sequence[str]) -> str:
+    """Hash an ordered ID sequence while permitting repeated stable IDs."""
+    digest = hashlib.sha256()
+    for stable_id in ids:
+        if not isinstance(stable_id, str) or not stable_id:
+            raise ValueError("ordered ID hash input must contain nonempty strings")
+        digest.update(stable_id.encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
 def sha256_int_rows(rows: np.ndarray) -> str:
     array = np.asarray(rows)
     if array.ndim != 2 or not np.issubdtype(array.dtype, np.integer):
@@ -692,6 +703,8 @@ def _load_sidecar(path: Path, expected_rows: int) -> list[dict[str, object]]:
                 value = _strict_json_bytes(line, f"vector sidecar line {line_number}")
                 if not isinstance(value, dict):
                     raise ValueError("vector sidecar rows must be JSON objects")
+                if line != canonical_json_bytes(value):
+                    raise ValueError("vector sidecar rows must use canonical JSON")
                 _require_exact_fields(
                     value,
                     _VECTOR_SIDECAR_REQUIRED_FIELDS | _VECTOR_SIDECAR_OPTIONAL_FIELDS,
@@ -705,9 +718,27 @@ def _load_sidecar(path: Path, expected_rows: int) -> list[dict[str, object]]:
                     raise ValueError("vector_id must be a nonempty string")
                 if not isinstance(stable_id, str) or not stable_id:
                     raise ValueError("stable_id must be a nonempty string")
-                if tensor_row != len(rows):
+                if (
+                    isinstance(tensor_row, bool)
+                    or not isinstance(tensor_row, int)
+                    or tensor_row != len(rows)
+                ):
                     raise ValueError(
                         "vector sidecar tensor_row does not match row order"
+                    )
+                for integer_field in ("engine_seed", "rollout_slot"):
+                    if integer_field in value:
+                        _require_int(value[integer_field], integer_field)
+                for text_field in ("split", "representation", "aggregation"):
+                    if text_field in value and (
+                        not isinstance(value[text_field], str) or not value[text_field]
+                    ):
+                        raise ValueError(
+                            f"vector sidecar {text_field} must be a nonempty string"
+                        )
+                if "source_capture_sha256" in value:
+                    _require_sha256(
+                        value["source_capture_sha256"], "source_capture_sha256"
                     )
                 rows.append(dict(value))
     except OSError as error:
@@ -799,6 +830,8 @@ def load_vector_set(
     manifest_value = _strict_json_file(manifest_path, "vector manifest")
     if not isinstance(manifest_value, dict):
         raise ValueError("vector manifest must be a JSON object")
+    if manifest_path.read_bytes() != canonical_json_bytes(manifest_value):
+        raise ValueError("vector manifest must use canonical JSON")
     _require_exact_fields(
         manifest_value,
         _VECTOR_MANIFEST_FIELDS,
@@ -845,10 +878,15 @@ def load_vector_set(
     ):
         if not isinstance(manifest[object_field], dict):
             raise ValueError(f"vector manifest {object_field} must be a JSON object")
+    verifier_status = manifest["verifier"].get("status")
+    if verifier_status not in {"computed", "not_computed"}:
+        raise ValueError("vector verifier status must be computed or not_computed")
 
     complete_value = _strict_json_file(complete_path, "vector completion marker")
     if not isinstance(complete_value, dict):
         raise ValueError("vector COMPLETE.json must be a JSON object")
+    if complete_path.read_bytes() != canonical_json_bytes(complete_value):
+        raise ValueError("vector COMPLETE.json must use canonical JSON")
     _require_exact_fields(
         complete_value, _COMPLETE_FIELDS, _COMPLETE_FIELDS, "vector completion marker"
     )
@@ -874,6 +912,64 @@ def load_vector_set(
         raise ValueError(
             f"incomplete vector chunk coverage: expected {vector_count}, got {covered}"
         )
+    replay_chunk_records = manifest["metadata"].get("replay_chunks")
+    if replay_chunk_records is not None:
+        if not isinstance(replay_chunk_records, list) or len(
+            replay_chunk_records
+        ) != len(chunks):
+            raise ValueError("vector replay chunk records do not match chunks")
+        required_record_fields = frozenset(
+            {
+                "schema_version",
+                "artifact_type",
+                "start",
+                "end",
+                "vector_ids_sha256",
+                "tensor_file",
+                "tensor_sha256",
+                "sidecar_file",
+                "sidecar_sha256",
+                "shard_contract_sha256",
+            }
+        )
+        contract_hash = manifest["metadata"].get("shard_contract_sha256")
+        _require_sha256(contract_hash, "metadata.shard_contract_sha256")
+        shard_contract_path = root / "SHARD_CONTRACT.json"
+        if not shard_contract_path.is_file() or sha256_file(
+            shard_contract_path
+        ) != contract_hash:
+            raise ValueError("vector shard contract hash mismatch")
+        for record, (start, end, sidecar_path, tensor_path) in zip(
+            replay_chunk_records, chunks, strict=True
+        ):
+            if not isinstance(record, dict):
+                raise ValueError("vector replay chunk record must be an object")
+            _require_exact_fields(
+                record,
+                required_record_fields,
+                required_record_fields,
+                "vector replay chunk record",
+            )
+            expected_values = {
+                "schema_version": 1,
+                "artifact_type": "opd_replay_vector_chunk_complete",
+                "start": start,
+                "end": end,
+                "tensor_file": tensor_path.name,
+                "sidecar_file": sidecar_path.name,
+                "shard_contract_sha256": contract_hash,
+            }
+            for field, expected in expected_values.items():
+                if record[field] != expected:
+                    raise ValueError(f"vector replay chunk {field} mismatch")
+            for path, hash_field in (
+                (tensor_path, "tensor_sha256"),
+                (sidecar_path, "sidecar_sha256"),
+            ):
+                _require_sha256(record[hash_field], hash_field)
+                if record[hash_field] != sha256_file(path):
+                    raise ValueError(f"vector replay chunk {hash_field} mismatch")
+            _require_sha256(record["vector_ids_sha256"], "vector_ids_sha256")
 
     all_vector_ids: list[str] = []
     all_stable_ids: list[str] = []
@@ -885,9 +981,13 @@ def load_vector_set(
         name: None for name in _VECTOR_SCALAR_FIELDS
     }
 
-    for start, end, sidecar_path, tensor_path in chunks:
+    for chunk_index, (start, end, sidecar_path, tensor_path) in enumerate(chunks):
         rows = end - start
         sidecars = _load_sidecar(sidecar_path, rows)
+        if replay_chunk_records is not None and sha256_id_lines(
+            [str(sidecar["vector_id"]) for sidecar in sidecars]
+        ) != replay_chunk_records[chunk_index]["vector_ids_sha256"]:
+            raise ValueError("vector replay chunk vector ID hash mismatch")
         try:
             tensors = load_safetensors(tensor_path)
         except Exception as error:
@@ -942,12 +1042,27 @@ def load_vector_set(
 
     if len(set(all_vector_ids)) != len(all_vector_ids):
         raise ValueError("duplicate vector IDs")
-    if len(set(all_stable_ids)) != len(all_stable_ids):
-        raise ValueError("duplicate stable IDs in one vector set")
     if sha256_id_lines(all_vector_ids) != manifest["vector_ids_sha256"]:
         raise ValueError("vector ID sequence hash mismatch")
-    if sha256_id_lines(all_stable_ids) != manifest["stable_ids_sha256"]:
+    if sha256_ordered_id_lines(all_stable_ids) != manifest["stable_ids_sha256"]:
         raise ValueError("stable ID sequence hash mismatch")
+
+    core_scalar_fields = set(_VECTOR_SCALAR_FIELDS) - {
+        "verifier_correct_count",
+        "verifier_total",
+    }
+    missing_core = sorted(
+        field for field in core_scalar_fields if scalar_presence[field] is not True
+    )
+    if missing_core:
+        raise ValueError(f"missing vector tensor fields: {missing_core}")
+    verifier_present = scalar_presence["verifier_correct_count"] is True
+    if verifier_present != (scalar_presence["verifier_total"] is True):
+        raise ValueError("verifier count tensors must be present together")
+    if verifier_status == "computed" and not verifier_present:
+        raise ValueError("computed verifier status requires verifier count tensors")
+    if verifier_status == "not_computed" and verifier_present:
+        raise ValueError("not_computed verifier status forbids verifier count tensors")
 
     vectors = np.ascontiguousarray(np.concatenate(projected_chunks, axis=0))
     scalar_values: dict[str, np.ndarray | None] = {}
@@ -959,6 +1074,21 @@ def load_vector_set(
         else:
             scalar_values[field] = None
     projected_norm = scalar_values["projected_gradient_norm"]
+    for positive_field in (
+        "full_gradient_norm",
+        "projected_gradient_norm",
+        "valid_token_count",
+        "response_length",
+    ):
+        value = scalar_values[positive_field]
+        if value is None or np.any(value <= 0):
+            raise ValueError(f"vector tensor {positive_field} must be positive")
+    if verifier_present:
+        correct = scalar_values["verifier_correct_count"]
+        total = scalar_values["verifier_total"]
+        assert correct is not None and total is not None
+        if np.any(total <= 0) or np.any(correct > total):
+            raise ValueError("invalid verifier correct/total counts")
     if projected_norm is not None and not np.allclose(
         projected_norm.astype(np.float64),
         np.linalg.norm(vectors.astype(np.float64), axis=1),
@@ -978,17 +1108,31 @@ def load_vector_set(
         order = np.array([positions[vector_id] for vector_id in requested_vector_ids])
     if expected_stable_ids is not None:
         requested_stable_ids = tuple(expected_stable_ids)
-        if len(set(requested_stable_ids)) != len(requested_stable_ids):
-            raise ValueError("expected stable IDs must be unique")
-        if set(requested_stable_ids) != set(all_stable_ids):
+        if any(
+            not isinstance(stable_id, str) or not stable_id
+            for stable_id in requested_stable_ids
+        ):
+            raise ValueError("expected stable IDs must be nonempty strings")
+        if len(requested_stable_ids) != vector_count:
             raise ValueError("expected stable IDs do not match artifact coverage")
-        positions = {stable_id: index for index, stable_id in enumerate(all_stable_ids)}
-        stable_order = np.array(
-            [positions[stable_id] for stable_id in requested_stable_ids]
-        )
-        if expected_vector_ids is not None and not np.array_equal(order, stable_order):
-            raise ValueError("requested vector and stable ID orders disagree")
-        order = stable_order
+        if expected_vector_ids is not None:
+            reordered_stable_ids = tuple(all_stable_ids[index] for index in order)
+            if reordered_stable_ids != requested_stable_ids:
+                raise ValueError("requested vector and stable ID orders disagree")
+        elif len(set(all_stable_ids)) != len(all_stable_ids):
+            if requested_stable_ids != tuple(all_stable_ids):
+                raise ValueError(
+                    "duplicate stable IDs require vector IDs for unambiguous reordering"
+                )
+        else:
+            if set(requested_stable_ids) != set(all_stable_ids):
+                raise ValueError("expected stable IDs do not match artifact coverage")
+            positions = {
+                stable_id: index for index, stable_id in enumerate(all_stable_ids)
+            }
+            order = np.array(
+                [positions[stable_id] for stable_id in requested_stable_ids]
+            )
 
     ordered_vector_ids = tuple(all_vector_ids[index] for index in order)
     ordered_stable_ids = tuple(all_stable_ids[index] for index in order)
@@ -1032,6 +1176,7 @@ __all__ = [
     "repository_state",
     "sha256_file",
     "sha256_id_lines",
+    "sha256_ordered_id_lines",
     "sha256_int_rows",
     "validate_exact_key_coverage",
     "write_or_validate_manifest",

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 import numpy as np
 import pytest
+from safetensors.numpy import load_file as load_safetensors
 from safetensors.numpy import save_file as save_safetensors
 
 from math_eval.opd_proxy_gradient_verify_artifacts import (
@@ -23,6 +25,7 @@ from math_eval.opd_proxy_gradient_verify_artifacts import (
     sha256_file,
     sha256_id_lines,
     sha256_int_rows,
+    sha256_ordered_id_lines,
     validate_exact_key_coverage,
     write_or_validate_manifest,
 )
@@ -39,6 +42,12 @@ def test_sha256_id_lines_uses_utf8_terminal_newlines():
     assert sha256_id_lines(["a", "β"]) == (
         "d3c5672deb0c99f78c72cf77d08b03ca61f7685b7fb1689d9861bcfd48afe094"
     )
+
+
+def test_ordered_id_hash_allows_repeated_stable_ids_without_losing_order():
+    expected = hashlib.sha256(b"q0\nq0\nq1\n").hexdigest()
+    assert sha256_ordered_id_lines(["q0", "q0", "q1"]) == expected
+    assert sha256_ordered_id_lines(["q0", "q1", "q0"]) != expected
 
 
 def test_sha256_int_rows_uses_compact_json_and_terminal_newlines():
@@ -355,6 +364,33 @@ def test_vector_loader_rejects_unknown_manifest_and_tensor_fields(tmp_path: Path
     _write_vector_fixture(unknown_tensor, add_unknown_tensor=True)
     with pytest.raises(ValueError, match="unknown vector tensor fields"):
         load_vector_set(unknown_tensor)
+
+
+def test_vector_loader_binds_verifier_status_to_optional_count_tensors(
+    tmp_path: Path,
+):
+    computed_without_counts = tmp_path / "computed_without_counts"
+    _write_vector_fixture(computed_without_counts)
+    manifest_path = computed_without_counts / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["verifier"] = {"status": "computed"}
+    manifest_path.write_bytes(canonical_json_bytes(manifest))
+    complete_path = computed_without_counts / "COMPLETE.json"
+    complete = json.loads(complete_path.read_text(encoding="utf-8"))
+    complete["manifest_sha256"] = sha256_file(manifest_path)
+    complete_path.write_bytes(canonical_json_bytes(complete))
+    with pytest.raises(ValueError, match="requires verifier count"):
+        load_vector_set(computed_without_counts)
+
+    counts_without_status = tmp_path / "counts_without_status"
+    _write_vector_fixture(counts_without_status)
+    tensor_path = counts_without_status / "vectors_0_2.safetensors"
+    tensors = dict(load_safetensors(tensor_path))
+    tensors["verifier_correct_count"] = np.array([1.0, 0.0], dtype=np.float32)
+    tensors["verifier_total"] = np.array([1.0, 1.0], dtype=np.float32)
+    save_safetensors(tensors, tensor_path)
+    with pytest.raises(ValueError, match="not_computed.*forbids"):
+        load_vector_set(counts_without_status)
 
 
 def test_vector_loader_rejects_nonfinite_and_zero_vectors(tmp_path: Path):
