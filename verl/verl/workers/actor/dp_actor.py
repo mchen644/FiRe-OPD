@@ -19,6 +19,7 @@ Single Process Actor
 
 import logging
 import os
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -32,6 +33,8 @@ from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from verl.trainer.ppo.opd_proxy_verify_capture import (
     attach_and_validate_keys,
     compute_authoritative_capture_tensors,
+    flatten_full_parameter_gradients,
+    publish_direct_gradient_fixture,
     recursive_parameter_sha256,
     resolve_capture_resume_prefix,
     write_tensor_chunks_atomic,
@@ -911,6 +914,171 @@ class DataParallelPPOActor(BasePPOActor):
             metrics["fire_opd/loss"] = loss.detach().item()
 
         return loss, metrics
+
+    @GPUMemoryLogger(role="dp actor direct OPD gradient fixture", logger=logger)
+    def capture_direct_opd_proxy_gradient_fixture(
+        self,
+        data: DataProto,
+        *,
+        projector=None,
+    ) -> dict[str, object]:
+        """Run one smoke-only canonical backward without any optimizer step."""
+        if not self.config.get("opd_proxy_verify_capture_only", False):
+            raise ValueError("direct fixture requires capture-only actor mode")
+        if data.meta_info.get("opd_proxy_verify_capture_enabled") is not True:
+            raise ValueError("direct fixture requires capture mode metadata")
+        if data.meta_info.get("opd_proxy_verify_direct_gradient_fixture") is not True:
+            raise ValueError("direct fixture requires the explicit smoke fixture flag")
+        if len(data) != 1:
+            raise ValueError("direct fixture requires exactly one trajectory")
+        if self.actor_optimizer is not None:
+            raise ValueError("direct fixture actor must not have an optimizer")
+        required = {
+            "input_ids",
+            "responses",
+            "attention_mask",
+            "position_ids",
+            "response_mask",
+            "rollout_log_probs",
+            "old_log_probs",
+            "ref_log_prob",
+            "rollout_is_weights",
+            "opd_proxy_verify_rollout_slot",
+            "opd_proxy_verify_engine_seed",
+        }
+        missing = required - set(data.batch.keys())
+        if missing:
+            raise ValueError(f"direct fixture lacks tensors: {sorted(missing)}")
+        data, keys = attach_and_validate_keys(
+            data,
+            engine_seed=int(data.batch["opd_proxy_verify_engine_seed"][0]),
+            native_rollouts=4,
+            require_complete_slots=False,
+        )
+        key = keys[0]
+        if any(parameter.grad is not None for parameter in self.actor_module.parameters()):
+            raise ValueError("direct fixture started with materialized gradients")
+        parameter_hash_before = recursive_parameter_sha256(self.actor_module)
+        self.actor_module.train()
+        policy_loss = None
+        try:
+            micro_batch = data.to(get_device_id())
+            model_inputs = {
+                **micro_batch.batch,
+                **micro_batch.non_tensor_batch,
+            }
+            _, current_log_prob, _ = self._forward_micro_batch(
+                model_inputs,
+                temperature=float(data.meta_info["temperature"]),
+                calculate_entropy=False,
+            )
+            authoritative = compute_authoritative_capture_tensors(
+                current_log_prob=current_log_prob,
+                batch_old_log_prob=model_inputs["old_log_probs"],
+                rollout_log_prob=model_inputs["rollout_log_probs"],
+                ref_log_prob=model_inputs["ref_log_prob"],
+                response_mask=model_inputs["response_mask"],
+                rollout_is_weights=model_inputs["rollout_is_weights"],
+                actor_config=self.config,
+            )
+            policy_loss = authoritative["policy_loss"]
+            policy_loss.backward()
+            full_gradient, parameter_layout, parameter_layout_sha256 = (
+                flatten_full_parameter_gradients(self.actor_module)
+            )
+            from math_eval.opd_proxy_gradient_projection import (
+                ProjectionConfig,
+                build_projection_manifest,
+                construct_cuda_projector,
+                full_gradient_l2_norm,
+                project_full_gradient,
+                verify_prismatic_reference,
+            )
+
+            projection_config = ProjectionConfig()
+            projection_manifest: dict[str, object] = {
+                "backend": "injected_fixture_projector",
+                "constructor": {
+                    "grad_dim": full_gradient.numel(),
+                    "proj_dim": projection_config.dimension,
+                    "seed": projection_config.seed,
+                    "proj_type": "rademacher",
+                    "device": str(full_gradient.device),
+                    "dtype": "float16",
+                    "block_size": projection_config.block_size,
+                    "max_batch_size": projection_config.max_batch_size,
+                },
+                "model_id": projection_config.model_id,
+                "output_scale": "1/sqrt(1024)",
+                "parameter_layout_sha256": parameter_layout_sha256,
+            }
+            if projector is None:
+                reference_repo = data.meta_info.get(
+                    "opd_proxy_verify_reference_repo"
+                )
+                if not isinstance(reference_repo, str) or not reference_repo:
+                    raise ValueError(
+                        "direct fixture requires the pinned reference repository"
+                    )
+                reference = verify_prismatic_reference(reference_repo)
+                projector = construct_cuda_projector(
+                    full_gradient.numel(),
+                    "cuda:0",
+                    projection_config,
+                    reference_repo=reference_repo,
+                )
+                projection_manifest = build_projection_manifest(
+                    gradient_dimension=full_gradient.numel(),
+                    parameter_layout_sha256=parameter_layout_sha256,
+                    config=projection_config,
+                    reference=reference,
+                )
+            full_norm = full_gradient_l2_norm(full_gradient)
+            projected = project_full_gradient(
+                projector, full_gradient, projection_config
+            ).squeeze(0)
+            policy_loss_value = policy_loss.detach().cpu().to(torch.float32)
+        finally:
+            self.actor_module.zero_grad(set_to_none=True)
+        if any(parameter.grad is not None for parameter in self.actor_module.parameters()):
+            raise ValueError("direct fixture failed to clear parameter gradients")
+        parameter_hash_after = recursive_parameter_sha256(self.actor_module)
+        if parameter_hash_before != parameter_hash_after:
+            raise ValueError("direct fixture changed actor parameter bytes")
+        artifact: dict[str, object] = {
+            "stable_id": key.stable_id,
+            "engine_seed": key.engine_seed,
+            "rollout_slot": key.rollout_slot,
+            "loss_mode": "vanilla",
+            "loss_agg_mode": "token-mean",
+            "optimizer_step_called": False,
+            "gradient_accumulation_scale_removed": 1.0,
+            "policy_loss": policy_loss_value,
+            "full_gradient_norm": full_norm.detach().cpu().to(torch.float32),
+            "projected_gradient": projected.detach().cpu().to(torch.float32),
+            "full_gradient_dtype": "float32",
+            "projector_input_dtype": "float16",
+            "projected_gradient_dtype": "float32",
+            "parameter_layout": list(parameter_layout),
+            "parameter_layout_sha256": parameter_layout_sha256,
+            "projection": projection_manifest,
+            "actor_parameter_sha256_before": parameter_hash_before,
+            "actor_parameter_sha256_after": parameter_hash_after,
+            "valid_token_count": int(data.batch["response_mask"].sum().item()),
+        }
+        output_root = data.meta_info.get("opd_proxy_verify_direct_output_root")
+        if output_root is not None:
+            if not isinstance(output_root, str) or not output_root:
+                raise ValueError("direct fixture output root must be a nonempty path")
+            parent_hashes = data.meta_info.get("opd_proxy_verify_parent_hashes")
+            if not isinstance(parent_hashes, dict) or not parent_hashes:
+                raise ValueError("direct fixture requires parent hash provenance")
+            artifact["published_manifest"] = publish_direct_gradient_fixture(
+                Path(output_root),
+                artifact=artifact,
+                parent_hashes=parent_hashes,
+            )
+        return artifact
 
     @GPUMemoryLogger(role="dp actor OPD proxy capture", logger=logger)
     def capture_opd_proxy_verify(self, data: DataProto) -> DataProto:

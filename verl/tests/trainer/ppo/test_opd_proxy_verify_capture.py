@@ -44,7 +44,163 @@ from verl.trainer.ppo.opd_proxy_verify_capture import (
     validate_capture_contract,
     write_tensor_chunks_atomic,
 )
-from verl.workers.config import ActorConfig
+from verl.workers.actor.dp_actor import DataParallelPPOActor
+from verl.workers.config import ActorConfig, PolicyLossConfig
+
+
+def _direct_fixture_actor_and_trajectory(tmp_path: Path):
+    actor = object.__new__(DataParallelPPOActor)
+    actor.config = ActorConfig(
+        strategy="fsdp",
+        rollout_n=4,
+        ppo_mini_batch_size=1,
+        ppo_micro_batch_size_per_gpu=1,
+        ppo_epochs=1,
+        use_dynamic_bsz=False,
+        use_torch_compile=False,
+        use_kl_loss=True,
+        kl_loss_coef=0.0,
+        entropy_coeff=0.0,
+        opd_proxy_verify_capture_only=True,
+        policy_loss=PolicyLossConfig(
+            loss_mode="vanilla", only_reverse_kl_advantages=True
+        ),
+    )
+    actor.actor_module = torch.nn.Linear(1, 1, bias=False)
+    with torch.no_grad():
+        actor.actor_module.weight.fill_(0.25)
+    actor.actor_optimizer = None
+
+    def fake_forward(model_inputs, temperature, calculate_entropy=False):
+        assert temperature == 1.0
+        assert calculate_entropy is False
+        current = actor.actor_module.weight.sum() * torch.ones_like(
+            model_inputs["old_log_probs"]
+        )
+        return None, current, {}
+
+    actor._forward_micro_batch = fake_forward
+    current = torch.full((1, 2), 0.25)
+    rollout = torch.zeros((1, 2))
+    old = torch.full((1, 2), 0.2)
+    mask = torch.ones((1, 2), dtype=torch.bool)
+    data = DataProto(
+        batch=TensorDict(
+            {
+                "input_ids": torch.tensor([[1, 2, 3]]),
+                "responses": torch.tensor([[2, 3]]),
+                "attention_mask": torch.ones((1, 3), dtype=torch.long),
+                "position_ids": torch.arange(3).unsqueeze(0),
+                "response_mask": mask,
+                "rollout_log_probs": rollout,
+                "old_log_probs": old,
+                "ref_log_prob": current + 0.5,
+                "rollout_is_weights": torch.exp(old - rollout) * mask,
+                "opd_proxy_verify_rollout_slot": torch.tensor([0]),
+                "opd_proxy_verify_engine_seed": torch.tensor([42]),
+            },
+            batch_size=1,
+        ),
+        non_tensor_batch={
+            "opd_verify_stable_id": np.asarray(["q-smoke"], dtype=object),
+            "opd_verify_split": np.asarray(["candidate"], dtype=object),
+            "opd_verify_manifest_index": np.asarray([0], dtype=object),
+        },
+        meta_info={
+            "temperature": 1.0,
+            "opd_proxy_verify_capture_enabled": True,
+            "opd_proxy_verify_direct_gradient_fixture": True,
+            "opd_proxy_verify_direct_output_root": str(tmp_path / "direct"),
+            "opd_proxy_verify_parent_hashes": {"capture": "a" * 64},
+        },
+    )
+    return actor, data
+
+
+class _DirectFixtureProjector:
+    def project(self, value, *, model_id):
+        assert model_id == 0
+        return value.float().sum(dim=1, keepdim=True).repeat(1, 1024)
+
+
+def test_direct_fixture_projects_registered_loss_without_optimizer_step(
+    monkeypatch, tmp_path: Path
+):
+    import verl.workers.actor.dp_actor as actor_module
+
+    actor, trajectory = _direct_fixture_actor_and_trajectory(tmp_path)
+    backward_calls = []
+    original_backward = torch.Tensor.backward
+
+    def backward_spy(tensor, *args, **kwargs):
+        backward_calls.append(tensor.detach().clone())
+        return original_backward(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(actor_module, "get_device_id", lambda: torch.device("cpu"))
+    monkeypatch.setattr(torch.Tensor, "backward", backward_spy)
+    actor._optimizer_step = lambda: pytest.fail("optimizer step called")
+    before = recursive_parameter_sha256(actor.actor_module)
+    expected_current = actor.actor_module.weight.sum() * torch.ones_like(
+        trajectory.batch["old_log_probs"]
+    )
+    expected_loss = compute_authoritative_capture_tensors(
+        current_log_prob=expected_current,
+        batch_old_log_prob=trajectory.batch["old_log_probs"],
+        rollout_log_prob=trajectory.batch["rollout_log_probs"],
+        ref_log_prob=trajectory.batch["ref_log_prob"],
+        response_mask=trajectory.batch["response_mask"],
+        rollout_is_weights=trajectory.batch["rollout_is_weights"],
+        actor_config=actor.config,
+    )["policy_loss"].detach()
+    method = DataParallelPPOActor.capture_direct_opd_proxy_gradient_fixture
+    while hasattr(method, "__wrapped__"):
+        method = method.__wrapped__
+
+    artifact = method(actor, trajectory, projector=_DirectFixtureProjector())
+
+    assert len(backward_calls) == 1
+    assert artifact["loss_mode"] == "vanilla"
+    assert artifact["loss_agg_mode"] == "token-mean"
+    assert artifact["optimizer_step_called"] is False
+    assert artifact["gradient_accumulation_scale_removed"] == 1.0
+    torch.testing.assert_close(artifact["policy_loss"], expected_loss)
+    assert artifact["actor_parameter_sha256_before"] == before
+    assert artifact["actor_parameter_sha256_after"] == before
+    assert recursive_parameter_sha256(actor.actor_module) == before
+    assert all(parameter.grad is None for parameter in actor.actor_module.parameters())
+    assert artifact["projected_gradient"].shape == (1024,)
+    assert artifact["projected_gradient"].dtype == torch.float32
+    assert (tmp_path / "direct/manifest.json").is_file()
+    assert (tmp_path / "direct/direct_gradient.safetensors").is_file()
+    assert (tmp_path / "direct/COMPLETE.json").is_file()
+
+
+def test_direct_fixture_requires_capture_and_explicit_smoke_flags(tmp_path: Path):
+    actor, trajectory = _direct_fixture_actor_and_trajectory(tmp_path)
+    method = DataParallelPPOActor.capture_direct_opd_proxy_gradient_fixture
+    while hasattr(method, "__wrapped__"):
+        method = method.__wrapped__
+    actor.config = ActorConfig(
+        strategy="fsdp",
+        rollout_n=4,
+        ppo_micro_batch_size_per_gpu=1,
+        opd_proxy_verify_capture_only=False,
+    )
+    with pytest.raises(ValueError, match="capture-only"):
+        method(actor, trajectory, projector=_DirectFixtureProjector())
+
+    actor, trajectory = _direct_fixture_actor_and_trajectory(tmp_path)
+    trajectory.meta_info["opd_proxy_verify_direct_gradient_fixture"] = False
+    with pytest.raises(ValueError, match="smoke fixture flag"):
+        method(actor, trajectory, projector=_DirectFixtureProjector())
+
+    actor, trajectory = _direct_fixture_actor_and_trajectory(tmp_path)
+    with pytest.raises(ValueError, match="exactly one trajectory"):
+        method(
+            actor,
+            DataProto.concat([trajectory, trajectory]),
+            projector=_DirectFixtureProjector(),
+        )
 
 
 def frozen_actor_config() -> ActorConfig:

@@ -475,6 +475,123 @@ def recursive_parameter_sha256(module: torch.nn.Module) -> str:
     return digest.hexdigest()
 
 
+def flatten_full_parameter_gradients(
+    module: torch.nn.Module,
+) -> tuple[torch.Tensor, tuple[dict[str, object], ...], str]:
+    """Flatten one complete unsharded native gradient in registration order."""
+    if not isinstance(module, torch.nn.Module):
+        raise TypeError("direct fixture requires a torch module")
+    class_name = type(module).__name__.lower()
+    if "fullyshard" in class_name or "fully_sharded" in class_name:
+        raise ValueError("direct fixture requires a complete unsharded actor")
+    records: list[dict[str, object]] = []
+    gradients: list[torch.Tensor] = []
+    offset = 0
+    for name, parameter in module.named_parameters(remove_duplicate=True):
+        if not parameter.requires_grad:
+            continue
+        parameter_type = type(parameter)
+        if parameter_type.__name__ == "DTensor" or parameter_type.__module__.startswith(
+            "torch.distributed.tensor"
+        ):
+            raise ValueError("direct fixture rejects local or distributed parameter shards")
+        if parameter.grad is None:
+            raise ValueError(f"direct fixture lacks gradient for parameter {name}")
+        gradient = parameter.grad.detach()
+        if gradient.layout != torch.strided or tuple(gradient.shape) != tuple(
+            parameter.shape
+        ):
+            raise ValueError(f"direct fixture gradient layout mismatch for {name}")
+        value = gradient.to(torch.float32).reshape(-1)
+        if not torch.isfinite(value).all():
+            raise ValueError(f"direct fixture gradient is non-finite for {name}")
+        records.append(
+            {
+                "name": name,
+                "shape": list(parameter.shape),
+                "numel": parameter.numel(),
+                "offset": offset,
+            }
+        )
+        gradients.append(value)
+        offset += parameter.numel()
+    if not gradients:
+        raise ValueError("direct fixture actor has no trainable parameter gradients")
+    flattened = torch.cat(gradients).contiguous()
+    from math_eval.opd_proxy_gradient_projection import (
+        full_gradient_l2_norm,
+        sha256_parameter_layout,
+    )
+
+    full_gradient_l2_norm(flattened)
+    layout_hash = sha256_parameter_layout(records)
+    return flattened, tuple(records), layout_hash
+
+
+def publish_direct_gradient_fixture(
+    output_root: Path,
+    *,
+    artifact: Mapping[str, object],
+    parent_hashes: Mapping[str, object],
+) -> dict[str, object]:
+    """Publish the one-trajectory smoke gradient as a create-once artifact."""
+    root = Path(output_root)
+    parents = _normalize_hashes(parent_hashes, "parent_hashes")
+    projected = artifact.get("projected_gradient")
+    full_norm = artifact.get("full_gradient_norm")
+    policy_loss = artifact.get("policy_loss")
+    if not isinstance(projected, torch.Tensor) or projected.shape != (1024,):
+        raise ValueError("direct fixture projected gradient must have shape (1024,)")
+    if not isinstance(full_norm, torch.Tensor) or full_norm.numel() != 1:
+        raise ValueError("direct fixture full gradient norm must be scalar")
+    if not isinstance(policy_loss, torch.Tensor) or policy_loss.numel() != 1:
+        raise ValueError("direct fixture policy loss must be scalar")
+    tensor_payload = save_safetensors(
+        {
+            "projected_gradient": projected.detach().cpu().to(torch.float32).reshape(1, -1),
+            "full_gradient_norm": full_norm.detach().cpu().to(torch.float32).reshape(1),
+            "projected_gradient_norm": torch.linalg.vector_norm(projected)
+            .detach()
+            .cpu()
+            .to(torch.float32)
+            .reshape(1),
+            "policy_loss": policy_loss.detach().cpu().to(torch.float32).reshape(1),
+        }
+    )
+    root.mkdir(parents=True, exist_ok=True)
+    tensor_path = root / "direct_gradient.safetensors"
+    _write_once(tensor_path, tensor_payload)
+    manifest_fields = {
+        key: value
+        for key, value in artifact.items()
+        if key not in {"projected_gradient", "full_gradient_norm", "policy_loss"}
+    }
+    manifest = write_or_validate_manifest(
+        root / "manifest.json",
+        {
+            "schema_version": 1,
+            "artifact_type": "opd_proxy_direct_gradient_fixture",
+            **manifest_fields,
+            "full_gradient_norm": float(full_norm.detach().cpu().item()),
+            "policy_loss": float(policy_loss.detach().cpu().item()),
+            "tensor_file": tensor_path.name,
+            "tensor_sha256": sha256_file(tensor_path),
+            "parent_hashes": parents,
+        },
+    )
+    write_or_validate_manifest(
+        root / "COMPLETE.json",
+        {
+            "schema_version": 1,
+            "artifact_type": "opd_proxy_direct_gradient_fixture_complete",
+            "manifest_sha256": sha256_file(root / "manifest.json"),
+            "tensor_sha256": sha256_file(tensor_path),
+            "parent_hashes": parents,
+        },
+    )
+    return manifest
+
+
 def _validate_capture_tensor_shapes(
     tensors: Mapping[str, torch.Tensor],
 ) -> tuple[int, set[str]]:
@@ -1115,7 +1232,9 @@ __all__ = [
     "build_response_mask",
     "compute_authoritative_capture_tensors",
     "finalize_capture_seed",
+    "flatten_full_parameter_gradients",
     "load_and_join_capture_chunks",
+    "publish_direct_gradient_fixture",
     "recursive_parameter_sha256",
     "resolve_capture_resume_prefix",
     "trajectory_keys_sha256",
