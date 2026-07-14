@@ -97,6 +97,13 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
+def _resolve_actor_optim_config(actor_config):
+    """Return no optimizer configuration for the capture-only actor."""
+    if actor_config.get("opd_proxy_verify_capture_only", False):
+        return None
+    return actor_config.optim
+
+
 def _unpack_log_prob_result(result):
     """Normalize actor/ref compute_log_prob return values across probe-disabled/enabled paths."""
 
@@ -241,6 +248,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         elif self._is_ref:
             # TODO: it seems that manual offload is slowly than FSDP offload
             self._is_offload_param = self.config.ref.fsdp_config.get("param_offload", False)
+        if self._is_actor and self.config.actor.get("opd_proxy_verify_capture_only", False):
+            self._is_offload_optimizer = False
 
         # normalize config
         if self._is_actor:
@@ -776,7 +785,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_actor or self._is_rollout:
             # we need the model for actor and rollout
             if self._is_actor:
-                optim_config = self.config.actor.optim
+                optim_config = _resolve_actor_optim_config(self.config.actor)
                 fsdp_config = omega_conf_to_dataclass(self.config.actor.fsdp_config)
             else:
                 optim_config = None
@@ -907,6 +916,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="actor_update")
     def update_actor(self, data: DataProto):
         assert self._is_actor
+        if self.config.actor.get("opd_proxy_verify_capture_only", False):
+            raise RuntimeError("update_actor is forbidden in OPD proxy capture-only mode")
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
         if self._is_offload_optimizer:
@@ -944,6 +955,23 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             offload_fsdp_optimizer(optimizer=self.actor_optimizer)
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
 
+        return output
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="red", role="actor_opd_proxy_capture")
+    def capture_opd_proxy_verify(self, data: DataProto):
+        assert self._is_actor
+        if not self.config.actor.get("opd_proxy_verify_capture_only", False):
+            raise ValueError("worker actor is not in OPD proxy capture-only mode")
+        if self.actor_optimizer is not None or self.actor_lr_scheduler is not None:
+            raise ValueError("capture-only worker constructed optimizer state")
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        with self.ulysses_sharding_manager:
+            output = self.actor.capture_opd_proxy_verify(data.to("cpu"))
+        output = output.to("cpu")
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))

@@ -18,18 +18,28 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import hashlib
+import importlib.metadata
 import json
 import os
 import uuid
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
+from pathlib import Path
 from pprint import pprint
 from typing import Optional
 
 import numpy as np
 import ray
 import torch
+from math_eval.opd_proxy_gradient_verify_artifacts import (
+    TrajectoryKey,
+    canonical_json_bytes,
+    sha256_file,
+    sha256_id_lines,
+    write_or_validate_manifest,
+)
 from omegaconf import OmegaConf, open_dict
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -49,6 +59,14 @@ from verl.trainer.ppo.metric_utils import (
     compute_throughout_metrics,
     compute_timing_metrics,
     process_validation_metrics,
+)
+from verl.trainer.ppo.opd_proxy_verify_capture import (
+    attach_and_validate_keys,
+    build_response_mask,
+    finalize_capture_seed,
+    load_and_join_capture_chunks,
+    trajectory_keys_sha256,
+    write_tensor_chunks_atomic,
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.trainer.ppo.tale_budget import (
@@ -189,6 +207,36 @@ def compute_response_mask(data: DataProto):
     response_length = responses.size(1)
     attention_mask = data.batch["attention_mask"]
     return attention_mask[:, -response_length:]
+
+
+_CAPTURE_FORBIDDEN_KEY_PREFIXES = (
+    "candidate_selection",
+    "difficulty_aware",
+    "length_aware_opd",
+    "rethinking_opd",
+    "tale_budget",
+)
+_CAPTURE_FORBIDDEN_KEYS = frozenset(
+    {
+        "advantages",
+        "returns",
+        "token_level_rewards",
+        "token_level_scores",
+        "difficulty_aware_entropy_weight",
+    }
+)
+
+
+def _validate_capture_batch_forbidden_keys(batch: DataProto) -> None:
+    keys = set(batch.batch.keys()) | set(batch.non_tensor_batch)
+    forbidden = sorted(
+        key
+        for key in keys
+        if key in _CAPTURE_FORBIDDEN_KEYS
+        or any(key.startswith(prefix) for prefix in _CAPTURE_FORBIDDEN_KEY_PREFIXES)
+    )
+    if forbidden:
+        raise ValueError(f"forbidden capture batch keys: {forbidden}")
 
 
 def _messages_to_list(messages):
@@ -777,7 +825,11 @@ class RayPPOTrainer:
         self.resource_pool_manager = resource_pool_manager
         self.use_reference_policy = need_reference_policy(self.role_worker_mapping)
         self.use_rm = need_reward_model(self.role_worker_mapping)
-        self.use_critic = need_critic(self.config)
+        capture_config = self.config.algorithm.get("opd_proxy_verify_capture", None)
+        capture_enabled = capture_config is not None and capture_config.get(
+            "enabled", False
+        )
+        self.use_critic = need_critic(self.config) and not capture_enabled
         self.ray_worker_group_cls = ray_worker_group_cls
         self.device_name = device_name if device_name else self.config.trainer.device
         self.validation_generations_logger = ValidationGenerationsLogger(
@@ -1371,6 +1423,509 @@ class RayPPOTrainer:
             if self.use_rm:
                 self.rm_wg.stop_profile()
 
+    def _load_ordered_opd_proxy_capture_batch(self, contract) -> DataProto:
+        if len(self.train_dataloader) != 1:
+            raise ValueError("OPD proxy capture requires exactly one dataloader batch")
+        batch_dict = next(iter(self.train_dataloader))
+        batch = DataProto.from_single_dict(batch_dict)
+        if len(batch) != contract["expected_questions"]:
+            raise ValueError("capture batch question count does not match contract")
+        required = (
+            "opd_verify_stable_id",
+            "opd_verify_split",
+            "opd_verify_manifest_index",
+        )
+        for key in required:
+            value = batch.non_tensor_batch.get(key)
+            if not isinstance(value, np.ndarray) or value.shape != (len(batch),):
+                raise ValueError(f"capture batch requires one-dimensional {key}")
+        stable_ids = batch.non_tensor_batch["opd_verify_stable_id"].tolist()
+        if any(
+            not isinstance(value, str) or not value for value in stable_ids
+        ) or len(set(stable_ids)) != len(stable_ids):
+            raise ValueError("capture batch stable IDs must be unique nonempty strings")
+
+        manifest_rows = []
+        with Path(contract["sample_manifest"]).open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    manifest_rows.append(json.loads(line))
+        by_id = {row.get("stable_id"): row for row in manifest_rows}
+        if len(by_id) != len(manifest_rows):
+            raise ValueError("sample manifest contains duplicate stable IDs")
+        manifest_order = [row["stable_id"] for row in manifest_rows if row.get("stable_id") in set(stable_ids)]
+        if stable_ids != manifest_order:
+            raise ValueError("capture parquet order differs from sample manifest order")
+        for index, stable_id in enumerate(stable_ids):
+            row = by_id.get(stable_id)
+            if row is None or row.get("split") != batch.non_tensor_batch["opd_verify_split"][index]:
+                raise ValueError(f"capture split mismatch for {stable_id}")
+            if row.get("manifest_index") != batch.non_tensor_batch["opd_verify_manifest_index"][index]:
+                raise ValueError(f"capture manifest index mismatch for {stable_id}")
+        batch.non_tensor_batch["uid"] = np.asarray(stable_ids, dtype=object)
+        _validate_capture_batch_forbidden_keys(batch)
+        return batch
+
+    def _opd_proxy_capture_parent_hashes(self, contract) -> dict[str, str]:
+        resolved_config = OmegaConf.to_container(self.config, resolve=True)
+        config_hash = hashlib.sha256(canonical_json_bytes(resolved_config)).hexdigest()
+        parents = {
+            "sample_manifest_sha256": contract["sample_manifest_sha256"],
+            "resolved_config_sha256": config_hash,
+        }
+        stage_manifest = Path(contract["sample_manifest"]).with_name("manifest.json")
+        provenance = {
+            "model_hashes": {"student": contract["sample_manifest_sha256"]},
+            "tokenizer_hashes": {"student": contract["sample_manifest_sha256"]},
+            "source_hashes": {"sample_manifest": contract["sample_manifest_sha256"]},
+        }
+        if stage_manifest.is_file():
+            parents["stage_manifest_sha256"] = sha256_file(stage_manifest)
+            stage_value = json.loads(stage_manifest.read_text(encoding="utf-8"))
+            stage_provenance = stage_value.get("provenance", {})
+            root_manifest = stage_provenance.get("root_manifest", {})
+            model_manifests = root_manifest.get("model_manifests", {})
+            pair_names = (
+                ("target_student", "target_teacher")
+                if contract["pair"] == "target"
+                else ("proxy_student", "proxy_teacher")
+            )
+            student_manifest = model_manifests.get(pair_names[0], {})
+            teacher_manifest = model_manifests.get(pair_names[1], {})
+            student_hash = student_manifest.get("manifest_sha256")
+            teacher_hash = teacher_manifest.get("manifest_sha256")
+            source_snapshot = stage_provenance.get("source_snapshot", {})
+            source_hash = source_snapshot.get("manifest_sha256")
+            compatibility = stage_provenance.get("tokenizer_compatibility", {}).get(
+                contract["pair"], {}
+            )
+            tokenizer_hash = compatibility.get("vocab_sha256")
+            for name, value in {
+                "student_model_sha256": student_hash,
+                "teacher_model_sha256": teacher_hash,
+                "source_snapshot_sha256": source_hash,
+                "tokenizer_vocab_sha256": tokenizer_hash,
+            }.items():
+                if not isinstance(value, str) or len(value) != 64:
+                    raise ValueError(f"stage manifest lacks capture provenance {name}")
+                parents[name] = value
+            provenance = {
+                "model_hashes": {"student": student_hash, "teacher": teacher_hash},
+                "tokenizer_hashes": {
+                    "student": tokenizer_hash,
+                    "teacher": tokenizer_hash,
+                },
+                "source_hashes": {"source_snapshot": source_hash},
+            }
+        self._opd_proxy_capture_provenance_hashes = provenance
+        return parents
+
+    @staticmethod
+    def _opd_proxy_capture_sidecars(batch: DataProto) -> list[dict[str, object]]:
+        rows = []
+        for index in range(len(batch)):
+            row = {
+                "stable_id": str(batch.non_tensor_batch["opd_verify_stable_id"][index]),
+                "engine_seed": int(batch.batch["opd_proxy_verify_engine_seed"][index]),
+                "rollout_slot": int(batch.batch["opd_proxy_verify_rollout_slot"][index]),
+                "split": str(batch.non_tensor_batch["opd_verify_split"][index]),
+                "manifest_index": int(batch.non_tensor_batch["opd_verify_manifest_index"][index]),
+            }
+            if "raw_prompt" in batch.non_tensor_batch:
+                raw_prompt = batch.non_tensor_batch["raw_prompt"][index]
+                row["raw_prompt"] = raw_prompt.tolist() if hasattr(raw_prompt, "tolist") else raw_prompt
+            rows.append(row)
+        return rows
+
+    @staticmethod
+    def _opd_proxy_capture_tensors(batch: DataProto) -> dict[str, torch.Tensor]:
+        permitted = (
+            "prompts",
+            "responses",
+            "input_ids",
+            "attention_mask",
+            "position_ids",
+            "response_mask",
+            "rollout_log_probs",
+            "old_log_probs",
+            "ref_log_prob",
+            "rollout_is_weights",
+            "opd_proxy_verify_rollout_slot",
+            "opd_proxy_verify_engine_seed",
+        )
+        return {key: batch.batch[key] for key in permitted if key in batch.batch}
+
+    def _load_completed_opd_proxy_rollout(
+        self, contract, parent_hashes, expected_keys
+    ):
+        output_root = Path(contract["output_root"])
+        rollout_dir = output_root / "rollout"
+        staging = output_root / ".rollout.tmp"
+        if staging.exists():
+            if rollout_dir.exists() or not (staging / "COMPLETE.json").is_file():
+                raise ValueError("incomplete rollout-generation subtree blocks restart")
+            os.replace(staging, rollout_dir)
+            descriptor = os.open(output_root, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        if not rollout_dir.exists():
+            downstream = (
+                output_root / "trainer_boundary",
+                output_root / "actor",
+                output_root / "COMPLETE.json",
+            )
+            if any(path.exists() for path in downstream):
+                raise ValueError("downstream capture artifacts exist without a rollout")
+            return None
+        if not (rollout_dir / "COMPLETE.json").is_file():
+            raise ValueError("incomplete rollout-generation subtree blocks restart")
+        provenance_path = rollout_dir / "ROLLOUT_PROVENANCE.json"
+        if not provenance_path.is_file():
+            raise ValueError("completed rollout lacks provenance")
+        provenance_bytes = provenance_path.read_bytes()
+        provenance = json.loads(provenance_bytes)
+        if provenance_bytes != canonical_json_bytes(provenance):
+            raise ValueError("completed rollout provenance is not canonical JSON")
+        if provenance.get("parent_hashes") != dict(parent_hashes):
+            raise ValueError("completed rollout parent hashes mismatch")
+        complete_bytes = (rollout_dir / "COMPLETE.json").read_bytes()
+        complete = json.loads(complete_bytes)
+        if complete_bytes != canonical_json_bytes(complete):
+            raise ValueError("completed rollout marker is not canonical JSON")
+        sidecar_rows = []
+        for record in complete.get("chunks", []):
+            expected_name = f"chunk_{record['start']}_{record['end']}.jsonl"
+            if record.get("sidecar_file") != expected_name:
+                raise ValueError("completed rollout sidecar filename mismatch")
+            sidecar_path = rollout_dir / expected_name
+            with sidecar_path.open("r", encoding="utf-8") as handle:
+                sidecar_rows.extend(json.loads(line) for line in handle if line.strip())
+        artifact_keys = tuple(
+            TrajectoryKey(
+                str(row["stable_id"]),
+                int(row["engine_seed"]),
+                int(row["rollout_slot"]),
+            )
+            for row in sidecar_rows
+        )
+        if artifact_keys != tuple(expected_keys):
+            raise ValueError("completed rollout compound-key order mismatch")
+        prompt_ids = list(dict.fromkeys(key.stable_id for key in artifact_keys))
+        expected_provenance = {
+            "ordered_prompt_keys_sha256": sha256_id_lines(prompt_ids),
+            "returned_compound_keys_sha256": trajectory_keys_sha256(artifact_keys),
+            "capture_order_keys_sha256": trajectory_keys_sha256(artifact_keys),
+            "engine_count": 1,
+            "generation_call_count": 1,
+        }
+        for name, value in expected_provenance.items():
+            if provenance.get(name) != value:
+                raise ValueError(f"completed rollout provenance mismatch: {name}")
+        engine_args = provenance.get("engine_args")
+        sampling_args = provenance.get("sampling_args")
+        if not isinstance(engine_args, dict) or engine_args.get("seed") != contract[
+            "engine_seed"
+        ]:
+            raise ValueError("completed rollout engine arguments mismatch")
+        if not isinstance(sampling_args, dict) or sampling_args.get("n") != contract[
+            "native_rollouts"
+        ]:
+            raise ValueError("completed rollout sampling arguments mismatch")
+        if not isinstance(provenance.get("vllm_version"), str) or not provenance[
+            "vllm_version"
+        ]:
+            raise ValueError("completed rollout lacks vLLM version")
+        loaded = load_and_join_capture_chunks(
+            rollout_dir,
+            expected_keys=artifact_keys,
+            parent_hashes=parent_hashes,
+        )
+        non_tensors: dict[str, np.ndarray] = {}
+        for sidecar_field in (
+            "stable_id",
+            "split",
+            "manifest_index",
+            "raw_prompt",
+        ):
+            if all(sidecar_field in row for row in loaded.sidecar_rows):
+                key = {
+                    "stable_id": "opd_verify_stable_id",
+                    "split": "opd_verify_split",
+                    "manifest_index": "opd_verify_manifest_index",
+                    "raw_prompt": "raw_prompt",
+                }[sidecar_field]
+                values = np.empty(len(loaded.sidecar_rows), dtype=object)
+                for index, row in enumerate(loaded.sidecar_rows):
+                    values[index] = row[sidecar_field]
+                non_tensors[key] = values
+        non_tensors["uid"] = non_tensors["opd_verify_stable_id"].copy()
+        batch = DataProto.from_dict(tensors=loaded.tensors, non_tensors=non_tensors)
+        _validate_capture_batch_forbidden_keys(batch)
+        return batch, artifact_keys, provenance
+
+    def _publish_opd_proxy_rollout_capture(
+        self, batch, keys, returned_keys, contract, parent_hashes
+    ) -> dict[str, object]:
+        output_root = Path(contract["output_root"])
+        rollout_dir = output_root / "rollout"
+        staging = output_root / ".rollout.tmp"
+        if rollout_dir.exists() or staging.exists():
+            raise ValueError("existing rollout subtree must be complete and resumed, not regenerated")
+        records = write_tensor_chunks_atomic(
+            staging,
+            tensors=self._opd_proxy_capture_tensors(batch),
+            sidecar_rows=self._opd_proxy_capture_sidecars(batch),
+            parent_hashes=parent_hashes,
+            chunk_size=contract["chunk_size"],
+        )
+        prompt_ids = list(dict.fromkeys(key.stable_id for key in returned_keys))
+        rollout_config = OmegaConf.to_container(
+            self.config.actor_rollout_ref.rollout, resolve=True
+        )
+        provenance = {
+            "ordered_prompt_keys_sha256": sha256_id_lines(prompt_ids),
+            "returned_compound_keys_sha256": trajectory_keys_sha256(returned_keys),
+            "capture_order_keys_sha256": trajectory_keys_sha256(keys),
+            "vllm_version": importlib.metadata.version("vllm"),
+            "engine_args": dict(rollout_config),
+            "sampling_args": {
+                "n": contract["native_rollouts"],
+                "temperature": float(
+                    self.config.actor_rollout_ref.rollout.temperature
+                ),
+                "top_p": float(self.config.actor_rollout_ref.rollout.top_p),
+            },
+            "engine_count": 1,
+            "generation_call_count": 1,
+            "parent_hashes": dict(parent_hashes),
+        }
+        write_or_validate_manifest(staging / "ROLLOUT_PROVENANCE.json", provenance)
+        write_or_validate_manifest(
+            staging / "COMPLETE.json",
+            {
+                "schema_version": 1,
+                "artifact_type": "opd_proxy_capture_subtree_complete",
+                "trajectory_count": len(keys),
+                "trajectory_keys_sha256": trajectory_keys_sha256(keys),
+                "parent_hashes": dict(parent_hashes),
+                "chunk_count": len(records),
+                "chunks": list(records),
+            },
+        )
+        output_root.mkdir(parents=True, exist_ok=True)
+        os.replace(staging, rollout_dir)
+        descriptor = os.open(output_root, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        return provenance
+
+    def _publish_opd_proxy_trainer_boundary(self, batch, keys, contract, parent_hashes) -> None:
+        directory = Path(contract["output_root"]) / "trainer_boundary"
+        write_tensor_chunks_atomic(
+            directory,
+            tensors=self._opd_proxy_capture_tensors(batch),
+            sidecar_rows=self._opd_proxy_capture_sidecars(batch),
+            parent_hashes=parent_hashes,
+            chunk_size=contract["chunk_size"],
+        )
+
+    def _finalize_opd_proxy_capture(
+        self, actor_output, keys, contract, parent_hashes, rollout_provenance
+    ):
+        ranks = actor_output.batch["opd_proxy_verify_actor_rank"].detach().cpu().tolist()
+        slots = actor_output.batch["opd_proxy_verify_rollout_slot"].detach().cpu().tolist()
+        seeds = actor_output.batch["opd_proxy_verify_engine_seed"].detach().cpu().tolist()
+        stable_ids = actor_output.non_tensor_batch["opd_verify_stable_id"].tolist()
+        before_values = actor_output.non_tensor_batch[
+            "opd_proxy_verify_parameter_sha256_before"
+        ].tolist()
+        after_values = actor_output.non_tensor_batch[
+            "opd_proxy_verify_parameter_sha256_after"
+        ].tolist()
+        rank_keys: dict[int, list[TrajectoryKey]] = defaultdict(list)
+        before_by_rank: dict[int, str] = {}
+        after_by_rank: dict[int, str] = {}
+        for rank, stable_id, seed, slot, before, after in zip(
+            ranks, stable_ids, seeds, slots, before_values, after_values, strict=True
+        ):
+            rank = int(rank)
+            rank_keys[rank].append(TrajectoryKey(str(stable_id), int(seed), int(slot)))
+            if rank in before_by_rank and before_by_rank[rank] != before:
+                raise ValueError("actor rank returned inconsistent pre-capture hashes")
+            if rank in after_by_rank and after_by_rank[rank] != after:
+                raise ValueError("actor rank returned inconsistent post-capture hashes")
+            before_by_rank[rank] = str(before)
+            after_by_rank[rank] = str(after)
+        combined_before = hashlib.sha256(canonical_json_bytes(before_by_rank)).hexdigest()
+        combined_after = hashlib.sha256(canonical_json_bytes(after_by_rank)).hexdigest()
+        config_hash = parent_hashes["resolved_config_sha256"]
+        seed_manifest = {
+            "vllm_version": rollout_provenance["vllm_version"],
+            "engine_args": rollout_provenance["engine_args"],
+            "sampling_args": rollout_provenance["sampling_args"],
+            "ordered_prompt_keys_sha256": rollout_provenance["ordered_prompt_keys_sha256"],
+            "returned_compound_keys_sha256": rollout_provenance["returned_compound_keys_sha256"],
+            "model_hashes": self._opd_proxy_capture_provenance_hashes[
+                "model_hashes"
+            ],
+            "tokenizer_hashes": self._opd_proxy_capture_provenance_hashes[
+                "tokenizer_hashes"
+            ],
+            "config_hashes": {"resolved": config_hash},
+            "source_hashes": self._opd_proxy_capture_provenance_hashes[
+                "source_hashes"
+            ],
+            "engine_count": rollout_provenance["engine_count"],
+            "generation_call_count": rollout_provenance["generation_call_count"],
+        }
+        return finalize_capture_seed(
+            Path(contract["output_root"]),
+            expected_keys=keys,
+            actor_rank_expected_keys=rank_keys,
+            parent_hashes=parent_hashes,
+            actor_parameter_sha256_before=combined_before,
+            actor_parameter_sha256_after=combined_after,
+            seed_manifest=seed_manifest,
+        )
+
+    def _fit_opd_proxy_verify_capture(self):
+        from verl.trainer.main_ppo import validate_opd_proxy_capture_runtime_config
+        from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
+
+        contract = validate_opd_proxy_capture_runtime_config(self.config)
+        if contract is None:
+            raise ValueError("capture entry point requires enabled typed config")
+        if self.async_rollout_mode:
+            raise ValueError("OPD proxy capture requires synchronous rollout")
+        if not self.use_reference_policy:
+            raise ValueError("OPD proxy capture requires a reference worker")
+        parent_hashes = self._opd_proxy_capture_parent_hashes(contract)
+        original_batch = self._load_ordered_opd_proxy_capture_batch(contract)
+        stable_ids = original_batch.non_tensor_batch["opd_verify_stable_id"].tolist()
+        expected_returned_keys = tuple(
+            TrajectoryKey(stable_id, contract["engine_seed"], slot)
+            for stable_id in stable_ids
+            for slot in range(contract["native_rollouts"])
+        )
+
+        completed_rollout = self._load_completed_opd_proxy_rollout(
+            contract, parent_hashes, expected_returned_keys
+        )
+        if completed_rollout is not None:
+            batch, capture_order_keys, rollout_provenance = completed_rollout
+        else:
+            gen_batch = original_batch.select(
+                batch_keys=["input_ids", "attention_mask", "position_ids"],
+                non_tensor_batch_keys=list(original_batch.non_tensor_batch),
+            )
+            gen_batch.meta_info = {
+                "do_sample": True,
+                "validate": False,
+                "opd_proxy_verify_capture_enabled": True,
+                "generation_kwargs": {
+                    "opd_proxy_verify_native_n": contract["native_rollouts"]
+                },
+            }
+            generated = self.actor_rollout_wg.generate_sequences(gen_batch)
+            generated, returned_keys = attach_and_validate_keys(
+                generated,
+                engine_seed=contract["engine_seed"],
+                native_rollouts=contract["native_rollouts"],
+                expected_keys=expected_returned_keys,
+            )
+            if returned_keys != expected_returned_keys:
+                raise ValueError("native rollout returned non-prompt-major compound keys")
+
+            remainder_keys = [
+                key
+                for key in original_batch.batch.keys()
+                if key not in {"input_ids", "attention_mask", "position_ids"}
+            ]
+            batch = original_batch.select(
+                batch_keys=remainder_keys,
+                non_tensor_batch_keys=list(original_batch.non_tensor_batch),
+            ).repeat(contract["native_rollouts"], interleave=True)
+            batch = batch.union(generated)
+            batch.non_tensor_batch["uid"] = batch.non_tensor_batch[
+                "opd_verify_stable_id"
+            ].copy()
+            response_mask = build_response_mask(
+                batch.batch["responses"],
+                eos_token_id=self.tokenizer.eos_token_id,
+                pad_token_id=self.tokenizer.pad_token_id,
+            )
+            attention_response_mask = batch.batch["attention_mask"][
+                :, -response_mask.shape[1] :
+            ].bool()
+            if not torch.equal(response_mask, attention_response_mask):
+                raise ValueError(
+                    "rollout response mask differs from authoritative EOS mask"
+                )
+            batch.batch["response_mask"] = response_mask
+            # Preserve native prompt-major/slot-minor engine order for immutable replay.
+            # The capture path never invokes trainer-side response balancing.
+            batch, capture_order_keys = attach_and_validate_keys(
+                batch,
+                engine_seed=contract["engine_seed"],
+                native_rollouts=contract["native_rollouts"],
+                expected_keys=expected_returned_keys,
+            )
+            _validate_capture_batch_forbidden_keys(batch)
+            rollout_provenance = self._publish_opd_proxy_rollout_capture(
+                batch,
+                capture_order_keys,
+                returned_keys,
+                contract,
+                parent_hashes,
+            )
+
+        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+        old_log_prob.batch.pop("entropys", None)
+        batch = batch.union(old_log_prob)
+        if self.use_ref_retokenization:
+            from verl.trainer.ppo.ref_input_utils import prepare_ref_model_inputs
+
+            batch = prepare_ref_model_inputs(
+                batch=batch,
+                ref_tokenizer=self.ref_tokenizer,
+                apply_chat_template_kwargs=self.config.data.get("apply_chat_template_kwargs", {}),
+                raw_prompt_key=self.ref_raw_prompt_key,
+            )
+        ref_log_prob = (
+            self.actor_rollout_wg.compute_ref_log_prob(batch)
+            if self.ref_in_actor
+            else self.ref_policy_wg.compute_ref_log_prob(batch)
+        )
+        batch = batch.union(ref_log_prob)
+        batch, _ = compute_rollout_correction_and_add_to_batch(
+            batch, self.config.algorithm.rollout_correction
+        )
+        _validate_capture_batch_forbidden_keys(batch)
+        self._publish_opd_proxy_trainer_boundary(
+            batch, capture_order_keys, contract, parent_hashes
+        )
+        batch.meta_info.update(
+            {
+                "temperature": float(self.config.actor_rollout_ref.rollout.temperature),
+                "opd_proxy_verify_output_root": contract["output_root"],
+                "opd_proxy_verify_parent_hashes": parent_hashes,
+                "opd_proxy_verify_chunk_size": contract["chunk_size"],
+                "opd_proxy_verify_engine_seed": contract["engine_seed"],
+            }
+        )
+        actor_output = self.actor_rollout_wg.capture_opd_proxy_verify(batch)
+        return self._finalize_opd_proxy_capture(
+            actor_output,
+            capture_order_keys,
+            contract,
+            parent_hashes,
+            rollout_provenance,
+        )
+
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
         attention_mask = batch.batch["attention_mask"]
@@ -1415,6 +1970,10 @@ class RayPPOTrainer:
         to construct the PPO dataflow.
         The light-weight advantage computation is done on the driver process.
         """
+        capture_config = self.config.algorithm.get("opd_proxy_verify_capture", None)
+        if capture_config is not None and capture_config.get("enabled", False):
+            return self._fit_opd_proxy_verify_capture()
+
         from omegaconf import OmegaConf
 
         from verl.utils.tracking import Tracking

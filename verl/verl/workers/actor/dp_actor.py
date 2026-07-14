@@ -20,6 +20,7 @@ Single Process Actor
 import logging
 import os
 
+import numpy as np
 import torch
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -28,6 +29,13 @@ from torch.distributed.tensor import DTensor
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.opd_proxy_verify_capture import (
+    attach_and_validate_keys,
+    compute_authoritative_capture_tensors,
+    recursive_parameter_sha256,
+    resolve_capture_resume_prefix,
+    write_tensor_chunks_atomic,
+)
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -904,8 +912,218 @@ class DataParallelPPOActor(BasePPOActor):
 
         return loss, metrics
 
+    @GPUMemoryLogger(role="dp actor OPD proxy capture", logger=logger)
+    def capture_opd_proxy_verify(self, data: DataProto) -> DataProto:
+        """Capture authoritative actor tensors without backward or optimizer state."""
+        if not self.config.get("opd_proxy_verify_capture_only", False):
+            raise ValueError("actor is not configured for OPD proxy capture only")
+        if self.actor_optimizer is not None:
+            raise ValueError("capture-only actor must not have an optimizer")
+        if self.config.ppo_epochs != 1:
+            raise ValueError("capture actor requires exactly one PPO epoch")
+        if self.config.use_dynamic_bsz:
+            raise ValueError("capture actor forbids dynamic micro-batching")
+        if self.config.ppo_micro_batch_size_per_gpu != 1:
+            raise ValueError("capture actor requires micro-batch size one")
+        if len(data) != self.config.ppo_mini_batch_size:
+            raise ValueError("capture actor requires exactly one local mini-batch")
+        frozen_actor_values = {
+            "loss_agg_mode": "token-mean",
+            "entropy_coeff": 0,
+            "use_kl_loss": True,
+            "kl_loss_coef": 0,
+        }
+        for field, expected in frozen_actor_values.items():
+            if self.config.get(field) != expected:
+                raise ValueError(
+                    f"capture actor requires {field}={expected!r}"
+                )
+        if self.config.policy_loss.get("loss_mode", None) != "vanilla" or not self.config.policy_loss.get(
+            "only_reverse_kl_advantages", False
+        ):
+            raise ValueError("capture actor requires vanilla reverse-KL policy loss")
+        forbidden_prefixes = (
+            "candidate_selection",
+            "difficulty_aware",
+            "length_aware_opd",
+            "rethinking_opd",
+            "tale_budget",
+        )
+        forbidden_exact = {
+            "advantages",
+            "returns",
+            "token_level_rewards",
+            "token_level_scores",
+            "difficulty_aware_entropy_weight",
+        }
+        all_keys = set(data.batch.keys()) | set(data.non_tensor_batch)
+        forbidden = sorted(
+            key
+            for key in all_keys
+            if key in forbidden_exact or any(key.startswith(prefix) for prefix in forbidden_prefixes)
+        )
+        if forbidden:
+            raise ValueError(f"forbidden capture batch keys: {forbidden}")
+        required_tensors = {
+            "responses",
+            "response_mask",
+            "input_ids",
+            "attention_mask",
+            "position_ids",
+            "old_log_probs",
+            "ref_log_prob",
+            "rollout_log_probs",
+            "rollout_is_weights",
+            "opd_proxy_verify_rollout_slot",
+            "opd_proxy_verify_engine_seed",
+        }
+        missing = required_tensors - set(data.batch.keys())
+        if missing:
+            raise ValueError(f"capture actor missing tensors: {sorted(missing)}")
+        required_non_tensors = {
+            "opd_verify_stable_id",
+            "opd_verify_split",
+            "opd_verify_manifest_index",
+        }
+        missing_non_tensors = required_non_tensors - set(data.non_tensor_batch)
+        if missing_non_tensors:
+            raise ValueError(
+                f"capture actor missing metadata: {sorted(missing_non_tensors)}"
+            )
+
+        engine_seed = int(data.meta_info["opd_proxy_verify_engine_seed"])
+        data, local_keys = attach_and_validate_keys(
+            data,
+            engine_seed=engine_seed,
+            native_rollouts=4,
+            require_complete_slots=False,
+        )
+        output_root = str(data.meta_info["opd_proxy_verify_output_root"])
+        parent_hashes = dict(data.meta_info["opd_proxy_verify_parent_hashes"])
+        chunk_size = int(data.meta_info["opd_proxy_verify_chunk_size"])
+        rank = torch.distributed.get_rank()
+        rank_directory = os.path.join(output_root, "actor", f"rank_{rank}")
+        resume_prefix = resolve_capture_resume_prefix(
+            rank_directory,
+            expected_keys=local_keys,
+            parent_hashes=parent_hashes,
+        )
+
+        self.actor_module.train()
+        if any(parameter.grad is not None for parameter in self.actor_module.parameters()):
+            raise ValueError("capture actor started with materialized parameter gradients")
+        parameter_hash_before = recursive_parameter_sha256(self.actor_module)
+        temperature = float(data.meta_info["temperature"])
+        tensor_keys = sorted(required_tensors)
+        selected = data.select(
+            batch_keys=tensor_keys,
+            non_tensor_batch_keys=sorted(required_non_tensors),
+        )
+        for chunk_start in range(resume_prefix, len(selected), chunk_size):
+            chunk_end = min(chunk_start + chunk_size, len(selected))
+            tensor_lists: dict[str, list[torch.Tensor]] = {}
+            sidecars: list[dict[str, object]] = []
+            for row_index in range(chunk_start, chunk_end):
+                micro_batch = selected[row_index : row_index + 1].to(get_device_id())
+                model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+                _, current_log_prob, _ = self._forward_micro_batch(
+                    model_inputs,
+                    temperature=temperature,
+                    calculate_entropy=False,
+                )
+                authoritative = compute_authoritative_capture_tensors(
+                    current_log_prob=current_log_prob,
+                    batch_old_log_prob=model_inputs["old_log_probs"],
+                    rollout_log_prob=model_inputs["rollout_log_probs"],
+                    ref_log_prob=model_inputs["ref_log_prob"],
+                    response_mask=model_inputs["response_mask"],
+                    rollout_is_weights=model_inputs["rollout_is_weights"],
+                    actor_config=self.config,
+                )
+                row_tensors = {
+                    key: model_inputs[key]
+                    for key in (
+                        "responses",
+                        "input_ids",
+                        "attention_mask",
+                        "position_ids",
+                    )
+                }
+                row_tensors.update(
+                    {
+                        name: value.reshape(1) if value.ndim == 0 else value
+                        for name, value in authoritative.items()
+                    }
+                )
+                for name, value in row_tensors.items():
+                    tensor_lists.setdefault(name, []).append(value.detach().cpu())
+                sidecars.append(
+                    {
+                        "stable_id": str(
+                            micro_batch.non_tensor_batch["opd_verify_stable_id"][0]
+                        ),
+                        "engine_seed": engine_seed,
+                        "rollout_slot": int(
+                            micro_batch.batch["opd_proxy_verify_rollout_slot"][0]
+                        ),
+                        "split": str(
+                            micro_batch.non_tensor_batch["opd_verify_split"][0]
+                        ),
+                        "manifest_index": int(
+                            micro_batch.non_tensor_batch[
+                                "opd_verify_manifest_index"
+                            ][0]
+                        ),
+                        "actor_rank": rank,
+                    }
+                )
+                del authoritative, current_log_prob, micro_batch, model_inputs
+            chunk_tensors = {
+                name: torch.cat(values, dim=0) for name, values in tensor_lists.items()
+            }
+            write_tensor_chunks_atomic(
+                rank_directory,
+                tensors=chunk_tensors,
+                sidecar_rows=sidecars,
+                parent_hashes=parent_hashes,
+                chunk_size=chunk_end - chunk_start,
+                start_index=chunk_start,
+            )
+
+        if any(parameter.grad is not None for parameter in self.actor_module.parameters()):
+            raise ValueError("capture actor materialized parameter gradients")
+        parameter_hash_after = recursive_parameter_sha256(self.actor_module)
+        if parameter_hash_before != parameter_hash_after:
+            raise ValueError("actor parameter hash changed during capture")
+        count = len(data)
+        return DataProto(
+            batch=data.batch.select(
+                "opd_proxy_verify_rollout_slot",
+                "opd_proxy_verify_engine_seed",
+            ).update(
+                {
+                    "opd_proxy_verify_actor_rank": torch.full(
+                        (count,), rank, dtype=torch.long
+                    )
+                }
+            ),
+            non_tensor_batch={
+                "opd_verify_stable_id": data.non_tensor_batch[
+                    "opd_verify_stable_id"
+                ].copy(),
+                "opd_proxy_verify_parameter_sha256_before": np.asarray(
+                    [parameter_hash_before] * count, dtype=object
+                ),
+                "opd_proxy_verify_parameter_sha256_after": np.asarray(
+                    [parameter_hash_after] * count, dtype=object
+                ),
+            },
+        ).to("cpu")
+
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
+        if self.config.get("opd_proxy_verify_capture_only", False):
+            raise RuntimeError("update_policy is forbidden in OPD proxy capture-only mode")
         # make sure we are in training mode
         self.actor_module.train()
 

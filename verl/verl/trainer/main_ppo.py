@@ -42,6 +42,64 @@ def main(config):
     run_ppo(config)
 
 
+def validate_opd_proxy_capture_runtime_config(config) -> dict[str, object] | None:
+    """Fail closed unless the full frozen optimizer-free capture contract is active."""
+    capture_config = OmegaConf.select(config, "algorithm.opd_proxy_verify_capture")
+    if capture_config is None or not capture_config.get("enabled", False):
+        return None
+
+    from verl.trainer.ppo.opd_proxy_verify_capture import validate_capture_contract
+
+    contract = validate_capture_contract(capture_config)
+    exact_values = {
+        "data.max_prompt_length": 2048,
+        "data.max_response_length": 16384,
+        "data.truncation": "error",
+        "data.shuffle": False,
+        "actor_rollout_ref.rollout.name": "vllm",
+        "actor_rollout_ref.rollout.mode": "sync",
+        "actor_rollout_ref.rollout.n": 4,
+        "actor_rollout_ref.rollout.seed": contract["engine_seed"],
+        "actor_rollout_ref.rollout.temperature": 1.0,
+        "actor_rollout_ref.rollout.top_p": 1.0,
+        "actor_rollout_ref.rollout.calculate_log_probs": True,
+        "actor_rollout_ref.actor.opd_proxy_verify_capture_only": True,
+        "actor_rollout_ref.actor.ppo_epochs": 1,
+        "actor_rollout_ref.actor.ppo_mini_batch_size": contract["expected_questions"],
+        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu": 1,
+        "actor_rollout_ref.actor.use_dynamic_bsz": False,
+        "actor_rollout_ref.actor.loss_agg_mode": "token-mean",
+        "actor_rollout_ref.actor.entropy_coeff": 0.0,
+        "actor_rollout_ref.actor.use_kl_loss": True,
+        "actor_rollout_ref.actor.kl_loss_coef": 0.0,
+        "actor_rollout_ref.actor.policy_loss.loss_mode": "vanilla",
+        "actor_rollout_ref.actor.policy_loss.only_reverse_kl_advantages": True,
+        "actor_rollout_ref.actor.policy_loss.length_aware_opd": False,
+        "actor_rollout_ref.actor.policy_loss.entropy_aware_distill": False,
+        "algorithm.use_kl_in_reward": False,
+        "algorithm.rollout_correction.rollout_is": "token",
+        "algorithm.rollout_correction.rollout_is_threshold": 5.0,
+        "algorithm.rollout_correction.rollout_is_batch_normalize": False,
+        "algorithm.rollout_correction.rollout_rs": None,
+        "algorithm.rollout_correction.bypass_mode": False,
+    }
+    for path, expected in exact_values.items():
+        actual = OmegaConf.select(config, path)
+        if actual != expected:
+            raise ValueError(
+                f"OPD proxy capture requires {path}={expected!r}, got {actual!r}"
+            )
+    for path in (
+        "algorithm.candidate_selection.enabled",
+        "algorithm.tale_budget.enabled",
+        "algorithm.difficulty_aware_opd.enabled",
+        "algorithm.rethinking_opd_probe.enabled",
+    ):
+        if OmegaConf.select(config, path, default=False):
+            raise ValueError(f"OPD proxy capture forbids {path}")
+    return contract
+
+
 # Define a function to run the PPO-like training process
 def run_ppo(config, task_runner_class=None) -> None:
     """Initialize Ray cluster and run distributed PPO training process.
@@ -257,9 +315,12 @@ class TaskRunner:
         print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
+        capture_contract = validate_opd_proxy_capture_runtime_config(config)
+        capture_enabled = capture_contract is not None
 
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
-        self.add_critic_worker(config)
+        if not capture_enabled:
+            self.add_critic_worker(config)
 
         # We should adopt a multi-source reward function here:
         # - for rule-based rm, we directly call a reward score
@@ -267,7 +328,8 @@ class TaskRunner:
         # - for code related prompt, we send to a sandbox if there are test cases
         # finally, we combine all the rewards together
         # The reward type depends on the tag of the data
-        self.add_reward_model_worker(config)
+        if not capture_enabled:
+            self.add_reward_model_worker(config)
 
         # Add a reference policy worker if KL loss or KL reward is used.
         self.add_ref_policy_worker(config, actor_rollout_cls)
@@ -276,7 +338,7 @@ class TaskRunner:
         validate_config(
             config=config,
             use_reference_policy=need_reference_policy(self.role_worker_mapping),
-            use_critic=need_critic(config),
+            use_critic=need_critic(config) and not capture_enabled,
         )
 
         # Download the checkpoint from HDFS to the local machine.
@@ -305,12 +367,26 @@ class TaskRunner:
             ref_tokenizer = hf_tokenizer(ref_local_path, trust_remote_code=trust_remote_code)
             print(f"Loaded ref_tokenizer from {ref_local_path} for re-tokenization")
 
-        # Load the reward manager for training and validation.
-        reward_fn = load_reward_manager(
-            config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
+        # Capture never executes scoring or validation; do not initialize reward code.
+        reward_fn = (
+            None
+            if capture_enabled
+            else load_reward_manager(
+                config,
+                tokenizer,
+                num_examine=0,
+                **config.reward_model.get("reward_kwargs", {}),
+            )
         )
-        val_reward_fn = load_reward_manager(
-            config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {})
+        val_reward_fn = (
+            None
+            if capture_enabled
+            else load_reward_manager(
+                config,
+                tokenizer,
+                num_examine=1,
+                **config.reward_model.get("reward_kwargs", {}),
+            )
         )
 
         resource_pool_manager = self.init_resource_pool_mgr(config)
@@ -326,13 +402,17 @@ class TaskRunner:
             is_train=True,
             max_samples=config.data.get("train_max_samples", -1),
         )
-        val_dataset = create_rl_dataset(
-            config.data.val_files,
-            config.data,
-            tokenizer,
-            processor,
-            is_train=False,
-            max_samples=config.data.get("val_max_samples", -1),
+        val_dataset = (
+            train_dataset
+            if capture_enabled
+            else create_rl_dataset(
+                config.data.val_files,
+                config.data,
+                tokenizer,
+                processor,
+                is_train=False,
+                max_samples=config.data.get("val_max_samples", -1),
+            )
         )
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
