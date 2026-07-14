@@ -205,8 +205,9 @@ Before GPU work, construct one immutable sample manifest.
 
 ```text
 eligible population:       57,045 questions
+benchmark-clean population: 56,662 questions
 sample seed:               2026071401 (NumPy PCG64)
-main sample:                1,024 questions without replacement
+main sample:                1,024 clean questions without replacement
 candidate prefix:            768 questions
 held-out reference suffix:   256 questions
 selection size:               172 questions
@@ -218,11 +219,15 @@ The selected size is the rounded production coreset fraction:
 round(768 * 12,800 / 57,045) = 172
 ```
 
-Construct `numpy.random.Generator(numpy.random.PCG64(2026071401))` and call
-`permutation(57_045)` exactly once on the ordered eligible-ID positions. The
-first 768 IDs are candidates and the next 256 are held-out reference questions.
-The split is not stratified, rebalanced, or regenerated after inspecting
-metadata or model outputs.
+First run the benchmark exclusion audit below over all 57,045 eligible IDs and
+freeze its 56,662-ID clean mask. Construct
+`numpy.random.Generator(numpy.random.PCG64(2026071401))` and call
+`permutation(57_045)` exactly once on the ordered eligible-ID positions. Filter
+that one permutation by the frozen clean mask while preserving order. The first
+768 retained IDs are candidates and the next 256 are held-out reference
+questions. This is a uniform sample without replacement from the
+benchmark-clean population. The split is not stratified, rebalanced, or
+regenerated after inspecting metadata or model outputs.
 
 Each manifest row records:
 
@@ -231,7 +236,8 @@ stable_id
 source_row_index
 original_dataset_index
 split: candidate | held_out
-sample_position
+eligible_permutation_position
+clean_sample_position
 exact question
 raw OPD prompt messages
 topic and leaf topic
@@ -243,7 +249,19 @@ source/prepared/eligibility hashes
 ```
 
 The manifest additionally records the ordered hashes for all 1,024 IDs, the
-candidate IDs, and the held-out IDs.
+candidate IDs, and the held-out IDs. The root sampling contract binds the
+full-population clean mask, every rejected ID and reason, the filtered
+permutation prefix needed to obtain 2,048 clean IDs, and both the original
+eligible-permutation position and retained clean-sample position of every
+Stage-0/1/2 row.
+
+For all ordered-ID hashes in this design, update SHA-256 with the UTF-8 ID and
+then one `\n` byte for each ID; a non-empty sequence therefore has a terminal
+newline. Under that encoding, the frozen Stage-1 candidate, held-out, and
+candidate-then-held-out hashes are respectively
+`bd4b790e7db49cabc85aad41de792cce436ce60ee004be505554fd83a1a55e9e`,
+`e867617c9b33e6d8881af7dd8b651f64ea7c27ef990f3153222ff34858e33fc7`, and
+`5d84fdbc96212e9915ecb32f0ef5b48d437876ec0c02efc801a43e777274acf6`.
 
 `leaf_topic` is derived only by splitting the prepared row's hierarchical
 `topic` string on the exact delimiter `" -> "`, stripping components, and
@@ -267,8 +285,8 @@ evaluation suite and binds their hashes into the sample manifest:
 | `data/amc2023/test.jsonl` | 40 | `b443425b035d98fec3da4de7e347ac43cebcf7b721e96ba8bf9e0120d24dd61d` |
 
 A read-only raw/exact audit currently finds zero overlaps, but that does not
-replace the reproducible normalized audit. The builder rejects a sampled
-question on either of these conditions:
+replace the reproducible normalized audit. Before sampling, the builder rejects
+each eligible question on either of these conditions:
 
 1. normalized exact-question equality after Unicode NFKC, case-folding,
    whitespace collapse, and removal of only the fixed terminal OPD instruction;
@@ -281,9 +299,25 @@ whitespace are separators. Hash every contiguous sequence of ten resulting
 tokens and reject any train/eval hash intersection. Questions with fewer than
 ten tokens are still covered by exact equality.
 
-The builder does not silently draw replacements. Any collision fails before
-GPU work so the sampling contract can be explicitly revised rather than
-conditioned on benchmark content.
+Under this exact rule, the frozen audit contains zero normalized-exact matches,
+383 10-token-gram matches, and 56,662 clean IDs. In source order, the canonical
+newline-delimited clean-ID list has SHA-256
+`88a1a21ddba4a8aa460963bb404c7bc8f3bf7f6373155fba5eebaad8e52606ee`, and the
+rejected-ID list has SHA-256
+`ba92df92881df385d9662c3a7305d05fe73f69e10cd5b3b3fb9a18e88f8699a6`.
+
+This filtering is an explicit, pre-model sampling rule rather than silent
+post-hoc replacement. The builder writes a 57,045-entry Boolean clean mask, a
+detailed row for every rejection containing the matched benchmark and n-gram,
+and a decontamination manifest binding their hashes. It then applies the one
+frozen permutation and records every rejected permutation position skipped
+before the Stage-2 cutoff. With seed 2026071401, permutation positions 0 through
+2063 contain the first 2,048 clean IDs and exactly 16 rejected IDs. The ordered
+first-2,048 clean-ID SHA-256 is
+`aebf0d9a4743b3bb6d2ee307b6194d3d95a948f699a4439b8c4d43f498efbfc4`.
+Manifest construction fails before GPU work if these counts or hashes differ,
+if fewer than 2,048 clean IDs exist, or if an audited collision appears in any
+sample view.
 
 ## Staged execution
 
@@ -310,11 +344,14 @@ proxy result is borderline:
 0.90 <= median n=1 worst-case G-Vendi percentile < 0.95
 ```
 
-Append the next 1,024 IDs from the original frozen permutation without changing
-any Stage-1 membership: permutation positions `[1024, 1792)` add 768 candidates
-and positions `[1792, 2048)` add 256 held-out references. Thus the expanded
-split is the ordered concatenation of the old and new blocks, with 1,536
-candidate and 512 held-out IDs, and the selected size is:
+Here `target oracle passes` means that both the cross-seed oracle-selection gate
+and the `T_42`/`T_43` target-dependence CKA gate defined below pass.
+
+Append the next 1,024 IDs from the filtered clean permutation without changing
+any Stage-1 membership: clean-sample positions `[1024, 1792)` add 768 candidates
+and clean-sample positions `[1792, 2048)` add 256 held-out references. Thus the
+expanded split is the ordered concatenation of the old and new blocks, with
+1,536 candidate and 512 held-out IDs, and the selected size is:
 
 ```text
 round(1,536 * 12,800 / 57,045) = 345
@@ -339,9 +376,12 @@ or a provenance/correctness failure.
 Stage 1 remains the sole primary classification. Because Stage 2 is triggered
 by a borderline Stage-1 result and reuses its rows, its expanded-pool null does
 not calibrate the full adaptive stopping rule. Stage 2 therefore reports a
-separate `extended_pass|extended_fail` sensitivity result and may diagnose
-finite-pool uncertainty, but it cannot upgrade or downgrade the Stage-1
-classification in the interpretation matrix.
+separate `extended_pass|extended_fail|extended_inconclusive` sensitivity result.
+Recompute the expanded-pool oracle and candidate gates: an expanded
+oracle/dependence failure is `extended_inconclusive`; otherwise apply the same
+candidate conjunction and label it `extended_pass` or `extended_fail`. The
+result may diagnose finite-pool uncertainty, but no Stage-2 label can upgrade
+or downgrade the Stage-1 classification in the interpretation matrix.
 
 ## Frozen vanilla-OPD contract
 
@@ -955,11 +995,13 @@ data/opd_proxy_gradient_verify/stage_{0,1,2}/report.{json,md}
 logs/opd_proxy_gradient_verify/stage_{0,1,2}/
 ```
 
-The root sampling contract binds the eligible-ID order, PCG64 algorithm and
-seed, and the first 2,048 permutation positions before any GPU output exists.
-Stage 0 and Stage 1 are immutable views of that contract. A Stage-2 manifest is
-created only when the predeclared extension gate fires and includes the exact
-Stage-1 report hash and the deterministic added-ID blocks as parents.
+The root sampling contract binds the eligible-ID order, benchmark hashes,
+decontamination artifacts, PCG64 algorithm and seed, skipped original
+permutation positions, and the first 2,048 retained clean positions before any
+GPU output exists. Stage 0 and Stage 1 are immutable views of that contract. A
+Stage-2 manifest is created only when the predeclared extension gate fires and
+includes the exact Stage-1 report hash and the deterministic added-ID blocks as
+parents.
 
 Every directory has a manifest binding:
 
@@ -1025,7 +1067,8 @@ Fail before or during GPU work when:
 
 Cover:
 
-- deterministic eligibility sampling and 768/256 splitting;
+- deterministic full-population benchmark audit, clean-mask hashing, filtered
+  eligibility sampling, skipped-position accounting, and 768/256 splitting;
 - deterministic Stage-2 block membership, parent manifests, and expanded
   1,536/512 cardinalities;
 - fixed hashes for a small manifest fixture;
