@@ -14,11 +14,13 @@
 
 import unittest
 
+import hydra
 import numpy as np
 import torch
 from omegaconf import OmegaConf
 
 from verl.trainer.config import AlgoConfig, KLControlConfig
+from verl.trainer.config.algorithm import OpdProxyVerifyCaptureConfig
 from verl.trainer.ppo.core_algos import (
     compute_gae_advantage_return,
     compute_grpo_outcome_advantage,
@@ -124,6 +126,19 @@ class TestAlgoConfig(unittest.TestCase):
         self.assertIsInstance(minimal_config.kl_ctrl, KLControlConfig)
         assert not minimal_config.pf_ppo
 
+    def test_capture_config_is_publicly_exported_and_hydra_instantiable(self):
+        from verl.trainer.config import OpdProxyVerifyCaptureConfig as PublicConfig
+
+        assert PublicConfig is OpdProxyVerifyCaptureConfig
+        instantiated = hydra.utils.instantiate(
+            {
+                "_target_": "verl.trainer.config.OpdProxyVerifyCaptureConfig",
+                "enabled": False,
+            }
+        )
+        assert isinstance(instantiated, OpdProxyVerifyCaptureConfig)
+        assert AlgoConfig().opd_proxy_verify_capture.enabled is False
+
     def test_config_init_from_yaml(self):
         import os
 
@@ -138,6 +153,11 @@ class TestAlgoConfig(unittest.TestCase):
         from verl.trainer.config import AlgoConfig
 
         assert isinstance(algo_config, AlgoConfig)
+        assert isinstance(
+            algo_config.opd_proxy_verify_capture, OpdProxyVerifyCaptureConfig
+        )
+        assert algo_config.opd_proxy_verify_capture.enabled is False
+        assert algo_config.opd_proxy_verify_capture.native_rollouts == 4
 
     def test_yaml_accepts_tale_budget_teacher_prompt_style_override(self):
         import os

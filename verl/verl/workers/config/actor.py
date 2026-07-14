@@ -133,6 +133,7 @@ class ActorConfig(BaseConfig):
     engine: BaseConfig = field(default_factory=BaseConfig)
     data_loader_seed = 1
     rollout_n: int = 1  # must be override by sampling config
+    opd_proxy_verify_capture_only: bool = False
     model_config: HFModelConfig = field(default_factory=BaseConfig)
 
     def __post_init__(self):

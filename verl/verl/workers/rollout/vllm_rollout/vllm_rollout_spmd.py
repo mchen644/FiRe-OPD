@@ -27,13 +27,14 @@ When working with Megatron:
 """
 
 import asyncio
+import copy
 import getpass
 import inspect
 import logging
 import os
 import time
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from types import MethodType
 from typing import Any, Generator
 
@@ -96,6 +97,60 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 # 1. support pp in vllm
 # 2. passing tokenizer is not necessary? no encoding/decoding is happending here
 # 3. simplify init logics
+
+
+@dataclass(frozen=True)
+class NativeNExpansion:
+    """Prompt-major expansion returned by one native multi-completion call."""
+
+    stable_ids: np.ndarray
+    rollout_slots: np.ndarray
+    token_ids: list[list[int]]
+
+
+def _expand_native_n_outputs(
+    *, stable_ids: np.ndarray, request_outputs: list[object], native_n: int
+) -> NativeNExpansion:
+    if isinstance(native_n, bool) or not isinstance(native_n, int) or native_n <= 0:
+        raise ValueError("native_n must be a positive integer")
+    if not isinstance(stable_ids, np.ndarray) or stable_ids.ndim != 1:
+        raise ValueError("stable_ids must be a one-dimensional numpy array")
+    stable_id_list = stable_ids.tolist()
+    if any(not isinstance(stable_id, str) or not stable_id for stable_id in stable_id_list):
+        raise ValueError("native-n prompt stable IDs must be nonempty strings")
+    if len(set(stable_id_list)) != len(stable_id_list):
+        raise ValueError("native-n prompts require unique stable IDs")
+    if len(request_outputs) != len(stable_id_list):
+        raise ValueError("native-n request output count does not match prompt count")
+
+    expanded_ids: list[str] = []
+    rollout_slots: list[int] = []
+    token_ids: list[list[int]] = []
+    for stable_id, request_output in zip(
+        stable_id_list, request_outputs, strict=True
+    ):
+        completions = getattr(request_output, "outputs", None)
+        if not isinstance(completions, list) or len(completions) != native_n:
+            raise ValueError(
+                f"native-n request for {stable_id} returned the wrong completion count"
+            )
+        for slot, completion in enumerate(completions):
+            completion_token_ids = getattr(completion, "token_ids", None)
+            if not isinstance(completion_token_ids, list) or any(
+                isinstance(token_id, bool) or not isinstance(token_id, int)
+                for token_id in completion_token_ids
+            ):
+                raise ValueError(
+                    f"native-n completion {stable_id} slot {slot} has invalid token IDs"
+                )
+            expanded_ids.append(stable_id)
+            rollout_slots.append(slot)
+            token_ids.append(list(completion_token_ids))
+    return NativeNExpansion(
+        stable_ids=np.asarray(expanded_ids, dtype=object),
+        rollout_slots=np.asarray(rollout_slots, dtype=np.int64),
+        token_ids=token_ids,
+    )
 
 
 # NOTE(sgm): add for verl. We can optimize it by making the dataloader yield List[int] without padding.
@@ -270,6 +325,7 @@ class vLLMRollout(BaseRollout):
         self.sampling_params = SamplingParams(**kwargs)
 
         self.pad_token_id = tokenizer.pad_token_id
+        self._opd_proxy_verify_capture_generated = False
 
     @contextmanager
     def update_sampling_params(self, **kwargs):
@@ -310,6 +366,39 @@ class vLLMRollout(BaseRollout):
             responses:     |<- LLM generation ->|<- tool_calls ->|<- LLM generation ->|<- padding ->|
             response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
         """
+        native_n = kwargs.pop("opd_proxy_verify_native_n", None)
+        native_capture = native_n is not None
+        native_stable_ids: np.ndarray | None = None
+        if native_capture:
+            if prompts.meta_info.get("opd_proxy_verify_capture_enabled") is not True:
+                raise ValueError(
+                    "opd_proxy_verify_native_n requires capture enabled metadata"
+                )
+            if isinstance(native_n, bool) or not isinstance(native_n, int) or native_n != 4:
+                raise ValueError("OPD proxy native capture requires exactly 4 completions")
+            if getattr(self, "_opd_proxy_verify_capture_generated", False):
+                raise RuntimeError(
+                    "second native capture generation on the same engine is forbidden"
+                )
+            stable_ids = prompts.non_tensor_batch.get("opd_verify_stable_id")
+            if not isinstance(stable_ids, np.ndarray) or stable_ids.ndim != 1:
+                raise ValueError(
+                    "native capture requires one-dimensional opd_verify_stable_id metadata"
+                )
+            stable_id_list = stable_ids.tolist()
+            if any(
+                not isinstance(stable_id, str) or not stable_id
+                for stable_id in stable_id_list
+            ) or len(set(stable_id_list)) != len(stable_id_list):
+                raise ValueError(
+                    "native capture requires unique nonempty stable prompt IDs"
+                )
+            native_stable_ids = stable_ids.copy()
+            if prompts.meta_info.get("do_sample", True) is not True or prompts.meta_info.get(
+                "validate", False
+            ):
+                raise ValueError("native capture requires sampled non-validation generation")
+
         idx = prompts.batch["input_ids"]  # (bs, prompt_length)
         # left-padded attention_mask
         attention_mask = prompts.batch["attention_mask"]
@@ -320,7 +409,13 @@ class vLLMRollout(BaseRollout):
 
         batch_size = idx.size(0)
 
-        non_tensor_batch = prompts.non_tensor_batch
+        # The legacy path intentionally keeps its existing in-place behavior. Capture
+        # works from a shallow mapping copy so retry checks retain caller metadata.
+        non_tensor_batch = (
+            dict(prompts.non_tensor_batch)
+            if native_capture
+            else prompts.non_tensor_batch
+        )
         if "raw_prompt_ids" not in non_tensor_batch:
             non_tensor_batch["raw_prompt_ids"] = np.array(
                 [_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)], dtype=object
@@ -379,32 +474,69 @@ class vLLMRollout(BaseRollout):
                 ] * batch_size
 
         # users can customize different sampling_params at different run
+        rollout_slots: torch.Tensor | None = None
         with self.update_sampling_params(**kwargs):
+            generation_sampling_params = self.sampling_params
+            if native_capture:
+                generation_sampling_params = copy.deepcopy(self.sampling_params)
+                generation_sampling_params.n = native_n
             outputs = self.inference_engine.generate(
                 prompts=vllm_inputs,  # because we have already convert it to prompt token id
-                sampling_params=self.sampling_params,
+                sampling_params=generation_sampling_params,
                 lora_request=lora_requests,
                 use_tqdm=False,
             )
+            if native_capture:
+                # The engine call is irrevocable even if output validation below fails.
+                self._opd_proxy_verify_capture_generated = True
 
             # TODO(sgm): disable logprob when recompute_log_prob is enable
             # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
+            if native_capture:
+                assert native_stable_ids is not None
+                expansion = _expand_native_n_outputs(
+                    stable_ids=native_stable_ids,
+                    request_outputs=outputs,
+                    native_n=native_n,
+                )
+                response = expansion.token_ids
+            else:
+                response = []
 
-            response = []
             rollout_log_probs = []
             for output in outputs:
                 for sample_id in range(len(output.outputs)):
                     response_ids = output.outputs[sample_id].token_ids
-                    response.append(response_ids)
+                    if not native_capture:
+                        response.append(response_ids)
                     if self.config.calculate_log_probs:
                         curr_log_prob = []
                         for i, logprob in enumerate(output.outputs[sample_id].logprobs):
                             curr_log_prob.append(logprob[response_ids[i]].logprob)
                         rollout_log_probs.append(curr_log_prob)
 
-            response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(
-                idx.device
-            )
+            if native_capture:
+                idx = idx.repeat_interleave(native_n, dim=0)
+                attention_mask = attention_mask.repeat_interleave(native_n, dim=0)
+                position_ids = position_ids.repeat_interleave(native_n, dim=0)
+                non_tensor_batch = {
+                    key: np.repeat(value, native_n, axis=0)
+                    for key, value in non_tensor_batch.items()
+                }
+                if not np.array_equal(
+                    non_tensor_batch["opd_verify_stable_id"], expansion.stable_ids
+                ):
+                    raise RuntimeError("native-n stable-ID expansion mismatch")
+                rollout_slots = torch.as_tensor(
+                    expansion.rollout_slots, dtype=torch.long, device=idx.device
+                )
+                batch_size *= native_n
+
+            response = pad_2d_list_to_length(
+                response,
+                self.pad_token_id,
+                max_length=self.config.response_length,
+            ).to(idx.device)
             if self.config.calculate_log_probs:
                 rollout_log_probs = pad_2d_list_to_length(
                     rollout_log_probs, -1, max_length=self.config.response_length
@@ -444,6 +576,8 @@ class vLLMRollout(BaseRollout):
         if self.config.calculate_log_probs:
             # we will recompute old log prob with actor
             batch["rollout_log_probs"] = rollout_log_probs
+        if rollout_slots is not None:
+            batch["opd_proxy_verify_rollout_slot"] = rollout_slots
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 

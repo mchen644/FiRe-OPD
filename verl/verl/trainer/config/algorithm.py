@@ -23,6 +23,7 @@ __all__ = [
     "DifficultyAwareOpdConfig",
     "FilterGroupsConfig",
     "KLControlConfig",
+    "OpdProxyVerifyCaptureConfig",
     "RethinkingOpdProbeConfig",
     "RolloutCorrectionConfig",
     "TaleBudgetConfig",
@@ -407,6 +408,23 @@ class DifficultyAwareOpdConfig(BaseConfig):
 
 
 @dataclass
+class OpdProxyVerifyCaptureConfig(BaseConfig):
+    """Frozen work-unit configuration for optimizer-free OPD proxy capture."""
+
+    enabled: bool = False
+    output_root: Optional[str] = None
+    sample_manifest: Optional[str] = None
+    sample_manifest_sha256: Optional[str] = None
+    stage: int = 0
+    pair: str = "target"
+    engine_seed: int = 42
+    native_rollouts: int = 4
+    expected_questions: int = 0
+    chunk_size: int = 16
+    schema_version: int = 1
+
+
+@dataclass
 class AlgoConfig(BaseConfig):
     """Configuration for the algorithm.
 
@@ -454,6 +472,9 @@ class AlgoConfig(BaseConfig):
     tale_budget: TaleBudgetConfig = field(default_factory=TaleBudgetConfig)
     rethinking_opd_probe: RethinkingOpdProbeConfig = field(default_factory=RethinkingOpdProbeConfig)
     difficulty_aware_opd: DifficultyAwareOpdConfig = field(default_factory=DifficultyAwareOpdConfig)
+    opd_proxy_verify_capture: OpdProxyVerifyCaptureConfig = field(
+        default_factory=OpdProxyVerifyCaptureConfig
+    )
     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None

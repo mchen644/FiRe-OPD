@@ -104,6 +104,45 @@ algorithm:
     # Target KL divergence (used for adaptive controller)
     target_kl: 0.1
 
+  # Optimizer-free OPD proxy verification capture configuration
+  opd_proxy_verify_capture:
+
+    # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+    _target_: verl.trainer.config.OpdProxyVerifyCaptureConfig
+
+    # Whether capture mode is enabled
+    enabled: False
+
+    # Immutable output root for this work unit
+    output_root: null
+
+    # Immutable stage sample manifest
+    sample_manifest: null
+
+    # Expected SHA-256 of the stage sample manifest
+    sample_manifest_sha256: null
+
+    # Stage number
+    stage: 0
+
+    # Model pair: target or proxy
+    pair: target
+
+    # vLLM engine seed
+    engine_seed: 42
+
+    # Native completions returned by one vLLM request
+    native_rollouts: 4
+
+    # Expected number of unique questions in this work unit
+    expected_questions: 0
+
+    # Atomic tensor chunk size
+    chunk_size: 16
+
+    # Capture artifact schema version
+    schema_version: 1
+
   # Whether to enable preference feedback PPO
   use_pf_ppo: False
 
