@@ -9,7 +9,7 @@ import os
 import re
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -1489,21 +1489,23 @@ def _default_replay_actor_config():
 
     from verl.workers.config import FSDPActorConfig, PolicyLossConfig
 
-    config = OmegaConf.structured(
-        FSDPActorConfig(
-            strategy="fsdp",
-            rollout_n=4,
-            ppo_mini_batch_size=1,
-            ppo_micro_batch_size_per_gpu=1,
-            ppo_epochs=1,
-            use_dynamic_bsz=False,
-            use_torch_compile=False,
-            use_kl_loss=True,
-            kl_loss_coef=0.0,
-            entropy_coeff=0.0,
-            policy_loss=PolicyLossConfig(
-                loss_mode="vanilla", only_reverse_kl_advantages=True
-            ),
+    config = OmegaConf.create(
+        asdict(
+            FSDPActorConfig(
+                strategy="fsdp",
+                rollout_n=4,
+                ppo_mini_batch_size=1,
+                ppo_micro_batch_size_per_gpu=1,
+                ppo_epochs=1,
+                use_dynamic_bsz=False,
+                use_torch_compile=False,
+                use_kl_loss=True,
+                kl_loss_coef=0.0,
+                entropy_coeff=0.0,
+                policy_loss=PolicyLossConfig(
+                    loss_mode="vanilla", only_reverse_kl_advantages=True
+                ),
+            )
         )
     )
     with open_dict(config):

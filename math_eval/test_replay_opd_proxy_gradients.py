@@ -46,6 +46,15 @@ from verl.trainer.ppo.opd_proxy_verify_capture import (
 from verl.workers.config import ActorConfig, PolicyLossConfig
 
 
+def test_default_replay_actor_config_constructs_without_typed_model_config():
+    config = replay_module._default_replay_actor_config()
+    assert config.strategy == "fsdp"
+    assert config.policy_loss.loss_mode == "vanilla"
+    assert config.policy_loss.only_reverse_kl_advantages is True
+    assert config.use_remove_padding is True
+    assert config.use_fused_kernels is False
+
+
 class ToyReplayActor:
     def __init__(self):
         self.actor_module = torch.nn.Linear(1, 1, bias=True)
