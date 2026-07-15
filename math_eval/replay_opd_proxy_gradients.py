@@ -1537,7 +1537,7 @@ def load_replay_actor(
 
     model = AutoModelForCausalLM.from_pretrained(
         model_root,
-        torch_dtype=torch.float32,
+        torch_dtype=torch.bfloat16,
         trust_remote_code=False,
         attn_implementation="flash_attention_2",
     ).to(device)

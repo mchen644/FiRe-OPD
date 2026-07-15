@@ -46,6 +46,57 @@ from verl.trainer.ppo.opd_proxy_verify_capture import (
 from verl.workers.config import ActorConfig, PolicyLossConfig
 
 
+def test_load_replay_actor_uses_checkpoint_bfloat16_precision(tmp_path, monkeypatch):
+    model_root = tmp_path / "model"
+    model_root.mkdir()
+    (model_root / "config.json").write_text("{}", encoding="utf-8")
+    seen = {}
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+
+        def to(self, device):
+            seen["device"] = device
+            return self
+
+        def gradient_checkpointing_enable(self, **kwargs):
+            seen["gradient_checkpointing"] = kwargs
+
+    class Actor:
+        def __init__(self, *, config, actor_module, actor_optimizer):
+            self.config = config
+            self.actor_module = actor_module
+            self.actor_optimizer = actor_optimizer
+
+    def from_pretrained(cls, path, **kwargs):
+        seen["model_path"] = Path(path)
+        seen["torch_dtype"] = kwargs["torch_dtype"]
+        return Model()
+
+    from transformers import AutoModelForCausalLM
+    from verl.models.transformers import monkey_patch as monkey_patch_module
+    from verl.workers.actor import dp_actor as dp_actor_module
+
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        AutoModelForCausalLM,
+        "from_pretrained",
+        classmethod(from_pretrained),
+    )
+    monkeypatch.setattr(monkey_patch_module, "apply_monkey_patch", lambda **kwargs: None)
+    monkeypatch.setattr(dp_actor_module, "DataParallelPPOActor", Actor)
+
+    actor = replay_module.load_replay_actor(model_root)
+
+    assert seen["model_path"] == model_root.resolve()
+    assert seen["device"] == "cuda:0"
+    assert seen["torch_dtype"] is torch.bfloat16
+    assert actor.actor_optimizer is None
+
+
 def test_default_replay_actor_config_constructs_without_typed_model_config():
     config = replay_module._default_replay_actor_config()
     assert config.strategy == "fsdp"
