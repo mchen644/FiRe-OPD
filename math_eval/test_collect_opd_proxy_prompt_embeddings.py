@@ -65,6 +65,9 @@ def _row(index: int):
         "split": "candidate",
         "manifest_index": index,
         "prompt": f"Question {index}",
+        "raw_opd_messages": [
+            {"role": "user", "content": f"Question {index} [OPD suffix]"}
+        ],
         "completion": f"must not be embedded {index}",
         "prompt_token_count_0_6b": 4,
     }
@@ -158,7 +161,9 @@ def test_embedding_collector_uses_only_raw_prompt_and_no_backward(monkeypatch):
     record = collector.collect_one(_row(0))
 
     assert record.vector_id == "E:q0"
-    assert tokenizer.last_messages == [{"role": "user", "content": "Question 0"}]
+    assert tokenizer.last_messages == [
+        {"role": "user", "content": "Question 0 [OPD suffix]"}
+    ]
     assert model.training is False
     assert model.teacher_calls == 0
     assert len(model.calls) == 1

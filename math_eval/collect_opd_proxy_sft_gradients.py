@@ -472,7 +472,7 @@ def load_production_sft_collector(
 
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        torch_dtype=torch.float32,
+        torch_dtype="auto",
         trust_remote_code=False,
         attn_implementation="flash_attention_2",
     ).to("cuda:0")

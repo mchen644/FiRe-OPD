@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from math_eval import collect_opd_proxy_sft_gradients as sft_module
 from math_eval.collect_opd_proxy_sft_gradients import (
     build_sft_example,
     collect_sft_shard,
@@ -125,6 +126,92 @@ def _collect_kwargs(tmp_path: Path, collector, rows, *, output="vectors", stage=
         },
         "chunk_size": 1,
     }
+
+
+def test_production_sft_loader_uses_official_checkpoint_dtype(tmp_path, monkeypatch):
+    model_root = tmp_path / "model"
+    model_root.mkdir()
+    reference = _reference(tmp_path)
+    expected_model_hash = "a" * 64
+    seen = {}
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(2))
+            self.config = type("Config", (), {"max_position_embeddings": 40_960})()
+
+        def to(self, device):
+            seen["device"] = device
+            return self
+
+    class GradientComputer:
+        def prepare_model_input(self, prompt, completion):
+            raise NotImplementedError
+
+        def obtain_gradient(self, encoding):
+            raise NotImplementedError
+
+        def project_gradients(self, gradients):
+            raise NotImplementedError
+
+    def model_from_pretrained(cls, path, **kwargs):
+        seen["model_path"] = Path(path)
+        seen["torch_dtype"] = kwargs["torch_dtype"]
+        return Model()
+
+    def tokenizer_from_pretrained(cls, path, **kwargs):
+        seen["tokenizer_path"] = Path(path)
+        return object()
+
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(
+        AutoModelForCausalLM,
+        "from_pretrained",
+        classmethod(model_from_pretrained),
+    )
+    monkeypatch.setattr(
+        AutoTokenizer,
+        "from_pretrained",
+        classmethod(tokenizer_from_pretrained),
+    )
+    monkeypatch.setattr(
+        sft_module,
+        "verify_prismatic_reference",
+        lambda path: reference,
+    )
+    monkeypatch.setattr(
+        sft_module,
+        "recursive_file_manifest",
+        lambda path: {"manifest_sha256": expected_model_hash},
+    )
+    monkeypatch.setattr(
+        sft_module,
+        "load_official_gradient_computer_class",
+        lambda *args: GradientComputer,
+    )
+    monkeypatch.setattr(
+        sft_module,
+        "construct_strict_collector",
+        lambda gradient_class, model_name, model, tokenizer: gradient_class(),
+    )
+
+    collector, model_manifest, tokenizer_manifest = (
+        sft_module.load_production_sft_collector(
+            model_path=model_root,
+            reference_repo=tmp_path,
+            expected_model_sha256=expected_model_hash,
+        )
+    )
+
+    assert seen["model_path"] == model_root
+    assert seen["tokenizer_path"] == model_root
+    assert seen["device"] == "cuda:0"
+    assert seen["torch_dtype"] == "auto"
+    assert collector.gradient_computer.__class__ is GradientComputer
+    assert model_manifest == tokenizer_manifest
 
 
 def test_sft_collector_calls_official_completion_only_methods(tmp_path: Path):

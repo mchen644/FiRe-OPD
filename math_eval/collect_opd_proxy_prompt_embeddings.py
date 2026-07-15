@@ -221,13 +221,25 @@ def _validate_embedding_row(
     if not isinstance(row, Mapping):
         raise TypeError("embedding row must be mapping-like")
     stable_id = row.get("stable_id")
-    prompt = row.get("prompt")
+    source_prompt = row.get("prompt")
+    raw_messages = row.get("raw_opd_messages")
     split = row.get("split")
     token_count = row.get("prompt_token_count_0_6b")
     if not isinstance(stable_id, str) or not stable_id:
         raise ValueError("embedding stable ID must be nonempty")
+    if not isinstance(source_prompt, str) or not source_prompt:
+        raise ValueError(f"embedding source prompt is invalid for {stable_id}")
+    if (
+        not isinstance(raw_messages, Sequence)
+        or isinstance(raw_messages, str | bytes)
+        or len(raw_messages) != 1
+        or not isinstance(raw_messages[0], Mapping)
+        or raw_messages[0].get("role") != "user"
+    ):
+        raise ValueError(f"embedding raw OPD message is invalid for {stable_id}")
+    prompt = raw_messages[0].get("content")
     if not isinstance(prompt, str) or not prompt:
-        raise ValueError(f"embedding prompt is invalid for {stable_id}")
+        raise ValueError(f"embedding raw OPD prompt is invalid for {stable_id}")
     if not isinstance(split, str) or not split:
         raise ValueError(f"embedding split is invalid for {stable_id}")
     if isinstance(token_count, bool) or not isinstance(token_count, int) or token_count <= 0:
