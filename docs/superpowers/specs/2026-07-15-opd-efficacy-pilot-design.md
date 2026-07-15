@@ -200,6 +200,19 @@ The maximum response length must not be reduced for the pilot.
 
 A contract-projection test removes only stage identity, `rollout.n`, and generation-seed fields from Stage-1 and pilot contracts and requires exact equality of every remaining field. This prevents an accidental unlisted pilot shortcut.
 
+### 5.3 Systems-only FSDP dispatch padding
+
+The exact target and proxy trajectory counts, 334 and 250, are not divisible by four FSDP ranks when native `n=1`. Internal actor and reference RPC dispatch therefore pads to 336 and 252 rows, respectively, using marked duplicate prefix rows. This is transport padding, not an algorithm deviation or additional trajectory:
+
+- generation still returns exactly one trajectory for each of the 334 or 250 ordered questions;
+- rollout correction and the published trainer boundary consume only the exact unpadded rows;
+- every FSDP rank executes an equal number of forwards, including on resume;
+- marked padding rows are never written to actor chunks, rank provenance, compound-key coverage, or completion manifests;
+- controller outputs are unpadded back to exact order and cardinality before finalization; and
+- any non-suffix marker, non-minimal dispatch count, leaked row, missing row, duplicate persisted key, or order change fails closed.
+
+The actor PPO mini-batch field records the internal dispatch count (336 for target and 252 for proxy), while `expected_questions` remains the scientific count (334 and 250). There is still exactly one mini-batch per actor rank and micro-batch size one.
+
 ## 6. Representations and replay
 
 The pilot produces exactly two representations.

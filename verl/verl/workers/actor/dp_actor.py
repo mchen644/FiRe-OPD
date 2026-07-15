@@ -1159,6 +1159,22 @@ class DataParallelPPOActor(BasePPOActor):
                 f"capture actor missing metadata: {sorted(missing_non_tensors)}"
             )
 
+        padding_key = "opd_proxy_verify_padding"
+        has_dispatch_padding = padding_key in data.non_tensor_batch
+        padding_mask = data.non_tensor_batch.get(padding_key)
+        if padding_mask is None:
+            padding_mask = np.zeros(len(data), dtype=np.bool_)
+        if (
+            not isinstance(padding_mask, np.ndarray)
+            or padding_mask.shape != (len(data),)
+            or padding_mask.dtype != np.bool_
+        ):
+            raise ValueError("capture padding marker must be a one-dimensional bool array")
+        padded_indices = np.flatnonzero(padding_mask)
+        real_count = int(padded_indices[0]) if padded_indices.size else len(data)
+        if padding_mask[:real_count].any() or not padding_mask[real_count:].all():
+            raise ValueError("capture padding rows must form one contiguous suffix")
+
         engine_seed = int(data.meta_info["opd_proxy_verify_engine_seed"])
         data, local_keys = attach_and_validate_keys(
             data,
@@ -1166,6 +1182,7 @@ class DataParallelPPOActor(BasePPOActor):
             native_rollouts=4,
             require_complete_slots=False,
         )
+        real_keys = local_keys[:real_count]
         output_root = str(data.meta_info["opd_proxy_verify_output_root"])
         parent_hashes = dict(data.meta_info["opd_proxy_verify_parent_hashes"])
         chunk_size = int(data.meta_info["opd_proxy_verify_chunk_size"])
@@ -1173,7 +1190,7 @@ class DataParallelPPOActor(BasePPOActor):
         rank_directory = os.path.join(output_root, "actor", f"rank_{rank}")
         resume_prefix = resolve_capture_resume_prefix(
             rank_directory,
-            expected_keys=local_keys,
+            expected_keys=real_keys,
             parent_hashes=parent_hashes,
         )
 
@@ -1183,11 +1200,18 @@ class DataParallelPPOActor(BasePPOActor):
         parameter_hash_before = recursive_parameter_sha256(self.actor_module)
         temperature = float(data.meta_info["temperature"])
         tensor_keys = sorted(required_tensors)
+        selected_non_tensor_keys = set(required_non_tensors)
+        if padding_key in data.non_tensor_batch:
+            selected_non_tensor_keys.add(padding_key)
         selected = data.select(
             batch_keys=tensor_keys,
-            non_tensor_batch_keys=sorted(required_non_tensors),
+            non_tensor_batch_keys=sorted(selected_non_tensor_keys),
         )
-        for chunk_start in range(resume_prefix, len(selected), chunk_size):
+        # With dispatch padding, every rank always performs the same number of
+        # forwards after resume because FSDP forward contains rank collectives.
+        # Unpadded captures retain the existing bounded-resume fast path.
+        loop_start = 0 if has_dispatch_padding else resume_prefix
+        for chunk_start in range(loop_start, len(selected), chunk_size):
             chunk_end = min(chunk_start + chunk_size, len(selected))
             tensor_lists: dict[str, list[torch.Tensor]] = {}
             sidecars: list[dict[str, object]] = []
@@ -1208,55 +1232,65 @@ class DataParallelPPOActor(BasePPOActor):
                     rollout_is_weights=model_inputs["rollout_is_weights"],
                     actor_config=self.config,
                 )
-                row_tensors = {
-                    key: model_inputs[key]
-                    for key in (
-                        "responses",
-                        "input_ids",
-                        "attention_mask",
-                        "position_ids",
+                publish_row = row_index < real_count and row_index >= resume_prefix
+                if publish_row:
+                    row_tensors = {
+                        key: model_inputs[key]
+                        for key in (
+                            "responses",
+                            "input_ids",
+                            "attention_mask",
+                            "position_ids",
+                        )
+                    }
+                    row_tensors.update(
+                        {
+                            name: value.reshape(1) if value.ndim == 0 else value
+                            for name, value in authoritative.items()
+                        }
                     )
-                }
-                row_tensors.update(
-                    {
-                        name: value.reshape(1) if value.ndim == 0 else value
-                        for name, value in authoritative.items()
-                    }
-                )
-                for name, value in row_tensors.items():
-                    tensor_lists.setdefault(name, []).append(value.detach().cpu())
-                sidecars.append(
-                    {
-                        "stable_id": str(
-                            micro_batch.non_tensor_batch["opd_verify_stable_id"][0]
-                        ),
-                        "engine_seed": engine_seed,
-                        "rollout_slot": int(
-                            micro_batch.batch["opd_proxy_verify_rollout_slot"][0]
-                        ),
-                        "split": str(
-                            micro_batch.non_tensor_batch["opd_verify_split"][0]
-                        ),
-                        "manifest_index": int(
-                            micro_batch.non_tensor_batch[
-                                "opd_verify_manifest_index"
-                            ][0]
-                        ),
-                        "actor_rank": rank,
-                    }
-                )
+                    for name, value in row_tensors.items():
+                        tensor_lists.setdefault(name, []).append(value.detach().cpu())
+                    sidecars.append(
+                        {
+                            "stable_id": str(
+                                micro_batch.non_tensor_batch[
+                                    "opd_verify_stable_id"
+                                ][0]
+                            ),
+                            "engine_seed": engine_seed,
+                            "rollout_slot": int(
+                                micro_batch.batch[
+                                    "opd_proxy_verify_rollout_slot"
+                                ][0]
+                            ),
+                            "split": str(
+                                micro_batch.non_tensor_batch[
+                                    "opd_verify_split"
+                                ][0]
+                            ),
+                            "manifest_index": int(
+                                micro_batch.non_tensor_batch[
+                                    "opd_verify_manifest_index"
+                                ][0]
+                            ),
+                            "actor_rank": rank,
+                        }
+                    )
                 del authoritative, current_log_prob, micro_batch, model_inputs
-            chunk_tensors = {
-                name: torch.cat(values, dim=0) for name, values in tensor_lists.items()
-            }
-            write_tensor_chunks_atomic(
-                rank_directory,
-                tensors=chunk_tensors,
-                sidecar_rows=sidecars,
-                parent_hashes=parent_hashes,
-                chunk_size=chunk_end - chunk_start,
-                start_index=chunk_start,
-            )
+            if sidecars:
+                chunk_tensors = {
+                    name: torch.cat(values, dim=0)
+                    for name, values in tensor_lists.items()
+                }
+                write_tensor_chunks_atomic(
+                    rank_directory,
+                    tensors=chunk_tensors,
+                    sidecar_rows=sidecars,
+                    parent_hashes=parent_hashes,
+                    chunk_size=len(sidecars),
+                    start_index=max(chunk_start, resume_prefix),
+                )
 
         if any(parameter.grad is not None for parameter in self.actor_module.parameters()):
             raise ValueError("capture actor materialized parameter gradients")

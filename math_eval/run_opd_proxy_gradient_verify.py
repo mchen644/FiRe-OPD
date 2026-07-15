@@ -23,6 +23,7 @@ from math_eval.opd_proxy_gradient_stage_profiles import (
     EFFICACY_PILOT,
     StageKind,
     capture_algorithm_contract_sha256,
+    capture_dispatch_question_count,
     parse_stage_kind,
     stage_directory_name,
     stage_profile,
@@ -650,6 +651,11 @@ def build_capture_hydra_overrides(
         question_count = int(manifest["proxy_capture_count"])
         student = repository / "models/Qwen3-0.6B"
         teacher = repository / "models/Qwen3-4B"
+    dispatch_question_count = capture_dispatch_question_count(
+        expected_questions=question_count,
+        native_rollouts=profile.native_rollouts,
+        world_size=4,
+    )
     sample_path = stage_root / str(manifest["sample_manifest"])
     source_path = stage_root / "source_snapshot.json"
     source_hash = (
@@ -696,7 +702,10 @@ def build_capture_hydra_overrides(
         ("actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu", "1"),
         ("actor_rollout_ref.ref.fsdp_config.param_offload", "true"),
         ("actor_rollout_ref.actor.ppo_epochs", "1"),
-        ("actor_rollout_ref.actor.ppo_mini_batch_size", str(question_count)),
+        (
+            "actor_rollout_ref.actor.ppo_mini_batch_size",
+            str(dispatch_question_count),
+        ),
         ("actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu", "1"),
         ("actor_rollout_ref.actor.ppo_max_token_len_per_gpu", "18432"),
         ("actor_rollout_ref.actor.use_dynamic_bsz", "false"),

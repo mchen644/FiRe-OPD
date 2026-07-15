@@ -48,9 +48,19 @@ def validate_opd_proxy_capture_runtime_config(config) -> dict[str, object] | Non
     if capture_config is None or not capture_config.get("enabled", False):
         return None
 
+    from math_eval.opd_proxy_gradient_stage_profiles import (
+        capture_dispatch_question_count,
+    )
+
     from verl.trainer.ppo.opd_proxy_verify_capture import validate_capture_contract
 
     contract = validate_capture_contract(capture_config)
+    world_size = int(config.trainer.n_gpus_per_node) * int(config.trainer.nnodes)
+    dispatch_question_count = capture_dispatch_question_count(
+        expected_questions=int(contract["expected_questions"]),
+        native_rollouts=int(contract["native_rollouts"]),
+        world_size=world_size,
+    )
     exact_values = {
         "data.max_prompt_length": 2048,
         "data.max_response_length": 16384,
@@ -65,7 +75,7 @@ def validate_opd_proxy_capture_runtime_config(config) -> dict[str, object] | Non
         "actor_rollout_ref.rollout.calculate_log_probs": True,
         "actor_rollout_ref.actor.opd_proxy_verify_capture_only": True,
         "actor_rollout_ref.actor.ppo_epochs": 1,
-        "actor_rollout_ref.actor.ppo_mini_batch_size": contract["expected_questions"],
+        "actor_rollout_ref.actor.ppo_mini_batch_size": dispatch_question_count,
         "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu": 1,
         "actor_rollout_ref.actor.use_dynamic_bsz": False,
         "actor_rollout_ref.actor.loss_agg_mode": "token-mean",

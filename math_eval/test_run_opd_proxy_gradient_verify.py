@@ -574,6 +574,20 @@ def test_efficacy_pilot_hydra_contract_differs_only_in_approved_identity_fields(
     }
     assert pilot["actor_rollout_ref.rollout.n"] == "1"
     assert pilot["actor_rollout_ref.rollout.seed"] == "42"
+    assert pilot["actor_rollout_ref.actor.ppo_mini_batch_size"] == "336"
+    proxy_pilot = dict(
+        value.split("=", 1)
+        for value in build_capture_hydra_overrides(
+            stage=EFFICACY_PILOT,
+            manifest=_manifest(EFFICACY_PILOT),
+            stage_directory=tmp_path / EFFICACY_PILOT,
+            pair="proxy",
+            seed=42,
+            output_root=tmp_path / EFFICACY_PILOT / "capture/proxy/seed_42",
+            repository_root=tmp_path,
+        )
+    )
+    assert proxy_pilot["actor_rollout_ref.actor.ppo_mini_batch_size"] == "252"
     assert pilot["algorithm.opd_proxy_verify_capture.native_rollouts"] == "1"
     assert pilot[
         "algorithm.opd_proxy_verify_capture.algorithm_contract_sha256"

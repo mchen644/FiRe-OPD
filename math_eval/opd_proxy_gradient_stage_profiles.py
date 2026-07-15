@@ -11,6 +11,20 @@ from math_eval.opd_proxy_gradient_verify_artifacts import canonical_json_bytes
 EFFICACY_PILOT = "efficacy_pilot"
 StageKind: TypeAlias = Literal[0, 1, 2, "efficacy_pilot"]
 
+
+def capture_dispatch_question_count(
+    *, expected_questions: int, native_rollouts: int, world_size: int
+) -> int:
+    """Return the internal question batch needed for equal FSDP rank dispatch."""
+    if expected_questions <= 0 or native_rollouts <= 0 or world_size <= 0:
+        raise ValueError("capture dispatch dimensions must be positive")
+    trajectories = expected_questions * native_rollouts
+    padded_trajectories = -(-trajectories // world_size) * world_size
+    if padded_trajectories % native_rollouts:
+        raise ValueError("capture dispatch padding must preserve native rollout groups")
+    return padded_trajectories // native_rollouts
+
+
 _NUMBERED_REPRESENTATIONS = tuple(
     [
         f"P_n1:seed={seed}:slot={slot}"

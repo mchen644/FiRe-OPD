@@ -86,6 +86,12 @@ def validate_config(
     # number of GPUs total
     n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
 
+    capture_only = bool(
+        config.actor_rollout_ref.actor.get(
+            "opd_proxy_verify_capture_only", False
+        )
+    )
+    actor_validation_batch_size = config.data.train_batch_size
     if not config.actor_rollout_ref.actor.use_dynamic_bsz:
         if config.actor_rollout_ref.actor.strategy == "megatron":
             model_parallel_size = (
@@ -105,12 +111,29 @@ def validate_config(
         else:
             minimal_bsz = n_gpus
 
-        # 1. Check total batch size for data correctness
+        # 1. Check total batch size for data correctness. Capture-only runs
+        # preserve exact scientific membership and pad only internal FSDP RPCs.
         real_train_batch_size = config.data.train_batch_size * config.actor_rollout_ref.rollout.n
-        assert real_train_batch_size % minimal_bsz == 0, (
-            f"real_train_batch_size ({real_train_batch_size}) must be divisible by minimal possible batch size "
-            f"({minimal_bsz})"
-        )
+        if capture_only:
+            dispatch_train_batch_size = (
+                config.actor_rollout_ref.actor.ppo_mini_batch_size
+                * config.actor_rollout_ref.rollout.n
+            )
+            expected_dispatch_size = (
+                -(-real_train_batch_size // minimal_bsz) * minimal_bsz
+            )
+            assert dispatch_train_batch_size == expected_dispatch_size, (
+                f"capture dispatch batch size ({dispatch_train_batch_size}) must equal "
+                f"the minimally padded batch size ({expected_dispatch_size})"
+            )
+            actor_validation_batch_size = (
+                config.actor_rollout_ref.actor.ppo_mini_batch_size
+            )
+        else:
+            assert real_train_batch_size % minimal_bsz == 0, (
+                f"real_train_batch_size ({real_train_batch_size}) must be divisible by minimal possible batch size "
+                f"({minimal_bsz})"
+            )
 
     # A helper function to check "micro_batch_size" vs "micro_batch_size_per_gpu"
     # We throw an error if the user sets both. The new convention is "..._micro_batch_size_per_gpu".
@@ -149,7 +172,9 @@ def validate_config(
 
     # Actor validation done in ActorConfig.__post_init__ and validate()
     actor_config = omega_conf_to_dataclass(config.actor_rollout_ref.actor)
-    actor_config.validate(n_gpus, config.data.train_batch_size, config.actor_rollout_ref.model)
+    actor_config.validate(
+        n_gpus, actor_validation_batch_size, config.actor_rollout_ref.model
+    )
 
     if not config.actor_rollout_ref.actor.use_dynamic_bsz:
         if use_reference_policy:

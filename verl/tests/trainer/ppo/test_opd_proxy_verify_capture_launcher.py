@@ -32,6 +32,7 @@ from tensordict import TensorDict
 
 from verl import DataProto
 from verl.trainer.main_ppo import validate_opd_proxy_capture_runtime_config
+from verl.trainer.ppo import ray_trainer as trainer_module
 from verl.trainer.ppo.opd_proxy_verify_capture import (
     attach_and_validate_keys,
     recursive_parameter_sha256,
@@ -41,6 +42,7 @@ from verl.trainer.ppo.ray_trainer import (
     _validate_capture_batch_forbidden_keys,
 )
 from verl.trainer.ppo.ref_input_utils import prepare_ref_model_inputs
+from verl.utils import config as config_module
 from verl.workers.actor.dp_actor import DataParallelPPOActor
 from verl.workers.config import ActorConfig, PolicyLossConfig
 from verl.workers.fsdp_workers import (
@@ -86,7 +88,11 @@ def _capture_config(tmp_path, *, enabled=True):
                 "truncation": "error",
                 "shuffle": False,
             },
-            "trainer": {"balance_batch": False},
+            "trainer": {
+                "balance_batch": False,
+                "n_gpus_per_node": 4,
+                "nnodes": 1,
+            },
             "actor_rollout_ref": {
                 "rollout": {
                     "name": "vllm",
@@ -437,6 +443,89 @@ def test_capture_finalizer_binds_rank_hashes_and_generation_provenance(
     }
 
 
+def test_capture_only_config_validates_exact_nondivisible_batch_via_internal_padding(
+    monkeypatch,
+):
+    config = OmegaConf.create(
+        {
+            "trainer": {"n_gpus_per_node": 4, "nnodes": 1},
+            "data": {"train_batch_size": 334, "val_batch_size": None},
+            "actor_rollout_ref": {
+                "model": {},
+                "actor": {
+                    "use_dynamic_bsz": False,
+                    "strategy": "fsdp",
+                    "ppo_mini_batch_size": 336,
+                    "opd_proxy_verify_capture_only": True,
+                },
+                "rollout": {
+                    "n": 1,
+                    "log_prob_micro_batch_size": None,
+                    "log_prob_micro_batch_size_per_gpu": 1,
+                    "val_kwargs": {"do_sample": False},
+                },
+                "ref": {
+                    "log_prob_micro_batch_size": None,
+                    "log_prob_micro_batch_size_per_gpu": 1,
+                },
+            },
+            "reward_model": {"enable": False},
+            "algorithm": {"use_kl_in_reward": False},
+        }
+    )
+    seen = {}
+
+    class Actor:
+        use_kl_loss = True
+
+        def validate(self, n_gpus, train_batch_size, model_config):
+            seen.update(
+                n_gpus=n_gpus,
+                train_batch_size=train_batch_size,
+                model_config=model_config,
+            )
+
+    monkeypatch.setattr(config_module, "omega_conf_to_dataclass", lambda *args, **kwargs: Actor())
+    config_module.validate_config(
+        config, use_reference_policy=False, use_critic=False
+    )
+    assert seen["n_gpus"] == 4
+    assert seen["train_batch_size"] == 336
+
+    config.actor_rollout_ref.actor.opd_proxy_verify_capture_only = False
+    with pytest.raises(AssertionError, match="334.*divisible.*4"):
+        config_module.validate_config(
+            config, use_reference_policy=False, use_critic=False
+        )
+
+
+def test_capture_worker_padding_is_internal_and_restores_exact_order():
+    data = DataProto.from_dict(
+        tensors={"value": torch.arange(5).reshape(5, 1)},
+        non_tensors={"stable_id": np.array([f"q{i}" for i in range(5)], dtype=object)},
+    )
+
+    class WorkerGroup:
+        world_size = 4
+
+        @staticmethod
+        def compute(batch):
+            assert len(batch) == 8
+            assert batch.non_tensor_batch["opd_proxy_verify_padding"].tolist() == (
+                [False] * 5 + [True] * 3
+            )
+            return batch
+
+    output = trainer_module._call_capture_worker_with_padding(
+        WorkerGroup(), "compute", data
+    )
+    assert len(data) == 5
+    assert len(output) == 5
+    assert output.batch["value"].flatten().tolist() == list(range(5))
+    assert output.non_tensor_batch["stable_id"].tolist() == [f"q{i}" for i in range(5)]
+    assert "opd_proxy_verify_padding" not in output.non_tensor_batch
+
+
 def test_capture_path_calls_one_generation_and_never_updates(monkeypatch, tmp_path):
     config = _capture_config(tmp_path)
     trainer = object.__new__(RayPPOTrainer)
@@ -482,7 +571,8 @@ def test_capture_path_calls_one_generation_and_never_updates(monkeypatch, tmp_pa
         world_size=1,
     )
     trainer.ref_policy_wg = SimpleNamespace(
-        compute_ref_log_prob=Recorder(calls, "ref", ref)
+        compute_ref_log_prob=Recorder(calls, "ref", ref),
+        world_size=1,
     )
     monkeypatch.setattr(
         trainer, "_publish_opd_proxy_rollout_capture", lambda *args, **kwargs: {}
@@ -651,10 +741,82 @@ def test_actor_capture_uses_micro_batch_one_and_never_backward_or_updates(
     assert (tmp_path / "actor/rank_0/chunk_0_1.safetensors").is_file()
     assert (tmp_path / "actor/rank_0/chunk_1_2.safetensors").is_file()
 
+    calls.clear()
+    method(actor, _actor_capture_data(tmp_path))
+    assert calls == []
+
+
+def test_actor_capture_computes_but_never_publishes_internal_padding(
+    monkeypatch, tmp_path
+):
+    import verl.workers.actor.dp_actor as actor_module
+
+    actor = object.__new__(DataParallelPPOActor)
+    actor.config = ActorConfig(
+        strategy="fsdp",
+        rollout_n=1,
+        ppo_mini_batch_size=2,
+        ppo_micro_batch_size_per_gpu=1,
+        ppo_epochs=1,
+        use_dynamic_bsz=False,
+        opd_proxy_verify_capture_only=True,
+        use_torch_compile=False,
+        use_kl_loss=True,
+        kl_loss_coef=0.0,
+        entropy_coeff=0.0,
+        policy_loss=PolicyLossConfig(
+            loss_mode="vanilla", only_reverse_kl_advantages=True
+        ),
+    )
+    actor.actor_module = torch.nn.Linear(1, 1, bias=False)
+    actor.actor_optimizer = None
+    calls = []
+
+    def fake_forward(model_inputs, temperature, calculate_entropy=False):
+        del temperature, calculate_entropy
+        calls.append(str(model_inputs["opd_verify_stable_id"][0]))
+        current = actor.actor_module.weight.sum() * torch.ones_like(
+            model_inputs["old_log_probs"]
+        )
+        return None, current, {}
+
+    actor._forward_micro_batch = fake_forward
+    monkeypatch.setattr(actor_module, "get_device_id", lambda: torch.device("cpu"))
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 3)
+    data = _actor_capture_data(tmp_path)
+    data.batch["opd_proxy_verify_rollout_slot"][1] = 0
+    data.non_tensor_batch["opd_verify_stable_id"][1] = "padding-q0"
+    data.non_tensor_batch["opd_proxy_verify_padding"] = np.array(
+        [False, True], dtype=np.bool_
+    )
+
+    method = DataParallelPPOActor.capture_opd_proxy_verify
+    while hasattr(method, "__wrapped__"):
+        method = method.__wrapped__
+    output = method(actor, data)
+
+    assert calls == ["q0", "padding-q0"]
+    assert len(output) == 2
+    assert (tmp_path / "actor/rank_3/chunk_0_1.safetensors").is_file()
+    assert not (tmp_path / "actor/rank_3/chunk_1_2.safetensors").exists()
+    sidecars = [
+        json.loads(line)
+        for line in (tmp_path / "actor/rank_3/chunk_0_1.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    assert [row["stable_id"] for row in sidecars] == ["q0"]
+
+    calls.clear()
+    method(actor, data)
+    assert calls == ["q0", "padding-q0"]
+    assert not (tmp_path / "actor/rank_3/chunk_1_2.safetensors").exists()
+
 
 def test_efficacy_pilot_runtime_contract_uses_native_n1(tmp_path):
     config = _capture_config(tmp_path)
     config.actor_rollout_ref.rollout.n = 1
+    config.actor_rollout_ref.actor.ppo_mini_batch_size = 4
     capture = config.algorithm.opd_proxy_verify_capture
     capture.stage = "efficacy_pilot"
     capture.native_rollouts = 1

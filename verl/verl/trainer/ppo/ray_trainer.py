@@ -92,6 +92,25 @@ from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_
 from verl.utils.torch_functional import masked_mean, postprocess_data
 from verl.utils.tracking import ValidationGenerationsLogger
 
+_CAPTURE_PADDING_KEY = "opd_proxy_verify_padding"
+
+
+def _call_capture_worker_with_padding(
+    worker_group, method_name: str, data: DataProto
+) -> DataProto:
+    """Pad an internal capture RPC evenly across ranks, then restore exact rows."""
+    padded, pad_size = pad_dataproto_to_divisor(data, worker_group.world_size)
+    if pad_size:
+        padded.non_tensor_batch[_CAPTURE_PADDING_KEY] = np.asarray(
+            [False] * len(data) + [True] * pad_size, dtype=np.bool_
+        )
+    output = getattr(worker_group, method_name)(padded)
+    output = unpad_dataproto(output, pad_size=pad_size)
+    output.non_tensor_batch.pop(_CAPTURE_PADDING_KEY, None)
+    if len(output) != len(data):
+        raise ValueError("capture worker padding changed the exact row count")
+    return output
+
 
 @dataclass
 class ResourcePoolManager:
@@ -1902,7 +1921,9 @@ class RayPPOTrainer:
                 parent_hashes,
             )
 
-        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+        old_log_prob = _call_capture_worker_with_padding(
+            self.actor_rollout_wg, "compute_log_prob", batch
+        )
         old_log_prob.batch.pop("entropys", None)
         batch = batch.union(old_log_prob)
         if self.use_ref_retokenization:
@@ -1914,10 +1935,11 @@ class RayPPOTrainer:
                 apply_chat_template_kwargs=self.config.data.get("apply_chat_template_kwargs", {}),
                 raw_prompt_key=self.ref_raw_prompt_key,
             )
-        ref_log_prob = (
-            self.actor_rollout_wg.compute_ref_log_prob(batch)
-            if self.ref_in_actor
-            else self.ref_policy_wg.compute_ref_log_prob(batch)
+        ref_worker_group = (
+            self.actor_rollout_wg if self.ref_in_actor else self.ref_policy_wg
+        )
+        ref_log_prob = _call_capture_worker_with_padding(
+            ref_worker_group, "compute_ref_log_prob", batch
         )
         batch = batch.union(ref_log_prob)
         batch, _ = compute_rollout_correction_and_add_to_batch(
@@ -1936,7 +1958,9 @@ class RayPPOTrainer:
                 "opd_proxy_verify_engine_seed": contract["engine_seed"],
             }
         )
-        actor_output = self.actor_rollout_wg.capture_opd_proxy_verify(batch)
+        actor_output = _call_capture_worker_with_padding(
+            self.actor_rollout_wg, "capture_opd_proxy_verify", batch
+        )
         return self._finalize_opd_proxy_capture(
             actor_output,
             capture_order_keys,
