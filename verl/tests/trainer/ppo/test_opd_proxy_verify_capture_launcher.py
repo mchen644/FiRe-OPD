@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -46,6 +47,15 @@ from verl.workers.fsdp_workers import (
     ActorRolloutRefWorker,
     _resolve_actor_optim_config,
 )
+
+
+def test_capture_shell_launcher_declares_first_class_efficacy_pilot_stage():
+    script = Path("verl/examples/fire_opd/run_capture_opd_proxy_verify.sh")
+    text = script.read_text(encoding="utf-8")
+    assert "efficacy_pilot" in text
+    assert '"${stage}" == "efficacy_pilot"' in text
+    assert "srun" not in text
+
 
 PARENTS = {
     "sample_manifest_sha256": "a" * 64,

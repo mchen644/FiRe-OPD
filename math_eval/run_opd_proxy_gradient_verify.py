@@ -19,6 +19,15 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields, replace
 from pathlib import Path, PurePosixPath
 
+from math_eval.opd_proxy_gradient_stage_profiles import (
+    EFFICACY_PILOT,
+    StageKind,
+    capture_algorithm_contract_sha256,
+    parse_stage_kind,
+    stage_directory_name,
+    stage_profile,
+)
+
 
 VERL_PYTHON = "/home/mchen/miniconda3/envs/verl/bin/python"
 GVENDI_PYTHON = "/home/mchen/miniconda3/envs/gvendi-opd/bin/python"
@@ -33,15 +42,15 @@ REPLAY_SHARDS = 4
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 REFERENCE_COMMIT = "d9484cd3b5991030b901ac4a3a9e2472dbfac2ad"
 REFERENCE_TREE = "a0079d8c5e15cb18bb4790f99c43cc19bb9ecd50"
-_STAGE_LAYOUTS = {
-    0: (24, 8, 5, 2, 2, 100),
-    1: (768, 256, 172, 76, 7, 10_000),
-    2: (1536, 512, 345, 153, 15, 10_000),
-}
+FROZEN_STAGE1_MANIFEST_SHA256 = (
+    "6d698d75995c777d6faaf1abd385a758977ca0350ce862284f1e9d8751eddd83"
+)
 
 MAIN_SOURCE_FILES = (
     "docs/superpowers/specs/2026-07-14-vanilla-opd-proxy-gradient-selection-verify-design.md",
     "docs/superpowers/plans/2026-07-14-vanilla-opd-proxy-gradient-selection-verify.md",
+    "docs/superpowers/specs/2026-07-15-opd-efficacy-pilot-design.md",
+    "docs/superpowers/plans/2026-07-15-opd-efficacy-pilot.md",
     "pytest.ini",
     "math_eval/build_gradient_eligibility.py",
     "math_eval/deepmath_gradient_diversity.py",
@@ -50,6 +59,8 @@ MAIN_SOURCE_FILES = (
     "math_eval/test_collect_prismatic_gradients.py",
     "math_eval/opd_proxy_gradient_verify_artifacts.py",
     "math_eval/test_opd_proxy_gradient_verify_artifacts.py",
+    "math_eval/opd_proxy_gradient_stage_profiles.py",
+    "math_eval/test_opd_proxy_gradient_stage_profiles.py",
     "math_eval/prepare_opd_proxy_gradient_verify.py",
     "math_eval/test_prepare_opd_proxy_gradient_verify.py",
     "math_eval/opd_proxy_gradient_projection.py",
@@ -412,21 +423,22 @@ def _require_sha(value: object, description: str) -> str:
     return value
 
 
-def validate_stage_manifest(manifest: Mapping[str, object], stage: int) -> None:
-    if stage not in _STAGE_LAYOUTS:
-        raise ValueError(f"unsupported stage: {stage}")
+def validate_stage_manifest(
+    manifest: Mapping[str, object], stage: str | int
+) -> None:
+    parsed_stage = parse_stage_kind(stage)
+    profile = stage_profile(parsed_stage)
     if manifest.get("schema_version") != 1 or manifest.get("artifact_type") != "opd_proxy_stage":
         raise ValueError("invalid OPD proxy stage manifest contract")
-    if manifest.get("stage") != stage:
+    if manifest.get("stage") != parsed_stage:
         raise ValueError("stage manifest stage mismatch")
-    candidate, heldout, selected, primary, diagnostic, draws = _STAGE_LAYOUTS[stage]
     expected = {
-        "candidate_count": candidate,
-        "held_out_count": heldout,
-        "selected_size": selected,
-        "primary_k": primary,
-        "diagnostic_k": diagnostic,
-        "null_draws": draws,
+        "candidate_count": profile.candidate_count,
+        "held_out_count": profile.held_out_count,
+        "selected_size": profile.selected_size,
+        "primary_k": profile.primary_k,
+        "diagnostic_k": profile.diagnostic_k,
+        "null_draws": profile.null_draws,
     }
     if any(manifest.get(name) != value for name, value in expected.items()):
         raise ValueError("stage manifest cardinality contract mismatch")
@@ -436,8 +448,12 @@ def validate_stage_manifest(manifest: Mapping[str, object], stage: int) -> None:
         "proxy_capture_parquet_sha256",
     ):
         _require_sha(manifest.get(field), field)
-    target_expected = candidate + heldout if stage != 2 else 1024
-    proxy_expected = candidate if stage != 2 else 768
+    target_expected = (
+        profile.candidate_count + profile.held_out_count
+        if parsed_stage != 2
+        else 1024
+    )
+    proxy_expected = profile.candidate_count if parsed_stage != 2 else 768
     if manifest.get("target_capture_count") != target_expected or manifest.get(
         "proxy_capture_count"
     ) != proxy_expected:
@@ -464,6 +480,17 @@ def validate_stage_manifest(manifest: Mapping[str, object], stage: int) -> None:
         raise ValueError("stage model manifests are malformed")
     if hashes["target_student"] != hashes["proxy_teacher"]:
         raise ValueError("target-student and proxy-teacher Qwen3-4B bytes differ")
+    if parsed_stage == EFFICACY_PILOT:
+        parent = manifest.get("parent_stage_manifest")
+        if not isinstance(parent, Mapping) or parent.get(
+            "sha256"
+        ) != FROZEN_STAGE1_MANIFEST_SHA256:
+            raise ValueError("efficacy_pilot parent Stage-1 manifest identity mismatch")
+        expected_algorithm = capture_algorithm_contract_sha256(parsed_stage)
+        if manifest.get("algorithm_contract_sha256") != expected_algorithm:
+            raise ValueError("efficacy_pilot algorithm contract identity mismatch")
+    elif "parent_stage_manifest" in manifest or "algorithm_contract_sha256" in manifest:
+        raise ValueError("numbered stage cannot use efficacy_pilot identity fields")
 
 
 def _model_hashes(manifest: Mapping[str, object]) -> dict[str, str]:
@@ -479,14 +506,19 @@ def _model_hashes(manifest: Mapping[str, object]) -> dict[str, str]:
     }
 
 
-def validate_stage_parent(stage: int, manifest: Mapping[str, object], parent_report: Path | None) -> None:
+def validate_stage_parent(
+    stage: str | int,
+    manifest: Mapping[str, object],
+    parent_report: Path | None,
+) -> None:
+    parsed_stage = parse_stage_kind(stage)
     stored = manifest.get("parent_report")
-    if stage in (0, 1):
+    if parsed_stage in (0, 1, EFFICACY_PILOT):
         if parent_report is not None or stored is not None:
-            raise ValueError(f"Stage {stage} forbids a parent report")
+            raise ValueError(f"Stage {parsed_stage} forbids a parent report")
         return
-    if stage != 2:
-        raise ValueError(f"unsupported stage: {stage}")
+    if parsed_stage != 2:
+        raise ValueError(f"unsupported stage: {parsed_stage}")
     if parent_report is None or not isinstance(stored, Mapping):
         raise ValueError("Stage 2 requires its exact Stage-1 parent report")
     path = Path(parent_report).resolve()
@@ -515,7 +547,7 @@ def _source_snapshot_manifest_sha256(path: Path) -> str:
 
 def build_capture_hydra_overrides(
     *,
-    stage: int,
+    stage: str | int,
     manifest: Mapping[str, object],
     stage_directory: Path,
     pair: str,
@@ -523,11 +555,13 @@ def build_capture_hydra_overrides(
     output_root: Path,
     repository_root: Path,
 ) -> tuple[str, ...]:
-    validate_stage_manifest(manifest, stage)
+    parsed_stage = parse_stage_kind(stage)
+    profile = stage_profile(parsed_stage)
+    validate_stage_manifest(manifest, parsed_stage)
     if pair not in {"target", "proxy"}:
         raise ValueError("capture pair must be target or proxy")
-    if seed not in SEEDS:
-        raise ValueError("capture seed must be 42 or 43")
+    if seed not in profile.generation_seeds:
+        raise ValueError("capture seed differs from the stage generation seeds")
     stage_root = Path(stage_directory).resolve()
     repository = Path(repository_root).resolve()
     if pair == "target":
@@ -570,7 +604,7 @@ def build_capture_hydra_overrides(
         ("actor_rollout_ref.model.path", _path_value(student)),
         ("+actor_rollout_ref.ref.model.path", _path_value(teacher)),
         ("actor_rollout_ref.model.use_remove_padding", "true"),
-        ("actor_rollout_ref.rollout.n", "4"),
+        ("actor_rollout_ref.rollout.n", str(profile.native_rollouts)),
         ("actor_rollout_ref.rollout.name", "vllm"),
         ("actor_rollout_ref.rollout.temperature", "1.0"),
         ("actor_rollout_ref.rollout.top_p", "1.0"),
@@ -615,10 +649,17 @@ def build_capture_hydra_overrides(
         ("algorithm.opd_proxy_verify_capture.sample_manifest_sha256", str(manifest["sample_manifest_sha256"])),
         ("algorithm.opd_proxy_verify_capture.source_snapshot", _path_value(source_path)),
         ("algorithm.opd_proxy_verify_capture.source_snapshot_sha256", source_hash),
-        ("algorithm.opd_proxy_verify_capture.stage", str(stage)),
+        ("algorithm.opd_proxy_verify_capture.stage", str(parsed_stage)),
         ("algorithm.opd_proxy_verify_capture.pair", pair),
         ("algorithm.opd_proxy_verify_capture.engine_seed", str(seed)),
-        ("algorithm.opd_proxy_verify_capture.native_rollouts", "4"),
+        (
+            "algorithm.opd_proxy_verify_capture.native_rollouts",
+            str(profile.native_rollouts),
+        ),
+        (
+            "algorithm.opd_proxy_verify_capture.algorithm_contract_sha256",
+            capture_algorithm_contract_sha256(parsed_stage),
+        ),
         ("algorithm.opd_proxy_verify_capture.expected_questions", str(question_count)),
         ("algorithm.opd_proxy_verify_capture.chunk_size", "16"),
         ("algorithm.opd_proxy_verify_capture.schema_version", "1"),
@@ -646,11 +687,16 @@ def _replay_dirs(stage_directory: Path, pair: str, seed: int) -> tuple[Path, ...
 
 
 def _source_dirs_for_stage(
-    stage: int, stage_directory: Path, representation: str
+    stage: str | int, stage_directory: Path, representation: str
 ) -> tuple[Path, ...]:
+    parsed_stage = parse_stage_kind(stage)
     roots = [stage_directory]
-    if stage == 2:
+    if parsed_stage == 2:
         roots.insert(0, stage_directory.parent / "stage_1")
+    if representation == "P_pilot":
+        return _replay_dirs(stage_directory, "proxy", 42)
+    if representation == "T_pilot":
+        return _replay_dirs(stage_directory, "target", 42)
     if representation.startswith("P_"):
         seed = int(representation.split(":")[1].split("=")[1])
         return tuple(
@@ -688,21 +734,23 @@ def _first_candidate_id(stage_directory: Path, manifest: Mapping[str, object]) -
 
 def build_stage_commands(
     *,
-    stage: int,
+    stage: str | int,
     manifest: Mapping[str, object],
     repository_root: Path | None = None,
     stage_directory: Path | None = None,
     reference_repo: Path = DEFAULT_REFERENCE_REPO,
 ) -> tuple[StageCommand, ...]:
-    validate_stage_manifest(manifest, stage)
+    parsed_stage = parse_stage_kind(stage)
+    profile = stage_profile(parsed_stage)
+    validate_stage_manifest(manifest, parsed_stage)
     repository = Path.cwd().resolve() if repository_root is None else Path(repository_root).resolve()
     stage_root = (
-        (repository / DEFAULT_OUTPUT_ROOT / f"stage_{stage}").resolve()
+        (repository / DEFAULT_OUTPUT_ROOT / profile.directory_name).resolve()
         if stage_directory is None
         else Path(stage_directory).resolve()
     )
     reference = Path(reference_repo).resolve()
-    logs = repository / "logs/opd_proxy_gradient_verify" / f"stage_{stage}"
+    logs = repository / "logs/opd_proxy_gradient_verify" / profile.directory_name
     source_snapshot = stage_root / "source_snapshot.json"
     hashes = _model_hashes(manifest)
     commands: list[StageCommand] = []
@@ -710,7 +758,7 @@ def build_stage_commands(
     all_slots = tuple(f"slot:{index}" for index in range(4))
     for pair in ("target", "proxy"):
         count = int(manifest[f"{pair}_capture_count"])
-        for seed in SEEDS:
+        for seed in profile.generation_seeds:
             output = _capture_root(stage_root, pair, seed)
             name = f"capture_{pair}_seed_{seed}"
             commands.append(
@@ -721,7 +769,7 @@ def build_stage_commands(
                         "--stage-directory",
                         str(stage_root),
                         "--stage",
-                        str(stage),
+                        str(parsed_stage),
                         "--pair",
                         pair,
                         "--engine-seed",
@@ -739,7 +787,7 @@ def build_stage_commands(
                 )
             )
 
-    if stage == 0:
+    if profile.run_direct_fixture:
         output = stage_root / "direct_gradient_fixture"
         commands.append(
             StageCommand(
@@ -785,7 +833,7 @@ def build_stage_commands(
             "models/Qwen3-4B" if pair == "target" else "models/Qwen3-0.6B"
         )
         group_total = int(manifest[f"{pair}_capture_count"])
-        for seed in SEEDS:
+        for seed in profile.generation_seeds:
             group = f"replay_{pair}_seed_{seed}"
             for shard_index, output in enumerate(_replay_dirs(stage_root, pair, seed)):
                 start, end = _official_shard_bounds(group_total, shard_index)
@@ -819,6 +867,8 @@ def build_stage_commands(
                             str(reference),
                             "--repository-root",
                             str(repository),
+                            "--expected-stage",
+                            str(parsed_stage),
                             "--chunk-size",
                             "16",
                         ),
@@ -833,10 +883,19 @@ def build_stage_commands(
                     )
                 )
 
-    for baseline, module in (
-        ("sft", "math_eval.collect_opd_proxy_sft_gradients"),
-        ("embedding", "math_eval.collect_opd_proxy_prompt_embeddings"),
-    ):
+    baseline_modules = tuple(
+        (baseline, module)
+        for baseline, module, enabled in (
+            ("sft", "math_eval.collect_opd_proxy_sft_gradients", profile.run_sft),
+            (
+                "embedding",
+                "math_eval.collect_opd_proxy_prompt_embeddings",
+                profile.run_embedding,
+            ),
+        )
+        if enabled
+    )
+    for baseline, module in baseline_modules:
         output = stage_root / "baselines" / baseline
         argv = [
             GVENDI_PYTHON,
@@ -856,10 +915,10 @@ def build_stage_commands(
                 "--output-directory",
                 str(output),
                 "--stage",
-                str(stage),
+                str(parsed_stage),
             ]
         )
-        if stage == 2:
+        if parsed_stage == 2:
             argv.extend(
                 [
                     "--stage1-vector-directory",
@@ -876,7 +935,7 @@ def build_stage_commands(
                 "16",
             ]
         )
-        rows = 768 if stage == 2 else int(manifest["candidate_count"])
+        rows = 768 if parsed_stage == 2 else int(manifest["candidate_count"])
         commands.append(
             StageCommand(
                 name=f"collect_{baseline}",
@@ -901,7 +960,7 @@ def build_stage_commands(
                 "math_eval.run_opd_proxy_gradient_verify",
                 "internal-validate-vectors",
                 "--stage",
-                str(stage),
+                str(parsed_stage),
                 "--stage-directory",
                 str(stage_root),
             ),
@@ -928,14 +987,11 @@ def build_stage_commands(
         "--source-snapshot",
         str(source_snapshot),
     ]
-    representations = tuple(
-        [f"P_n1:seed={seed}:slot={slot}" for seed in SEEDS for slot in range(4)]
-        + [f"P_n4:seed={seed}" for seed in SEEDS]
-        + ["S", "E"]
-        + [f"T:seed={seed}" for seed in SEEDS]
-    )
+    representations = profile.selection_representations
     for representation in representations:
-        for source in _source_dirs_for_stage(stage, stage_root, representation):
+        for source in _source_dirs_for_stage(
+            parsed_stage, stage_root, representation
+        ):
             select_argv.extend(["--vector", f"{representation}={source}"])
     commands.append(
         StageCommand(
@@ -964,7 +1020,7 @@ def build_stage_commands(
                 "math_eval.run_opd_proxy_gradient_verify",
                 "internal-prepare-analysis-inputs",
                 "--stage",
-                str(stage),
+                str(parsed_stage),
                 "--stage-directory",
                 str(stage_root),
             ),
@@ -1220,7 +1276,13 @@ def _validate_completed_output(command: StageCommand) -> None:
         _require_output_source_parent(command, random.manifest)
         return
     if command.output_kind == "analysis":
-        stage = int(command.output_root.name.rsplit("_", 1)[-1])
+        directory_name = command.output_root.name
+        stage_value = (
+            directory_name.removeprefix("stage_")
+            if directory_name.startswith("stage_")
+            else directory_name
+        )
+        stage = parse_stage_kind(stage_value)
         report = _validate_report_pair(stage, command.output_root)
         expected = dict(command.input_hashes).get("source_snapshot_sha256")
         if report.get("provenance", {}).get("source_snapshot_sha256") != expected:
@@ -1860,7 +1922,9 @@ def estimate_remaining_seconds(
     }
 
 
-def _read_stage_manifest(stage_directory: Path, stage: int, *, require_files: bool) -> dict[str, object]:
+def _read_stage_manifest(
+    stage_directory: Path, stage: str | int, *, require_files: bool
+) -> dict[str, object]:
     manifest = load_canonical_json(stage_directory / "manifest.json", "stage manifest")
     validate_stage_manifest(manifest, stage)
     if require_files:
@@ -1875,12 +1939,12 @@ def _read_stage_manifest(stage_directory: Path, stage: int, *, require_files: bo
     return manifest
 
 
-def _representation_names() -> tuple[str, ...]:
+def _representation_names(stage: str | int) -> tuple[str, ...]:
+    profile = stage_profile(stage)
     return tuple(
-        [f"P_n1:seed={seed}:slot={slot}" for seed in SEEDS for slot in range(4)]
-        + [f"P_n4:seed={seed}" for seed in SEEDS]
-        + ["S", "E"]
-        + [f"T:seed={seed}" for seed in SEEDS]
+        dict.fromkeys(
+            profile.selection_representations + profile.target_representations
+        )
     )
 
 
@@ -1902,7 +1966,7 @@ def _load_stage_ids(stage_directory: Path, manifest: Mapping[str, object]) -> tu
     return tuple(candidates), tuple(heldout)
 
 
-def _internal_validate_vectors(stage: int, stage_directory: Path) -> None:
+def _internal_validate_vectors(stage: str | int, stage_directory: Path) -> None:
     from math_eval.opd_proxy_gradient_verify_artifacts import (
         canonical_json_bytes as artifact_json_bytes,
         load_vector_set,
@@ -1911,8 +1975,10 @@ def _internal_validate_vectors(stage: int, stage_directory: Path) -> None:
         build_selection_vector_view,
     )
 
+    parsed_stage = parse_stage_kind(stage)
+    profile = stage_profile(parsed_stage)
     stage_root = Path(stage_directory).resolve()
-    manifest = _read_stage_manifest(stage_root, stage, require_files=True)
+    manifest = _read_stage_manifest(stage_root, parsed_stage, require_files=True)
     candidate_ids, heldout_ids = _load_stage_ids(stage_root, manifest)
     expected_source_hash = _source_snapshot_manifest_sha256(
         stage_root / "source_snapshot.json"
@@ -1928,13 +1994,19 @@ def _internal_validate_vectors(stage: int, stage_directory: Path) -> None:
             )
 
     view_hashes: dict[str, str] = {}
-    for name in _representation_names():
+    for name in _representation_names(parsed_stage):
         expected_representation = (
-            "P" if name.startswith("P_") else "T" if name.startswith("T:") else name
+            name
+            if name in {"P_pilot", "T_pilot"}
+            else "P"
+            if name.startswith("P_")
+            else "T"
+            if name.startswith("T:")
+            else name
         )
         sources = [
             load_vector_set(path, expected_representation=expected_representation)
-            for path in _source_dirs_for_stage(stage, stage_root, name)
+            for path in _source_dirs_for_stage(parsed_stage, stage_root, name)
         ]
         for source in sources:
             validate_source(source, name)
@@ -1942,11 +2014,13 @@ def _internal_validate_vectors(stage: int, stage_directory: Path) -> None:
         view_hashes[name] = hashlib.sha256(
             artifact_json_bytes(view.manifest)
         ).hexdigest()
-    for seed in SEEDS:
-        name = f"T:seed={seed}"
+    for _, name in zip(
+        profile.generation_seeds, profile.target_representations, strict=True
+    ):
+        expected_representation = "T_pilot" if name == "T_pilot" else "T"
         sources = [
-            load_vector_set(path, expected_representation="T")
-            for path in _source_dirs_for_stage(stage, stage_root, name)
+            load_vector_set(path, expected_representation=expected_representation)
+            for path in _source_dirs_for_stage(parsed_stage, stage_root, name)
         ]
         for source in sources:
             validate_source(source, f"{name} held-out")
@@ -1954,7 +2028,7 @@ def _internal_validate_vectors(stage: int, stage_directory: Path) -> None:
     marker = {
         "schema_version": 1,
         "artifact_type": "opd_proxy_vectors_validated",
-        "stage": stage,
+        "stage": parsed_stage,
         "candidate_count": len(candidate_ids),
         "held_out_count": len(heldout_ids),
         "representation_view_manifest_sha256": view_hashes,
@@ -1962,22 +2036,30 @@ def _internal_validate_vectors(stage: int, stage_directory: Path) -> None:
     write_or_validate_json(stage_root / "vectors/VALIDATED.json", marker)
 
 
-def _internal_prepare_analysis_inputs(stage: int, stage_directory: Path) -> None:
+def _internal_prepare_analysis_inputs(
+    stage: str | int, stage_directory: Path
+) -> None:
     from math_eval.analyze_opd_proxy_gradient_verify import (
         write_analysis_input_manifest,
     )
 
+    parsed_stage = parse_stage_kind(stage)
+    profile = stage_profile(parsed_stage)
     stage_root = Path(stage_directory).resolve()
     write_analysis_input_manifest(
         stage_dir=stage_root,
         selection_directory=stage_root / "selection",
         representation_sources={
-            name: _source_dirs_for_stage(stage, stage_root, name)
-            for name in _representation_names()
+            name: _source_dirs_for_stage(parsed_stage, stage_root, name)
+            for name in _representation_names(parsed_stage)
         },
         target_heldout_sources={
-            seed: _source_dirs_for_stage(stage, stage_root, f"T:seed={seed}")
-            for seed in SEEDS
+            seed: _source_dirs_for_stage(parsed_stage, stage_root, name)
+            for seed, name in zip(
+                profile.generation_seeds,
+                profile.target_representations,
+                strict=True,
+            )
         },
     )
 
@@ -2028,15 +2110,19 @@ def _validate_model_contract(repository: Path, manifest: Mapping[str, object]) -
         raise ValueError("the two Qwen3-4B roles are not byte-identical")
 
 
-def validate_stage_prerequisite(stage: int, output_root: Path) -> None:
-    if stage == 0:
+def validate_stage_prerequisite(stage: str | int, output_root: Path) -> None:
+    parsed_stage = parse_stage_kind(stage)
+    if parsed_stage in (0, EFFICACY_PILOT):
         return
-    previous_root = output_root / f"stage_{stage - 1}"
+    assert isinstance(parsed_stage, int)
+    previous_root = output_root / f"stage_{parsed_stage - 1}"
     previous = previous_root / "STAGE_COMPLETE.json"
     if not previous.is_file():
-        raise RuntimeError(f"Stage {stage} requires completed Stage {stage - 1}")
+        raise RuntimeError(
+            f"Stage {parsed_stage} requires completed Stage {parsed_stage - 1}"
+        )
     marker = load_canonical_json(previous, "previous stage completion")
-    if marker.get("stage") != stage - 1:
+    if marker.get("stage") != parsed_stage - 1:
         raise RuntimeError("previous stage completion marker has wrong stage")
     if marker.get("report_sha256") != sha256_file(previous_root / "report.json"):
         raise RuntimeError("previous stage report differs from completion marker")
@@ -2047,7 +2133,7 @@ def validate_stage_prerequisite(stage: int, output_root: Path) -> None:
         "source_snapshot_file_sha256"
     ) != sha256_file(previous_source):
         raise RuntimeError("previous stage source snapshot differs from completion marker")
-    if stage == 1:
+    if parsed_stage == 1:
         resume_path = previous_root / "resume_exercise.json"
         direct_path = previous_root / "direct_gradient_fixture/COMPLETE.json"
         if (
@@ -2059,13 +2145,17 @@ def validate_stage_prerequisite(stage: int, output_root: Path) -> None:
 
 
 def validate_cross_stage_source(
-    stage: int, output_root: Path, current_source_sha256: str
+    stage: str | int, output_root: Path, current_source_sha256: str
 ) -> None:
-    if stage == 0:
+    parsed_stage = parse_stage_kind(stage)
+    if parsed_stage in (0, EFFICACY_PILOT):
         return
+    assert isinstance(parsed_stage, int)
     _require_sha(current_source_sha256, "current source snapshot SHA")
     previous = load_canonical_json(
-        Path(output_root) / f"stage_{stage - 1}" / "STAGE_COMPLETE.json",
+        Path(output_root)
+        / f"stage_{parsed_stage - 1}"
+        / "STAGE_COMPLETE.json",
         "previous stage completion",
     )
     if previous.get("source_snapshot_sha256") != current_source_sha256:
@@ -2090,22 +2180,46 @@ def validate_stage2_trigger(parent_report: Path) -> None:
         raise RuntimeError("Stage-1 report does not satisfy the Stage-2 trigger")
 
 
-def _validate_report_pair(stage: int, stage_root: Path) -> dict[str, object]:
+def _validate_report_pair(
+    stage: str | int, stage_root: Path
+) -> dict[str, object]:
     from math_eval.analyze_opd_proxy_gradient_verify import render_markdown
 
+    parsed_stage = parse_stage_kind(stage)
     report_path = stage_root / "report.json"
     markdown_path = stage_root / "report.md"
     report = load_canonical_json(report_path, "analysis report")
     if (
         report.get("artifact_type")
         != "opd_proxy_gradient_verification_report"
-        or report.get("stage") != stage
+        or report.get("stage") != parsed_stage
     ):
         raise RuntimeError("analysis report stage/contract mismatch")
     if markdown_path.read_text(encoding="utf-8") != render_markdown(report):
         raise RuntimeError("analysis JSON and Markdown reports disagree")
-    if stage == 0 and report.get("classification") != {"status": "smoke_only"}:
+    classification = report.get("classification")
+    if parsed_stage == 0 and classification != {"status": "smoke_only"}:
         raise RuntimeError("Stage-0 report must remain smoke-only")
+    if parsed_stage == EFFICACY_PILOT:
+        if (
+            not isinstance(classification, Mapping)
+            or classification.get("status") != "pilot_only"
+            or classification.get("decision")
+            not in {"go", "no_go", "borderline"}
+            or classification.get("main_hypothesis") != "not_evaluated"
+        ):
+            raise RuntimeError("efficacy pilot report violates pilot_only classification")
+        forbidden = {
+            "oracle",
+            "P_n1",
+            "P_n4",
+            "S",
+            "E",
+            "classification",
+            "interpretation",
+        }
+        if set(classification) & forbidden:
+            raise RuntimeError("efficacy pilot report contains Stage-1 classification keys")
     return report
 
 
@@ -2229,7 +2343,7 @@ def _validate_stage0_direct_fixture(
 
 
 def _validate_scientific_outputs(
-    stage: int,
+    stage: str | int,
     stage_root: Path,
     manifest: Mapping[str, object],
 ) -> dict[str, object]:
@@ -2242,17 +2356,19 @@ def _validate_scientific_outputs(
         "source_snapshot_sha256"
     ) != _source_snapshot_manifest_sha256(stage_root / "source_snapshot.json"):
         raise RuntimeError("analysis report is not bound to the source snapshot")
-    if stage == 0:
+    if parse_stage_kind(stage) == 0:
         _validate_stage0_direct_fixture(stage_root, manifest)
     return report
 
 
-def _write_stage_complete(stage: int, stage_root: Path, commands: Sequence[StageCommand]) -> None:
+def _write_stage_complete(
+    stage: str | int, stage_root: Path, commands: Sequence[StageCommand]
+) -> None:
     report_path = stage_root / "report.json"
     marker = {
         "schema_version": 1,
         "artifact_type": "opd_proxy_stage_complete",
-        "stage": stage,
+        "stage": parse_stage_kind(stage),
         "report_sha256": sha256_file(report_path),
         "source_snapshot_sha256": _source_snapshot_manifest_sha256(
             stage_root / "source_snapshot.json"
@@ -2262,7 +2378,7 @@ def _write_stage_complete(stage: int, stage_root: Path, commands: Sequence[Stage
         ),
         "work_units": [command.name for command in commands],
     }
-    if stage == 0:
+    if parse_stage_kind(stage) == 0:
         marker["resume_exercise_sha256"] = sha256_file(
             stage_root / "resume_exercise.json"
         )
@@ -2275,7 +2391,8 @@ def _write_stage_complete(stage: int, stage_root: Path, commands: Sequence[Stage
 def _run_stage(args) -> int:
     repository = Path.cwd().resolve()
     output_root = (repository / DEFAULT_OUTPUT_ROOT).resolve()
-    stage_root = output_root / f"stage_{args.stage}"
+    profile = stage_profile(args.stage)
+    stage_root = output_root / profile.directory_name
     manifest = _read_stage_manifest(stage_root, args.stage, require_files=True)
     validate_stage_parent(args.stage, manifest, args.parent_report)
     commands = build_stage_commands(
@@ -2289,9 +2406,9 @@ def _run_stage(args) -> int:
         for command in commands:
             sys.stdout.buffer.write(canonical_json_bytes(command.contract()))
         return 0
-    if args.stage == 0 and not args.exercise_resume:
+    if profile.require_resume_exercise and not args.exercise_resume:
         raise RuntimeError("real Stage 0 requires --exercise-resume")
-    if args.stage != 0 and args.exercise_resume:
+    if not profile.require_resume_exercise and args.exercise_resume:
         raise RuntimeError("--exercise-resume is smoke-only and forbidden after Stage 0")
     validate_stage_prerequisite(args.stage, output_root)
     if args.stage == 2:
@@ -2329,10 +2446,15 @@ def _run_stage(args) -> int:
 def _validate_stage_command(args) -> int:
     repository = Path.cwd().resolve()
     output_root = (repository / DEFAULT_OUTPUT_ROOT).resolve()
-    stage_root = (output_root / f"stage_{args.stage}").resolve()
+    parsed_stage = parse_stage_kind(args.stage)
+    stage_root = (output_root / stage_directory_name(parsed_stage)).resolve()
     validate_stage_prerequisite(args.stage, output_root)
     manifest = _read_stage_manifest(stage_root, args.stage, require_files=True)
-    parent = None if args.stage < 2 else Path(manifest["parent_report"]["path"])  # type: ignore[index]
+    parent = (
+        Path(manifest["parent_report"]["path"])  # type: ignore[index]
+        if parsed_stage == 2
+        else None
+    )
     validate_stage_parent(args.stage, manifest, parent)
     if parent is not None:
         validate_stage2_trigger(parent)
@@ -2469,6 +2591,13 @@ def _estimate(args) -> int:
     return 0
 
 
+def _parse_cli_stage(value: str) -> StageKind:
+    try:
+        return parse_stage_kind(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
 def _add_reference(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--reference-repo", type=Path, default=DEFAULT_REFERENCE_REPO
@@ -2489,7 +2618,7 @@ def parse_cli_args(argv: Sequence[str] | None = None):
     if not values or values[0] not in subcommands:
         parser = argparse.ArgumentParser(description=__doc__)
         parser.set_defaults(command="run-stage")
-        parser.add_argument("--stage", type=int, choices=(0, 1, 2), required=True)
+        parser.add_argument("--stage", type=_parse_cli_stage, required=True)
         parser.add_argument("--parent-report", type=Path)
         parser.add_argument("--exercise-resume", action="store_true")
         _add_reference(parser)
@@ -2501,7 +2630,7 @@ def parse_cli_args(argv: Sequence[str] | None = None):
     runtime.add_argument("--expected-gpus", type=int, default=4)
     runtime.add_argument("--require-idle", action="store_true")
     validate = children.add_parser("validate-stage")
-    validate.add_argument("--stage", type=int, choices=(0, 1, 2), required=True)
+    validate.add_argument("--stage", type=_parse_cli_stage, required=True)
     validate.add_argument("--preflight-only", action="store_true")
     validate.add_argument("--require-complete", action="store_true")
     validate.add_argument("--regenerate-report", action="store_true")
@@ -2516,13 +2645,13 @@ def parse_cli_args(argv: Sequence[str] | None = None):
     decision.add_argument("--stage1-report", type=Path, required=True)
     capture = children.add_parser("capture-work-unit")
     capture.add_argument("--stage-directory", type=Path, required=True)
-    capture.add_argument("--stage", type=int, choices=(0, 1, 2), required=True)
+    capture.add_argument("--stage", type=_parse_cli_stage, required=True)
     capture.add_argument("--pair", choices=("target", "proxy"), required=True)
     capture.add_argument("--engine-seed", type=int, choices=SEEDS, required=True)
     capture.add_argument("--output-root", type=Path, required=True)
     for name in ("internal-validate-vectors", "internal-prepare-analysis-inputs"):
         child = children.add_parser(name)
-        child.add_argument("--stage", type=int, choices=(0, 1, 2), required=True)
+        child.add_argument("--stage", type=_parse_cli_stage, required=True)
         child.add_argument("--stage-directory", type=Path, required=True)
     return parser.parse_args(values)
 

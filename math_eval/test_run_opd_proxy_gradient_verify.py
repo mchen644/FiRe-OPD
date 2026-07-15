@@ -8,6 +8,10 @@ import numpy as np
 import pytest
 
 from math_eval import run_opd_proxy_gradient_verify as orchestrator_module
+from math_eval.opd_proxy_gradient_stage_profiles import (
+    EFFICACY_PILOT,
+    capture_algorithm_contract_sha256,
+)
 from math_eval.run_opd_proxy_gradient_verify import (
     GVENDI_PYTHON,
     VERL_PYTHON,
@@ -34,11 +38,12 @@ from math_eval.run_opd_proxy_gradient_verify import (
 REFERENCE_REPO = Path("/home/mchen/prismatic-synthesis-reference")
 
 
-def _manifest(stage: int = 0) -> dict:
+def _manifest(stage: int | str = 0) -> dict:
     sizes = {
         0: (24, 8, 5, 2, 2, 100),
         1: (768, 256, 172, 76, 7, 10_000),
         2: (1536, 512, 345, 153, 15, 10_000),
+        EFFICACY_PILOT: (250, 84, 56, 25, 3, 10_000),
     }
     candidate, heldout, selected, primary, diagnostic, draws = sizes[stage]
     model_manifests = {
@@ -69,6 +74,22 @@ def _manifest(stage: int = 0) -> dict:
             {"path": "/tmp/stage1-report.json", "sha256": "7" * 64}
             if stage == 2
             else None
+        ),
+        **(
+            {
+                "parent_stage_manifest": {
+                    "path": "/tmp/stage_1/manifest.json",
+                    "sha256": (
+                        "6d698d75995c777d6faaf1abd385a7589"
+                        "77ca0350ce862284f1e9d8751eddd83"
+                    ),
+                },
+                "algorithm_contract_sha256": (
+                    capture_algorithm_contract_sha256(EFFICACY_PILOT)
+                ),
+            }
+            if stage == EFFICACY_PILOT
+            else {}
         ),
         "provenance": {"root_manifest": {"model_manifests": model_manifests}},
     }
@@ -346,6 +367,236 @@ def test_dry_run_orders_capture_replay_selection_analysis(tmp_path):
     assert next(command for command in commands if command.name == "select").argv[0] == (
         GVENDI_PYTHON
     )
+
+
+def test_efficacy_pilot_plan_has_only_approved_work_units(tmp_path):
+    commands = build_stage_commands(
+        stage=EFFICACY_PILOT,
+        manifest=_manifest(EFFICACY_PILOT),
+        repository_root=tmp_path,
+        stage_directory=tmp_path / EFFICACY_PILOT,
+        reference_repo=REFERENCE_REPO,
+    )
+    names = [command.name for command in commands]
+    assert names[:2] == ["capture_target_seed_42", "capture_proxy_seed_42"]
+    assert len(
+        [name for name in names if name.startswith("replay_target_seed_42")]
+    ) == 4
+    assert len(
+        [name for name in names if name.startswith("replay_proxy_seed_42")]
+    ) == 4
+    assert names[-4:] == [
+        "validate_vectors",
+        "select",
+        "prepare_analysis_inputs",
+        "analyze",
+    ]
+    assert len(commands) == 14
+    forbidden = (
+        "seed_43",
+        "direct_gradient_fixture",
+        "collect_sft",
+        "collect_embedding",
+    )
+    assert not any(any(token in name for token in forbidden) for name in names)
+    assert sum(command.row_count for command in commands if command.name.startswith(
+        "replay_target_seed_42"
+    )) == 334
+    assert sum(command.row_count for command in commands if command.name.startswith(
+        "replay_proxy_seed_42"
+    )) == 250
+
+    select = next(command for command in commands if command.name == "select")
+    vectors = [
+        select.argv[index + 1]
+        for index, value in enumerate(select.argv[:-1])
+        if value == "--vector"
+    ]
+    assert len(vectors) == 4
+    assert all(value.startswith("P_pilot=") for value in vectors)
+    assert all(
+        token not in " ".join(select.argv)
+        for token in ("T_pilot=", "P_n4", "S=", "E=", "T:seed=")
+    )
+    assert all("--expected-stage" in command.argv for command in commands[2:10])
+
+
+def test_efficacy_pilot_hydra_contract_differs_only_in_approved_identity_fields(
+    tmp_path,
+):
+    stage1 = dict(
+        value.split("=", 1)
+        for value in build_capture_hydra_overrides(
+            stage=1,
+            manifest=_manifest(1),
+            stage_directory=tmp_path / "stage_1",
+            pair="target",
+            seed=42,
+            output_root=tmp_path / "stage_1/capture/target/seed_42",
+            repository_root=tmp_path,
+        )
+    )
+    pilot = dict(
+        value.split("=", 1)
+        for value in build_capture_hydra_overrides(
+            stage=EFFICACY_PILOT,
+            manifest=_manifest(EFFICACY_PILOT),
+            stage_directory=tmp_path / EFFICACY_PILOT,
+            pair="target",
+            seed=42,
+            output_root=tmp_path / EFFICACY_PILOT / "capture/target/seed_42",
+            repository_root=tmp_path,
+        )
+    )
+    approved_differences = {
+        "data.train_files",
+        "data.train_batch_size",
+        "actor_rollout_ref.rollout.n",
+        "actor_rollout_ref.rollout.seed",
+        "actor_rollout_ref.actor.ppo_mini_batch_size",
+        "algorithm.opd_proxy_verify_capture.output_root",
+        "algorithm.opd_proxy_verify_capture.sample_manifest",
+        "algorithm.opd_proxy_verify_capture.sample_manifest_sha256",
+        "algorithm.opd_proxy_verify_capture.source_snapshot",
+        "algorithm.opd_proxy_verify_capture.source_snapshot_sha256",
+        "algorithm.opd_proxy_verify_capture.stage",
+        "algorithm.opd_proxy_verify_capture.native_rollouts",
+        "algorithm.opd_proxy_verify_capture.expected_questions",
+        "algorithm.opd_proxy_verify_capture.algorithm_contract_sha256",
+    }
+    assert {key: value for key, value in stage1.items() if key not in approved_differences} == {
+        key: value for key, value in pilot.items() if key not in approved_differences
+    }
+    assert pilot["actor_rollout_ref.rollout.n"] == "1"
+    assert pilot["actor_rollout_ref.rollout.seed"] == "42"
+    assert pilot["algorithm.opd_proxy_verify_capture.native_rollouts"] == "1"
+    assert pilot[
+        "algorithm.opd_proxy_verify_capture.algorithm_contract_sha256"
+    ] == capture_algorithm_contract_sha256(EFFICACY_PILOT)
+    for key, value in {
+        "data.max_response_length": "16384",
+        "actor_rollout_ref.rollout.temperature": "1.0",
+        "actor_rollout_ref.rollout.top_p": "1.0",
+        "actor_rollout_ref.actor.policy_loss.loss_mode": "vanilla",
+        "actor_rollout_ref.actor.policy_loss.only_reverse_kl_advantages": "true",
+        "actor_rollout_ref.actor.loss_agg_mode": "token-mean",
+        "algorithm.rollout_correction.rollout_is": "token",
+        "algorithm.rollout_correction.rollout_is_threshold": "5.0",
+    }.items():
+        assert pilot[key] == value
+
+
+def test_cli_accepts_only_first_class_efficacy_pilot_stage():
+    accepted = (
+        ["--stage", EFFICACY_PILOT],
+        ["validate-stage", "--stage", EFFICACY_PILOT, "--preflight-only"],
+        [
+            "capture-work-unit",
+            "--stage-directory",
+            "/tmp/pilot",
+            "--stage",
+            EFFICACY_PILOT,
+            "--pair",
+            "target",
+            "--engine-seed",
+            "42",
+            "--output-root",
+            "/tmp/pilot/capture/target/seed_42",
+        ],
+        [
+            "internal-validate-vectors",
+            "--stage",
+            EFFICACY_PILOT,
+            "--stage-directory",
+            "/tmp/pilot",
+        ],
+        [
+            "internal-prepare-analysis-inputs",
+            "--stage",
+            EFFICACY_PILOT,
+            "--stage-directory",
+            "/tmp/pilot",
+        ],
+    )
+    for argv in accepted:
+        assert parse_cli_args(argv).stage == EFFICACY_PILOT
+    for invalid in ("pilot", "3", "-1"):
+        with pytest.raises(SystemExit):
+            parse_cli_args(["--stage", invalid])
+
+
+def test_pilot_report_pair_rejects_stage1_classification_keys(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        "math_eval.analyze_opd_proxy_gradient_verify.render_markdown",
+        lambda report: "pilot report\n",
+    )
+    stage_root = tmp_path / EFFICACY_PILOT
+    stage_root.mkdir()
+    report = {
+        "artifact_type": "opd_proxy_gradient_verification_report",
+        "stage": EFFICACY_PILOT,
+        "classification": {
+            "status": "pilot_only",
+            "decision": "borderline",
+            "main_hypothesis": "not_evaluated",
+        },
+    }
+    (stage_root / "report.json").write_bytes(canonical_json_bytes(report))
+    (stage_root / "report.md").write_text("pilot report\n", encoding="utf-8")
+    assert orchestrator_module._validate_report_pair(
+        EFFICACY_PILOT, stage_root
+    ) == report
+
+    report["classification"]["oracle"] = {"classification": "pass"}
+    (stage_root / "report.json").write_bytes(canonical_json_bytes(report))
+    with pytest.raises(RuntimeError, match="pilot"):
+        orchestrator_module._validate_report_pair(EFFICACY_PILOT, stage_root)
+
+
+def test_pilot_cli_dry_run_is_repeatable_and_starts_no_process(
+    tmp_path, monkeypatch, capfd
+):
+    stage_root = tmp_path / "data/opd_proxy_gradient_verify" / EFFICACY_PILOT
+    stage_root.mkdir(parents=True)
+    sample = stage_root / "sample_manifest.jsonl"
+    target = stage_root / "capture_target.parquet"
+    proxy = stage_root / "capture_proxy.parquet"
+    sample.write_text('{"split":"candidate","stable_id":"q0"}\n', encoding="utf-8")
+    target.write_bytes(b"target")
+    proxy.write_bytes(b"proxy")
+    manifest = _manifest(EFFICACY_PILOT)
+    manifest["sample_manifest_sha256"] = hashlib.sha256(sample.read_bytes()).hexdigest()
+    manifest["target_capture_parquet_sha256"] = hashlib.sha256(
+        target.read_bytes()
+    ).hexdigest()
+    manifest["proxy_capture_parquet_sha256"] = hashlib.sha256(
+        proxy.read_bytes()
+    ).hexdigest()
+    (stage_root / "manifest.json").write_bytes(canonical_json_bytes(manifest))
+
+    def forbidden(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("CPU dry-run must not start execution")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPD_PROXY_VERIFY_DRY_RUN", "1")
+    monkeypatch.setattr(orchestrator_module, "execute_stage_commands", forbidden)
+    monkeypatch.setattr(orchestrator_module.SystemRuntime, "start", forbidden)
+    assert orchestrator_module.main(
+        ["--stage", EFFICACY_PILOT, "--reference-repo", str(REFERENCE_REPO)]
+    ) == 0
+    first = capfd.readouterr().out
+    assert orchestrator_module.main(
+        ["--stage", EFFICACY_PILOT, "--reference-repo", str(REFERENCE_REPO)]
+    ) == 0
+    second = capfd.readouterr().out
+    assert first == second
+    assert len(first.splitlines()) == 14
+    assert '"name":"capture_target_seed_42"' in first
+    assert '"name":"analyze"' in first
+    assert "srun" not in first
 
 
 def test_cli_dry_run_is_byte_identical_and_loads_no_models(tmp_path):
@@ -975,6 +1226,7 @@ def test_capture_launcher_has_no_forbidden_allocation_or_install_behavior():
     assert "pip install" not in text
     assert "conda install" not in text
     assert "CUDA_VISIBLE_DEVICES=" not in text
+    assert "efficacy_pilot" in text
     subprocess.run(["bash", "-n", str(script)], check=True)
     direct = Path("verl/examples/fire_opd/run_direct_opd_proxy_gradient_fixture.sh")
     direct_text = direct.read_text(encoding="utf-8")

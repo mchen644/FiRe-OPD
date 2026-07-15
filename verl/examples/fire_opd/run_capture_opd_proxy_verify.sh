@@ -75,8 +75,10 @@ for required in stage_directory stage pair engine_seed output_root; do
     exit 2
   fi
 done
-if [[ ! "${stage}" =~ ^[012]$ ]]; then
-  echo "capture stage must be 0, 1, or 2" >&2
+if [[ "${stage}" == "efficacy_pilot" ]]; then
+  :
+elif [[ ! "${stage}" =~ ^[012]$ ]]; then
+  echo "capture stage must be 0, 1, 2, or efficacy_pilot" >&2
   exit 2
 fi
 if [[ "${pair}" != "target" && "${pair}" != "proxy" ]]; then
@@ -85,6 +87,10 @@ if [[ "${pair}" != "target" && "${pair}" != "proxy" ]]; then
 fi
 if [[ "${engine_seed}" != "42" && "${engine_seed}" != "43" ]]; then
   echo "capture engine seed must be 42 or 43" >&2
+  exit 2
+fi
+if [[ "${stage}" == "efficacy_pilot" && "${engine_seed}" != "42" ]]; then
+  echo "efficacy_pilot capture engine seed must be 42" >&2
   exit 2
 fi
 
