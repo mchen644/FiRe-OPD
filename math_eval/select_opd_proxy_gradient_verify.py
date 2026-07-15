@@ -1429,6 +1429,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             Path(args.stage_directory) / "manifest.json"
         ),
     }
+    if stage == EFFICACY_PILOT:
+        algorithm_hash = stage_manifest.get("algorithm_contract_sha256")
+        if not isinstance(algorithm_hash, str) or _SHA256_RE.fullmatch(
+            algorithm_hash
+        ) is None:
+            raise ValueError("efficacy_pilot stage lacks algorithm contract identity")
+        parent_hashes["algorithm_contract_sha256"] = algorithm_hash
     generate_random_schedules(
         candidate_rows,
         selected_size=int(stage_manifest["selected_size"]),

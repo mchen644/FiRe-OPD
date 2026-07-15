@@ -36,6 +36,10 @@ from math_eval.run_opd_proxy_gradient_verify import (
 
 
 REFERENCE_REPO = Path("/home/mchen/prismatic-synthesis-reference")
+FROZEN_STAGE1_MANIFEST = (
+    Path(__file__).resolve().parents[1]
+    / "data/opd_proxy_gradient_verify/stage_1/manifest.json"
+)
 
 
 def _manifest(stage: int | str = 0) -> dict:
@@ -78,7 +82,7 @@ def _manifest(stage: int | str = 0) -> dict:
         **(
             {
                 "parent_stage_manifest": {
-                    "path": "/tmp/stage_1/manifest.json",
+                    "path": str(FROZEN_STAGE1_MANIFEST),
                     "sha256": (
                         "6d698d75995c777d6faaf1abd385a7589"
                         "77ca0350ce862284f1e9d8751eddd83"
@@ -419,6 +423,107 @@ def test_efficacy_pilot_plan_has_only_approved_work_units(tmp_path):
         for token in ("T_pilot=", "P_n4", "S=", "E=", "T:seed=")
     )
     assert all("--expected-stage" in command.argv for command in commands[2:10])
+
+
+def test_pilot_work_unit_contract_and_timing_ledger_carry_full_identity(tmp_path):
+    pilot = build_stage_commands(
+        stage=EFFICACY_PILOT,
+        manifest=_manifest(EFFICACY_PILOT),
+        repository_root=tmp_path,
+        stage_directory=tmp_path / EFFICACY_PILOT,
+        reference_repo=REFERENCE_REPO,
+    )[0]
+    stage1 = build_stage_commands(
+        stage=1,
+        manifest=_manifest(1),
+        repository_root=tmp_path,
+        stage_directory=tmp_path / "stage_1",
+        reference_repo=REFERENCE_REPO,
+    )[0]
+    pilot_contract = pilot.contract()
+    stage1_contract = stage1.contract()
+    expected = {
+        "stage": EFFICACY_PILOT,
+        "native_rollouts": 1,
+        "generation_seeds": [42],
+        "sample_manifest_sha256": "4" * 64,
+        "source_snapshot_sha256": "0" * 64,
+        "algorithm_contract_sha256": capture_algorithm_contract_sha256(
+            EFFICACY_PILOT
+        ),
+    }
+    assert {key: pilot_contract[key] for key in expected} == expected
+    assert all(pilot_contract[key] != stage1_contract[key] for key in (
+        "stage", "native_rollouts", "generation_seeds", "algorithm_contract_sha256"
+    ))
+
+    runnable = StageCommand(
+        **{
+            **pilot.as_dict(),
+            "name": "pilot_identity_fixture",
+            "argv": ("echo", "pilot"),
+            "completion_paths": (tmp_path / "pilot-output/COMPLETE.json",),
+            "output_root": tmp_path / "pilot-output",
+            "log_path": tmp_path / "pilot.log",
+            "gpu_tokens": (),
+            "output_kind": "generic",
+            "validate_output": False,
+            "row_count": 1,
+        }
+    )
+    execute_stage_commands(
+        (runnable,),
+        stage_directory=tmp_path / EFFICACY_PILOT,
+        env=_runtime_env(),
+        runtime=_FakeRuntime(),
+    )
+    complete = orchestrator_module.load_canonical_json(
+        tmp_path
+        / EFFICACY_PILOT
+        / "work_units/pilot_identity_fixture.complete.json",
+        "pilot work-unit completion",
+    )
+    assert {key: complete[key] for key in expected} == expected
+
+
+def test_pilot_stage_completion_carries_algorithm_source_and_parent_identity(
+    tmp_path,
+):
+    stage_root = tmp_path / EFFICACY_PILOT
+    stage_root.mkdir()
+    files = [{"path": "module.py", "sha256": "9" * 64}]
+    source_hash = hashlib.sha256(canonical_json_bytes(files)).hexdigest()
+    (stage_root / "source_snapshot.json").write_bytes(
+        canonical_json_bytes({"files": files, "manifest_sha256": source_hash})
+    )
+    (stage_root / "report.json").write_bytes(
+        canonical_json_bytes({"stage": EFFICACY_PILOT})
+    )
+    command = build_stage_commands(
+        stage=EFFICACY_PILOT,
+        manifest=_manifest(EFFICACY_PILOT),
+        repository_root=tmp_path,
+        stage_directory=stage_root,
+        reference_repo=REFERENCE_REPO,
+    )[0]
+    orchestrator_module._write_stage_complete(
+        EFFICACY_PILOT, stage_root, (command,)
+    )
+    marker = orchestrator_module.load_canonical_json(
+        stage_root / "STAGE_COMPLETE.json", "pilot completion"
+    )
+    assert marker["stage"] == EFFICACY_PILOT
+    assert marker["source_snapshot_sha256"] == source_hash
+    assert marker["algorithm_contract_sha256"] == (
+        capture_algorithm_contract_sha256(EFFICACY_PILOT)
+    )
+    assert marker["native_rollouts"] == 1
+    assert marker["generation_seeds"] == [42]
+    assert marker["sample_manifest_sha256"] == "4" * 64
+    assert marker["parent_stage1_manifest_sha256"] == (
+        "6d698d75995c777d6faaf1abd385a7589"
+        "77ca0350ce862284f1e9d8751eddd83"
+    )
 
 
 def test_efficacy_pilot_hydra_contract_differs_only_in_approved_identity_fields(
@@ -814,9 +919,27 @@ def test_stage_parent_contract_rejects_wrong_or_unexpected_parent(tmp_path):
         validate_stage_parent(1, _manifest(1), parent)
 
 
-def test_stage1_cannot_start_without_completed_stage0_smoke(tmp_path):
-    with pytest.raises(RuntimeError, match="completed Stage 0"):
-        validate_stage_prerequisite(1, tmp_path)
+def test_pilot_parent_validation_requires_exact_frozen_stage1_bytes(tmp_path):
+    manifest = _manifest(EFFICACY_PILOT)
+    orchestrator_module.validate_pilot_parent_manifest(manifest)
+
+    replacement = tmp_path / "manifest.json"
+    replacement.write_bytes(FROZEN_STAGE1_MANIFEST.read_bytes() + b" ")
+    changed = {
+        **manifest,
+        "parent_stage_manifest": {
+            **manifest["parent_stage_manifest"],
+            "path": str(replacement),
+        },
+    }
+    with pytest.raises(ValueError, match="parent"):
+        orchestrator_module.validate_pilot_parent_manifest(changed)
+
+
+def test_stage1_and_pilot_cannot_start_without_completed_stage0_smoke(tmp_path):
+    for stage in (1, EFFICACY_PILOT):
+        with pytest.raises(RuntimeError, match="completed Stage 0"):
+            validate_stage_prerequisite(stage, tmp_path)
 
 
 def test_stage_prerequisite_binds_report_source_and_smoke_evidence(tmp_path):
@@ -845,6 +968,7 @@ def test_stage_prerequisite_binds_report_source_and_smoke_evidence(tmp_path):
     marker_path = stage0 / "STAGE_COMPLETE.json"
     marker_path.write_bytes(canonical_json_bytes(marker))
     validate_stage_prerequisite(1, tmp_path)
+    validate_stage_prerequisite(EFFICACY_PILOT, tmp_path)
     validate_cross_stage_source(1, tmp_path, source_hash)
     with pytest.raises(RuntimeError, match="differ across stages"):
         validate_cross_stage_source(1, tmp_path, "2" * 64)
@@ -1151,10 +1275,32 @@ def test_full_experiment_source_snapshot_covers_main_and_reference_sources():
     assert set(snapshot["repositories"]) == {"main", "reference"}
     paths = {(row["repository"], row["path"]) for row in snapshot["files"]}
     assert ("main", "math_eval/run_opd_proxy_gradient_verify.py") in paths
+    for required in (
+        "docs/superpowers/specs/2026-07-15-opd-efficacy-pilot-design.md",
+        "docs/superpowers/plans/2026-07-15-opd-efficacy-pilot.md",
+        "math_eval/opd_proxy_gradient_stage_profiles.py",
+        "math_eval/test_opd_proxy_gradient_stage_profiles.py",
+    ):
+        assert ("main", required) in paths
     assert (
         "reference",
         "prismatic-synthesis/gradient_modules/gradient_computer.py",
     ) in paths
+
+    parent_path = Path("data/opd_proxy_gradient_verify/stage_1/manifest.json")
+    parent = orchestrator_module.load_canonical_json(
+        parent_path, "frozen Stage-1 parent manifest"
+    )
+    assert hashlib.sha256(parent_path.read_bytes()).hexdigest() == (
+        "6d698d75995c777d6faaf1abd385a7589"
+        "77ca0350ce862284f1e9d8751eddd83"
+    )
+    assert parent["provenance"]["publication"]["repository"]["head"] == (
+        "174849613a9c61445765f0b913174d286f3819e4"
+    )
+    assert snapshot["manifest_sha256"] != parent["provenance"][
+        "source_snapshot"
+    ]["manifest_sha256"]
 
 
 def test_gvendi_interpreter_imports_both_verl_and_cuda_projector_symbol():

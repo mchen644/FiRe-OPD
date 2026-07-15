@@ -9,6 +9,10 @@ import pytest
 from safetensors.numpy import load_file as load_safetensors
 from safetensors.numpy import save_file as save_safetensors
 
+from math_eval.opd_proxy_gradient_stage_profiles import (
+    EFFICACY_PILOT,
+    capture_algorithm_contract_sha256,
+)
 from math_eval.opd_proxy_gradient_verify_artifacts import (
     SourceFileSpec,
     TrajectoryKey,
@@ -27,6 +31,7 @@ from math_eval.opd_proxy_gradient_verify_artifacts import (
     sha256_int_rows,
     sha256_ordered_id_lines,
     validate_exact_key_coverage,
+    validate_existing_work_unit,
     write_or_validate_manifest,
 )
 
@@ -188,6 +193,68 @@ def test_write_or_validate_manifest_rejects_changed_parent_hash(tmp_path: Path):
     changed = {**original, "parent_hashes": {"sample": "b" * 64}}
     with pytest.raises(ValueError, match="manifest mismatch"):
         write_or_validate_manifest(path, changed)
+
+
+def _work_unit_contract(stage: int | str) -> dict[str, object]:
+    native_rollouts = 1 if stage == EFFICACY_PILOT else 4
+    seeds = [42] if stage == EFFICACY_PILOT else [42, 43]
+    return {
+        "schema_version": 1,
+        "artifact_type": "opd_proxy_work_unit_contract",
+        "name": "capture_target_seed_42",
+        "stage": stage,
+        "native_rollouts": native_rollouts,
+        "generation_seeds": seeds,
+        "sample_manifest_sha256": "a" * 64,
+        "source_snapshot_sha256": "b" * 64,
+        "algorithm_contract_sha256": capture_algorithm_contract_sha256(stage),
+    }
+
+
+def test_pilot_and_stage1_work_unit_contracts_are_cross_resume_incompatible(
+    tmp_path: Path,
+):
+    stage1_contract = _work_unit_contract(1)
+    pilot_contract = _work_unit_contract(EFFICACY_PILOT)
+    assert pilot_contract["algorithm_contract_sha256"] != stage1_contract[
+        "algorithm_contract_sha256"
+    ]
+
+    shared_path = tmp_path / "same-name.contract.json"
+    shared_path.write_bytes(canonical_json_bytes(stage1_contract))
+    with pytest.raises(ValueError, match="work-unit contract differs"):
+        validate_existing_work_unit(shared_path, pilot_contract)
+
+    shared_path.write_bytes(canonical_json_bytes(pilot_contract))
+    with pytest.raises(ValueError, match="work-unit contract differs"):
+        validate_existing_work_unit(shared_path, stage1_contract)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("stage", 1),
+        ("native_rollouts", 4),
+        ("generation_seeds", [42, 43]),
+        ("sample_manifest_sha256", "c" * 64),
+        ("source_snapshot_sha256", "d" * 64),
+        (
+            "algorithm_contract_sha256",
+            capture_algorithm_contract_sha256(1),
+        ),
+    ],
+)
+def test_existing_work_unit_rejects_each_independent_identity_mismatch(
+    tmp_path: Path, field: str, replacement: object
+):
+    expected = _work_unit_contract(EFFICACY_PILOT)
+    stored = {**expected, field: replacement}
+    # Deliberately use a pilot-looking path: names cannot rescue identity mismatch.
+    path = tmp_path / "efficacy_pilot/capture_target_seed_42.contract.json"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(canonical_json_bytes(stored))
+    with pytest.raises(ValueError, match="work-unit contract differs"):
+        validate_existing_work_unit(path, expected)
 
 
 def _version_resolver(versions: dict[str, str | None]):

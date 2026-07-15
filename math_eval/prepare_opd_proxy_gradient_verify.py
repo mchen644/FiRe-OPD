@@ -1472,6 +1472,7 @@ def write_stage_artifacts(
             "candidate_ids_sha256": pilot_parent.manifest["candidate_ids_sha256"],
             "held_out_ids_sha256": pilot_parent.manifest["held_out_ids_sha256"],
             "all_ids_sha256": pilot_parent.manifest["all_ids_sha256"],
+            "provenance": pilot_parent.manifest["provenance"],
         }
     else:
         if (

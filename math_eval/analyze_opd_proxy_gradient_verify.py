@@ -351,6 +351,7 @@ def _load_vector_record(
     expected_representation: str,
     selection_name: str,
     expected_source_hash: str,
+    expected_algorithm_hash: str | None,
     description: str,
 ) -> tuple[VectorSet, str]:
     if not isinstance(record, dict):
@@ -398,6 +399,12 @@ def _load_vector_record(
             raise ValueError(
                 f"{description} vector source snapshot provenance mismatch"
             )
+        if expected_algorithm_hash is not None and parents.get(
+            "algorithm_contract_sha256"
+        ) != expected_algorithm_hash:
+            raise ValueError(
+                f"{description} vector algorithm contract provenance mismatch"
+            )
         sources.append(source)
         if sha256_file(manifest_path) != expected_manifest_sha:
             raise ValueError(f"{description} vector manifest changed while loading")
@@ -428,6 +435,14 @@ def write_analysis_input_manifest(
     stage = parse_stage_kind(stage_manifest.get("stage"))
     representations = _analysis_representations(stage)
     target_seeds = stage_profile(stage).generation_seeds
+    algorithm_hash = (
+        _require_sha(
+            stage_manifest.get("algorithm_contract_sha256"),
+            "pilot algorithm contract SHA",
+        )
+        if stage == EFFICACY_PILOT
+        else None
+    )
     if set(representation_sources) != set(representations):
         raise ValueError("analysis input representations are incomplete or unexpected")
     if set(target_heldout_sources) != set(target_seeds):
@@ -468,6 +483,12 @@ def write_analysis_input_manifest(
                 raise ValueError(
                     f"{description} vector source snapshot provenance mismatch"
                 )
+            if algorithm_hash is not None and parents.get(
+                "algorithm_contract_sha256"
+            ) != algorithm_hash:
+                raise ValueError(
+                    f"{description} vector algorithm contract provenance mismatch"
+                )
             hashes.append(sha256_file(directory / "manifest.json"))
         if len(declared) == 1:
             return {
@@ -507,6 +528,8 @@ def write_analysis_input_manifest(
             for seed in target_seeds
         },
     }
+    if algorithm_hash is not None:
+        manifest["algorithm_contract_sha256"] = algorithm_hash
     write_or_validate_manifest(stage_root / ANALYSIS_INPUTS_FILE, manifest)
     return manifest
 
@@ -527,6 +550,14 @@ def _load_inputs(stage_dir: Path, reference_repo: Path) -> _LoadedInputs:
     representations = _analysis_representations(layout.stage)
     selection_representations = expected_representations(layout.stage)
     target_seeds = stage_profile(layout.stage).generation_seeds
+    expected_algorithm_hash = (
+        _require_sha(
+            stage_manifest.get("algorithm_contract_sha256"),
+            "pilot algorithm contract SHA",
+        )
+        if layout.stage == EFFICACY_PILOT
+        else None
+    )
     inputs_path = stage_root / ANALYSIS_INPUTS_FILE
     inputs = _load_canonical_json(inputs_path, "analysis input manifest")
     if inputs.get("schema_version") != 1 or inputs.get("artifact_type") != (
@@ -537,6 +568,11 @@ def _load_inputs(stage_dir: Path, reference_repo: Path) -> _LoadedInputs:
         raise ValueError("analysis input stage manifest SHA mismatch")
     if inputs.get("source_snapshot_sha256") != source_snapshot_hash:
         raise ValueError("analysis input source snapshot SHA mismatch")
+    if expected_algorithm_hash is not None:
+        if inputs.get("algorithm_contract_sha256") != expected_algorithm_hash:
+            raise ValueError("analysis input algorithm contract SHA mismatch")
+    elif "algorithm_contract_sha256" in inputs:
+        raise ValueError("numbered analysis input has pilot algorithm identity")
 
     representation_records = inputs.get("representations")
     if not isinstance(representation_records, dict) or set(
@@ -557,6 +593,7 @@ def _load_inputs(stage_dir: Path, reference_repo: Path) -> _LoadedInputs:
             expected_representation=_source_representation(name),
             selection_name=name,
             expected_source_hash=source_snapshot_hash,
+            expected_algorithm_hash=expected_algorithm_hash,
             description=name,
         )
         vectors[name] = vector
@@ -580,6 +617,7 @@ def _load_inputs(stage_dir: Path, reference_repo: Path) -> _LoadedInputs:
             expected_representation=_source_representation(name),
             selection_name=name,
             expected_source_hash=source_snapshot_hash,
+            expected_algorithm_hash=expected_algorithm_hash,
             description=f"target held-out seed {seed}",
         )
 
@@ -600,6 +638,8 @@ def _load_inputs(stage_dir: Path, reference_repo: Path) -> _LoadedInputs:
         "source_snapshot_sha256": source_snapshot_hash,
         "stage_manifest_sha256": stage_manifest_sha,
     }
+    if expected_algorithm_hash is not None:
+        parent_hashes["algorithm_contract_sha256"] = expected_algorithm_hash
     selection = load_selection_bundle(
         selection_directory,
         expected_candidate_ids=candidate_ids,

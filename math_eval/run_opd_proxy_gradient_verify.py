@@ -225,6 +225,12 @@ class StageCommand:
     extra_env: tuple[tuple[str, str], ...] = ()
     input_hashes: tuple[tuple[str, str], ...] = ()
     validate_output: bool = True
+    stage: StageKind | None = None
+    native_rollouts: int | None = None
+    generation_seeds: tuple[int, ...] = ()
+    sample_manifest_sha256: str | None = None
+    source_snapshot_sha256: str | None = None
+    algorithm_contract_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if not self.name or not re.fullmatch(r"[a-z0-9][a-z0-9_]*", self.name):
@@ -242,9 +248,41 @@ class StageCommand:
         for name, value in self.input_hashes:
             if not name or _SHA256_RE.fullmatch(value) is None:
                 raise ValueError("stage command input hashes must be named SHA-256 values")
+        identity_values = (
+            self.stage,
+            self.native_rollouts,
+            self.generation_seeds,
+            self.sample_manifest_sha256,
+            self.source_snapshot_sha256,
+            self.algorithm_contract_sha256,
+        )
+        if any(value not in (None, ()) for value in identity_values):
+            if self.stage is None:
+                raise ValueError("stage command identity requires a stage")
+            profile = stage_profile(self.stage)
+            if self.native_rollouts != profile.native_rollouts:
+                raise ValueError("stage command native rollout identity mismatch")
+            if self.generation_seeds != profile.generation_seeds:
+                raise ValueError("stage command generation seed identity mismatch")
+            _require_sha(self.sample_manifest_sha256, "stage command sample manifest SHA")
+            _require_sha(self.source_snapshot_sha256, "stage command source snapshot SHA")
+            if self.algorithm_contract_sha256 != capture_algorithm_contract_sha256(
+                self.stage
+            ):
+                raise ValueError("stage command algorithm contract identity mismatch")
 
     def as_dict(self) -> dict[str, object]:
         return {field.name: getattr(self, field.name) for field in fields(self)}
+
+    def identity(self) -> dict[str, object]:
+        return {
+            "stage": self.stage,
+            "native_rollouts": self.native_rollouts,
+            "generation_seeds": list(self.generation_seeds),
+            "sample_manifest_sha256": self.sample_manifest_sha256,
+            "source_snapshot_sha256": self.source_snapshot_sha256,
+            "algorithm_contract_sha256": self.algorithm_contract_sha256,
+        }
 
     def contract(self) -> dict[str, object]:
         return {
@@ -263,6 +301,7 @@ class StageCommand:
             "extra_env": {key: value for key, value in self.extra_env},
             "input_hashes": {key: value for key, value in self.input_hashes},
             "validate_output": self.validate_output,
+            **self.identity(),
         }
 
     @property
@@ -504,6 +543,43 @@ def _model_hashes(manifest: Mapping[str, object]) -> dict[str, str]:
             "proxy_student",
         )
     }
+
+
+def validate_pilot_parent_manifest(
+    manifest: Mapping[str, object],
+) -> dict[str, object]:
+    """Validate the pilot's exact frozen Stage-1 membership parent bytes."""
+    if manifest.get("stage") != EFFICACY_PILOT:
+        raise ValueError("pilot parent validation requires efficacy_pilot stage")
+    record = manifest.get("parent_stage_manifest")
+    if not isinstance(record, Mapping):
+        raise ValueError("efficacy_pilot lacks its parent Stage-1 manifest")
+    path_value = record.get("path")
+    if not isinstance(path_value, str) or not path_value:
+        raise ValueError("efficacy_pilot parent Stage-1 path is invalid")
+    expected = _require_sha(
+        record.get("sha256"), "efficacy_pilot parent Stage-1 SHA"
+    )
+    path = Path(path_value).resolve()
+    if expected != FROZEN_STAGE1_MANIFEST_SHA256 or sha256_file(path) != expected:
+        raise ValueError("efficacy_pilot parent Stage-1 manifest bytes differ")
+    parent = load_canonical_json(path, "efficacy_pilot parent Stage-1 manifest")
+    publication = parent.get("provenance")
+    publication = (
+        publication.get("publication")
+        if isinstance(publication, Mapping)
+        else None
+    )
+    repository = (
+        publication.get("repository")
+        if isinstance(publication, Mapping)
+        else None
+    )
+    if parent.get("stage") != 1 or not isinstance(repository, Mapping) or repository.get(
+        "head"
+    ) != "174849613a9c61445765f0b913174d286f3819e4":
+        raise ValueError("efficacy_pilot parent Stage-1 provenance differs")
+    return parent
 
 
 def validate_stage_parent(
@@ -1071,6 +1147,14 @@ def build_stage_commands(
                 ("source_snapshot_sha256", source_snapshot_sha256),
                 ("stage_manifest_sha256", stage_manifest_sha256),
             ),
+            stage=parsed_stage,
+            native_rollouts=profile.native_rollouts,
+            generation_seeds=profile.generation_seeds,
+            sample_manifest_sha256=str(manifest["sample_manifest_sha256"]),
+            source_snapshot_sha256=source_snapshot_sha256,
+            algorithm_contract_sha256=capture_algorithm_contract_sha256(
+                parsed_stage
+            ),
         )
         for command in commands
     )
@@ -1228,6 +1312,12 @@ def _require_output_source_parent(
         raise RuntimeError(
             f"completed work unit {command.name} differs from its source snapshot"
         )
+    if command.stage == EFFICACY_PILOT and parents.get(
+        "algorithm_contract_sha256"
+    ) != command.algorithm_contract_sha256:
+        raise RuntimeError(
+            f"completed work unit {command.name} differs from its algorithm contract"
+        )
 
 
 def _validate_completed_output(command: StageCommand) -> None:
@@ -1285,8 +1375,24 @@ def _validate_completed_output(command: StageCommand) -> None:
         stage = parse_stage_kind(stage_value)
         report = _validate_report_pair(stage, command.output_root)
         expected = dict(command.input_hashes).get("source_snapshot_sha256")
-        if report.get("provenance", {}).get("source_snapshot_sha256") != expected:
+        provenance = report.get("provenance", {})
+        if provenance.get("source_snapshot_sha256") != expected:
             raise RuntimeError("analysis report source snapshot mismatch")
+        if command.stage == EFFICACY_PILOT and provenance.get(
+            "algorithm_contract_sha256"
+        ) != command.algorithm_contract_sha256:
+            raise RuntimeError("analysis report algorithm contract mismatch")
+        return
+    if command.output_kind == "validation":
+        marker = load_canonical_json(
+            command.completion_paths[0], "vector validation marker"
+        )
+        if marker.get("source_snapshot_sha256") != command.source_snapshot_sha256:
+            raise RuntimeError("vector validation source snapshot mismatch")
+        if command.stage == EFFICACY_PILOT and marker.get(
+            "algorithm_contract_sha256"
+        ) != command.algorithm_contract_sha256:
+            raise RuntimeError("vector validation algorithm contract mismatch")
         return
     if command.output_kind == "analysis_inputs":
         inputs = load_canonical_json(
@@ -1295,6 +1401,10 @@ def _validate_completed_output(command: StageCommand) -> None:
         expected = dict(command.input_hashes).get("source_snapshot_sha256")
         if inputs.get("source_snapshot_sha256") != expected:
             raise RuntimeError("analysis inputs source snapshot mismatch")
+        if command.stage == EFFICACY_PILOT and inputs.get(
+            "algorithm_contract_sha256"
+        ) != command.algorithm_contract_sha256:
+            raise RuntimeError("analysis inputs algorithm contract mismatch")
         return
     for path in command.completion_paths:
         if path.suffix == ".json":
@@ -1340,8 +1450,20 @@ def _work_paths(stage_directory: Path, command: StageCommand) -> tuple[Path, Pat
 
 
 def _prepare_unit(stage_directory: Path, command: StageCommand) -> bool:
+    from math_eval.opd_proxy_gradient_verify_artifacts import (
+        validate_existing_work_unit,
+    )
+
     contract_path, complete_path = _work_paths(stage_directory, command)
-    write_or_validate_json(contract_path, command.contract())
+    if contract_path.is_file():
+        try:
+            validate_existing_work_unit(contract_path, command.contract())
+        except ValueError as error:
+            raise RuntimeError(
+                f"work-unit contract differs for {command.name}"
+            ) from error
+    else:
+        write_or_validate_json(contract_path, command.contract())
     _guard_capture_resume(command)
     completions_exist = [path.is_file() for path in command.completion_paths]
     if complete_path.exists():
@@ -1349,6 +1471,11 @@ def _prepare_unit(stage_directory: Path, command: StageCommand) -> bool:
         complete = load_canonical_json(complete_path, f"{command.name} completion")
         if complete.get("contract_sha256") != command.contract_sha256:
             raise RuntimeError(f"work unit {command.name} completion contract mismatch")
+        if any(
+            complete.get(key) != value
+            for key, value in command.identity().items()
+        ):
+            raise RuntimeError(f"work unit {command.name} completion identity mismatch")
         actual = _completion_records(command)
         if complete.get("completion_artifacts") != actual:
             raise RuntimeError(f"work unit {command.name} completion artifact mismatch")
@@ -1368,6 +1495,7 @@ def _prepare_unit(stage_directory: Path, command: StageCommand) -> bool:
             "duration_seconds": 0.0,
             "completed_rows": command.row_count,
             "adopted_after_orchestrator_interruption": True,
+            **command.identity(),
         }
         write_or_validate_json(complete_path, complete)
         return True
@@ -1454,6 +1582,7 @@ def _publish_unit_completion(
         "duration_seconds": float(duration),
         "completed_rows": command.row_count,
         "adopted_after_orchestrator_interruption": False,
+        **command.identity(),
     }
     write_or_validate_json(complete_path, complete)
 
@@ -1983,6 +2112,14 @@ def _internal_validate_vectors(stage: str | int, stage_directory: Path) -> None:
     expected_source_hash = _source_snapshot_manifest_sha256(
         stage_root / "source_snapshot.json"
     )
+    expected_algorithm_hash = (
+        _require_sha(
+            manifest.get("algorithm_contract_sha256"),
+            "pilot algorithm contract SHA",
+        )
+        if parsed_stage == EFFICACY_PILOT
+        else None
+    )
 
     def validate_source(vector_set, description: str) -> None:
         parents = vector_set.manifest.get("parent_hashes")
@@ -1991,6 +2128,12 @@ def _internal_validate_vectors(stage: str | int, stage_directory: Path) -> None:
         ) != expected_source_hash:
             raise ValueError(
                 f"{description} vector source differs from experiment source snapshot"
+            )
+        if expected_algorithm_hash is not None and parents.get(
+            "algorithm_contract_sha256"
+        ) != expected_algorithm_hash:
+            raise ValueError(
+                f"{description} vector differs from pilot algorithm contract"
             )
 
     view_hashes: dict[str, str] = {}
@@ -2032,6 +2175,12 @@ def _internal_validate_vectors(stage: str | int, stage_directory: Path) -> None:
         "candidate_count": len(candidate_ids),
         "held_out_count": len(heldout_ids),
         "representation_view_manifest_sha256": view_hashes,
+        "source_snapshot_sha256": expected_source_hash,
+        **(
+            {"algorithm_contract_sha256": expected_algorithm_hash}
+            if expected_algorithm_hash is not None
+            else {}
+        ),
     }
     write_or_validate_json(stage_root / "vectors/VALIDATED.json", marker)
 
@@ -2112,17 +2261,21 @@ def _validate_model_contract(repository: Path, manifest: Mapping[str, object]) -
 
 def validate_stage_prerequisite(stage: str | int, output_root: Path) -> None:
     parsed_stage = parse_stage_kind(stage)
-    if parsed_stage in (0, EFFICACY_PILOT):
+    if parsed_stage == 0:
         return
-    assert isinstance(parsed_stage, int)
-    previous_root = output_root / f"stage_{parsed_stage - 1}"
+    if parsed_stage == EFFICACY_PILOT:
+        previous_stage = 0
+    else:
+        assert isinstance(parsed_stage, int)
+        previous_stage = parsed_stage - 1
+    previous_root = output_root / f"stage_{previous_stage}"
     previous = previous_root / "STAGE_COMPLETE.json"
     if not previous.is_file():
         raise RuntimeError(
-            f"Stage {parsed_stage} requires completed Stage {parsed_stage - 1}"
+            f"Stage {parsed_stage} requires completed Stage {previous_stage}"
         )
     marker = load_canonical_json(previous, "previous stage completion")
-    if marker.get("stage") != parsed_stage - 1:
+    if marker.get("stage") != previous_stage:
         raise RuntimeError("previous stage completion marker has wrong stage")
     if marker.get("report_sha256") != sha256_file(previous_root / "report.json"):
         raise RuntimeError("previous stage report differs from completion marker")
@@ -2133,7 +2286,7 @@ def validate_stage_prerequisite(stage: str | int, output_root: Path) -> None:
         "source_snapshot_file_sha256"
     ) != sha256_file(previous_source):
         raise RuntimeError("previous stage source snapshot differs from completion marker")
-    if parsed_stage == 1:
+    if parsed_stage in (1, EFFICACY_PILOT):
         resume_path = previous_root / "resume_exercise.json"
         direct_path = previous_root / "direct_gradient_fixture/COMPLETE.json"
         if (
@@ -2352,10 +2505,20 @@ def _validate_scientific_outputs(
         stage_root / "manifest.json"
     ):
         raise RuntimeError("analysis report is not bound to the stage manifest")
-    if report.get("provenance", {}).get(
+    provenance = report.get("provenance", {})
+    if provenance.get(
         "source_snapshot_sha256"
     ) != _source_snapshot_manifest_sha256(stage_root / "source_snapshot.json"):
         raise RuntimeError("analysis report is not bound to the source snapshot")
+    if parse_stage_kind(stage) == EFFICACY_PILOT:
+        if provenance.get("algorithm_contract_sha256") != (
+            manifest.get("algorithm_contract_sha256")
+        ):
+            raise RuntimeError("pilot report is not bound to the algorithm contract")
+        if provenance.get("parent_stage1_manifest_sha256") != (
+            FROZEN_STAGE1_MANIFEST_SHA256
+        ):
+            raise RuntimeError("pilot report is not bound to the frozen Stage-1 parent")
     if parse_stage_kind(stage) == 0:
         _validate_stage0_direct_fixture(stage_root, manifest)
     return report
@@ -2364,11 +2527,19 @@ def _validate_scientific_outputs(
 def _write_stage_complete(
     stage: str | int, stage_root: Path, commands: Sequence[StageCommand]
 ) -> None:
+    parsed_stage = parse_stage_kind(stage)
+    if not commands:
+        raise RuntimeError("stage completion requires work-unit identities")
+    identity = commands[0].identity()
+    if identity["stage"] != parsed_stage or any(
+        command.identity() != identity for command in commands[1:]
+    ):
+        raise RuntimeError("stage work units do not share one experiment identity")
     report_path = stage_root / "report.json"
     marker = {
         "schema_version": 1,
         "artifact_type": "opd_proxy_stage_complete",
-        "stage": parse_stage_kind(stage),
+        "stage": parsed_stage,
         "report_sha256": sha256_file(report_path),
         "source_snapshot_sha256": _source_snapshot_manifest_sha256(
             stage_root / "source_snapshot.json"
@@ -2377,8 +2548,16 @@ def _write_stage_complete(
             stage_root / "source_snapshot.json"
         ),
         "work_units": [command.name for command in commands],
+        "native_rollouts": identity["native_rollouts"],
+        "generation_seeds": identity["generation_seeds"],
+        "sample_manifest_sha256": identity["sample_manifest_sha256"],
+        "algorithm_contract_sha256": identity["algorithm_contract_sha256"],
     }
-    if parse_stage_kind(stage) == 0:
+    if parsed_stage == EFFICACY_PILOT:
+        marker["parent_stage1_manifest_sha256"] = (
+            FROZEN_STAGE1_MANIFEST_SHA256
+        )
+    if parsed_stage == 0:
         marker["resume_exercise_sha256"] = sha256_file(
             stage_root / "resume_exercise.json"
         )
@@ -2395,6 +2574,8 @@ def _run_stage(args) -> int:
     stage_root = output_root / profile.directory_name
     manifest = _read_stage_manifest(stage_root, args.stage, require_files=True)
     validate_stage_parent(args.stage, manifest, args.parent_report)
+    if args.stage == EFFICACY_PILOT:
+        validate_pilot_parent_manifest(manifest)
     commands = build_stage_commands(
         stage=args.stage,
         manifest=manifest,
@@ -2456,6 +2637,8 @@ def _validate_stage_command(args) -> int:
         else None
     )
     validate_stage_parent(args.stage, manifest, parent)
+    if parsed_stage == EFFICACY_PILOT:
+        validate_pilot_parent_manifest(manifest)
     if parent is not None:
         validate_stage2_trigger(parent)
     validate_main_repository(repository, manifest)
@@ -2699,6 +2882,7 @@ __all__ = [
     "validate_cross_stage_source",
     "validate_main_repository",
     "validate_opd_cli_runtime",
+    "validate_pilot_parent_manifest",
     "validate_stage_parent",
     "validate_stage_prerequisite",
     "validate_stage2_trigger",

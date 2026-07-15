@@ -878,6 +878,9 @@ def test_pilot_artifacts_publish_in_separate_namespace_with_parent_identity(
     assert manifest["target_capture_count"] == 334
     assert manifest["proxy_capture_count"] == 250
     assert manifest["parent_stage_manifest"]["sha256"] == parent_sha
+    assert manifest["parent_stage_manifest"]["provenance"] == parent.manifest[
+        "provenance"
+    ]
     assert manifest["algorithm_contract_sha256"] == (
         capture_algorithm_contract_sha256(EFFICACY_PILOT)
     )

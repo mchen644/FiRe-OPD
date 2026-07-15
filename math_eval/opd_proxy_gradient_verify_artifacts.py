@@ -454,6 +454,26 @@ def write_or_validate_manifest(
             os.close(lock_descriptor)
 
 
+def validate_existing_work_unit(
+    path: Path, expected_contract: Mapping[str, object]
+) -> dict[str, object]:
+    """Validate an existing immutable work-unit contract by full canonical value."""
+    target = Path(path)
+    normalized_value = _strict_json_bytes(
+        canonical_json_bytes(dict(expected_contract)), "expected work-unit contract"
+    )
+    if not isinstance(normalized_value, dict):
+        raise ValueError("expected work-unit contract must be a JSON object")
+    if not target.is_file():
+        raise ValueError(f"work-unit contract does not exist: {target}")
+    actual = _strict_json_file(target, "work-unit contract")
+    if actual != normalized_value or target.read_bytes() != canonical_json_bytes(
+        normalized_value
+    ):
+        raise ValueError("work-unit contract differs from the immutable identity")
+    return dict(normalized_value)
+
+
 def _stable_file_record(path: Path, logical_path: str) -> dict[str, object]:
     before = path.stat()
     digest = sha256_file(path)
@@ -1191,5 +1211,6 @@ __all__ = [
     "sha256_ordered_id_lines",
     "sha256_int_rows",
     "validate_exact_key_coverage",
+    "validate_existing_work_unit",
     "write_or_validate_manifest",
 ]

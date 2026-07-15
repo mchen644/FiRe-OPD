@@ -136,6 +136,11 @@ def _write_vector_directory(
         parent_hashes={
             "sample_manifest_sha256": parent_hash,
             "source_snapshot_sha256": TEST_SOURCE_HASH,
+            **(
+                {"algorithm_contract_sha256": "f" * 64}
+                if name in {"P_pilot", "T_pilot"}
+                else {}
+            ),
         },
         source_snapshot={"manifest_sha256": TEST_SOURCE_HASH},
         repository={"head": "c" * 40, "status": "", "status_sha256": "d" * 64},
@@ -437,15 +442,17 @@ def _build_synthetic_pilot(root: Path) -> Path:
     selection_dir = root / "selection"
     proxy = loaded["P_pilot"]
     proxy_hash = hashlib.sha256(canonical_json_bytes(proxy.manifest)).hexdigest()
+    pilot_parent_hashes = {
+        "source_snapshot_sha256": TEST_SOURCE_HASH,
+        "stage_manifest_sha256": stage_hash,
+        "algorithm_contract_sha256": "f" * 64,
+    }
     run_selection(
         {"P_pilot": proxy},
         stage=EFFICACY_PILOT,
         candidate_rows=rows[:250],
         output_directory=selection_dir,
-        parent_hashes={
-            "source_snapshot_sha256": TEST_SOURCE_HASH,
-            "stage_manifest_sha256": stage_hash,
-        },
+        parent_hashes=pilot_parent_hashes,
         expected_vector_manifest_hashes={"P_pilot": proxy_hash},
         fake_cluster_manager=_FakeClusterManager,
     )
@@ -454,10 +461,7 @@ def _build_synthetic_pilot(root: Path) -> Path:
         selected_size=56,
         draws=10_000,
         output_directory=selection_dir,
-        parent_hashes={
-            "source_snapshot_sha256": TEST_SOURCE_HASH,
-            "stage_manifest_sha256": stage_hash,
-        },
+        parent_hashes=pilot_parent_hashes,
         stage=EFFICACY_PILOT,
     )
     inputs = {
@@ -465,6 +469,7 @@ def _build_synthetic_pilot(root: Path) -> Path:
         "artifact_type": "opd_proxy_analysis_inputs",
         "stage_manifest_sha256": stage_hash,
         "source_snapshot_sha256": TEST_SOURCE_HASH,
+        "algorithm_contract_sha256": "f" * 64,
         "selection_directory": "selection",
         "selection_manifest_sha256": sha256_file(
             selection_dir / "selection.manifest.json"
@@ -593,6 +598,14 @@ def test_pilot_report_is_forced_pilot_only_with_unavailable_cross_seed_diagnosti
         "cross_seed_oracle"
     ]["reason"]
     assert report["provenance"]["parent_stage1_manifest_sha256"] == "e" * 64
+    assert report["provenance"]["algorithm_contract_sha256"] == "f" * 64
+    inputs = json.loads((synthetic_pilot_dir / "analysis_inputs.json").read_text())
+    assert inputs["algorithm_contract_sha256"] == "f" * 64
+    for name in ("selection.manifest.json", "random.manifest.json"):
+        artifact = json.loads(
+            (synthetic_pilot_dir / "selection" / name).read_text()
+        )
+        assert artifact["parent_hashes"]["algorithm_contract_sha256"] == "f" * 64
 
     json_path = tmp_path / "pilot-report.json"
     markdown_path = tmp_path / "pilot-report.md"
@@ -628,7 +641,10 @@ def test_pilot_analyzer_rejects_any_non_pilot_classification(
         run_analysis(stage_dir=synthetic_pilot_dir, reference_repo=REFERENCE_REPO)
 
 
-@pytest.mark.parametrize("mutation", ["extra_representation", "extra_target_seed"])
+@pytest.mark.parametrize(
+    "mutation",
+    ["extra_representation", "extra_target_seed", "missing_algorithm_identity"],
+)
 def test_pilot_analyzer_rejects_non_pilot_analysis_inputs(
     synthetic_pilot_dir, monkeypatch, tmp_path, mutation
 ):
@@ -638,10 +654,14 @@ def test_pilot_analyzer_rejects_non_pilot_analysis_inputs(
     inputs = json.loads(inputs_path.read_text())
     if mutation == "extra_representation":
         inputs["representations"]["S"] = dict(inputs["representations"]["P_pilot"])
-    else:
+    elif mutation == "extra_target_seed":
         inputs["target_heldout"]["43"] = dict(inputs["target_heldout"]["42"])
+    else:
+        inputs.pop("algorithm_contract_sha256", None)
     atomic_write_json(inputs_path, inputs)
-    with pytest.raises(ValueError, match="incomplete|unexpected|stage seeds"):
+    with pytest.raises(
+        ValueError, match="incomplete|unexpected|stage seeds|algorithm contract"
+    ):
         run_analysis(stage_dir=bad, reference_repo=REFERENCE_REPO)
 
 
