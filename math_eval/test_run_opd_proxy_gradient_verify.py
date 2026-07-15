@@ -19,6 +19,7 @@ from math_eval.run_opd_proxy_gradient_verify import (
     execute_stage_commands,
     parse_cli_args,
     parse_slurm_end_time,
+    validate_cross_stage_source,
     validate_opd_cli_runtime,
     validate_stage_parent,
     validate_stage_prerequisite,
@@ -322,6 +323,19 @@ def test_non_smoke_plan_omits_direct_fixture_and_stage2_uses_stage1_sources(tmp_
     assert "direct_gradient_fixture" not in names
     select = next(command for command in commands if command.name == "select")
     assert any("stage_1" in argument for argument in select.argv)
+    vectors = [
+        select.argv[index + 1]
+        for index, value in enumerate(select.argv[:-1])
+        if value == "--vector"
+    ]
+    sft_sources = [value for value in vectors if value.startswith("S=")]
+    embedding_sources = [value for value in vectors if value.startswith("E=")]
+    assert len(sft_sources) == len(embedding_sources) == 1
+    assert all("stage_2" in value and "stage_1" not in value for value in sft_sources)
+    assert all(
+        "stage_2" in value and "stage_1" not in value
+        for value in embedding_sources
+    )
 
 
 def test_capture_hydra_contract_is_fully_explicit(tmp_path):
@@ -354,9 +368,56 @@ def test_capture_hydra_contract_is_fully_explicit(tmp_path):
     assert values["algorithm.difficulty_aware_opd.enabled"] == "false"
     assert values["algorithm.rethinking_opd_probe.enabled"] == "false"
     assert values["algorithm.opd_proxy_verify_capture.expected_questions"] == "32"
+    assert values["algorithm.opd_proxy_verify_capture.source_snapshot"] == str(
+        (stage_dir / "source_snapshot.json").resolve()
+    )
+    assert (
+        values["algorithm.opd_proxy_verify_capture.source_snapshot_sha256"]
+        == "0" * 64
+    )
     assert values["actor_rollout_ref.model.path"].endswith("models/Qwen3-4B")
     assert values["+actor_rollout_ref.ref.model.path"].endswith(
         "models/Qwen3-30B-A3B-Instruct-2507"
+    )
+
+
+def test_real_work_contracts_bind_logical_source_snapshot_hash(tmp_path):
+    stage_dir = tmp_path / "stage_0"
+    stage_dir.mkdir()
+    source_files = [{"path": "module.py", "sha256": "1" * 64}]
+    source_hash = hashlib.sha256(canonical_json_bytes(source_files)).hexdigest()
+    (stage_dir / "source_snapshot.json").write_bytes(
+        canonical_json_bytes(
+            {"files": source_files, "manifest_sha256": source_hash}
+        )
+    )
+    overrides = build_capture_hydra_overrides(
+        stage=0,
+        manifest=_manifest(0),
+        stage_directory=stage_dir,
+        pair="target",
+        seed=42,
+        output_root=stage_dir / "capture/target/seed_42",
+        repository_root=tmp_path,
+    )
+    values = dict(value.split("=", 1) for value in overrides)
+    assert values["algorithm.opd_proxy_verify_capture.source_snapshot_sha256"] == (
+        source_hash
+    )
+    commands = build_stage_commands(
+        stage=0,
+        manifest=_manifest(0),
+        repository_root=tmp_path,
+        stage_directory=stage_dir,
+        reference_repo=REFERENCE_REPO,
+    )
+    assert all(
+        dict(command.input_hashes)["source_snapshot_sha256"] == source_hash
+        for command in commands
+    )
+    select = next(command for command in commands if command.name == "select")
+    assert select.argv[select.argv.index("--source-snapshot") + 1] == str(
+        stage_dir / "source_snapshot.json"
     )
 
 
@@ -419,6 +480,42 @@ def test_stage_parent_contract_rejects_wrong_or_unexpected_parent(tmp_path):
 
 def test_stage1_cannot_start_without_completed_stage0_smoke(tmp_path):
     with pytest.raises(RuntimeError, match="completed Stage 0"):
+        validate_stage_prerequisite(1, tmp_path)
+
+
+def test_stage_prerequisite_binds_report_source_and_smoke_evidence(tmp_path):
+    stage0 = tmp_path / "stage_0"
+    (stage0 / "direct_gradient_fixture").mkdir(parents=True)
+    report = stage0 / "report.json"
+    resume = stage0 / "resume_exercise.json"
+    direct = stage0 / "direct_gradient_fixture/COMPLETE.json"
+    report.write_bytes(canonical_json_bytes({"stage": 0}))
+    resume.write_bytes(canonical_json_bytes({"status": "complete"}))
+    direct.write_bytes(canonical_json_bytes({"status": "complete"}))
+    files = [{"path": "module.py", "sha256": "1" * 64}]
+    source_hash = hashlib.sha256(canonical_json_bytes(files)).hexdigest()
+    source = stage0 / "source_snapshot.json"
+    source.write_bytes(
+        canonical_json_bytes({"files": files, "manifest_sha256": source_hash})
+    )
+    marker = {
+        "stage": 0,
+        "report_sha256": hashlib.sha256(report.read_bytes()).hexdigest(),
+        "source_snapshot_sha256": source_hash,
+        "source_snapshot_file_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "resume_exercise_sha256": hashlib.sha256(resume.read_bytes()).hexdigest(),
+        "direct_fixture_complete_sha256": hashlib.sha256(direct.read_bytes()).hexdigest(),
+    }
+    marker_path = stage0 / "STAGE_COMPLETE.json"
+    marker_path.write_bytes(canonical_json_bytes(marker))
+    validate_stage_prerequisite(1, tmp_path)
+    validate_cross_stage_source(1, tmp_path, source_hash)
+    with pytest.raises(RuntimeError, match="differ across stages"):
+        validate_cross_stage_source(1, tmp_path, "2" * 64)
+
+    marker["source_snapshot_sha256"] = "0" * 64
+    marker_path.write_bytes(canonical_json_bytes(marker))
+    with pytest.raises(RuntimeError, match="source snapshot"):
         validate_stage_prerequisite(1, tmp_path)
 
 
@@ -607,6 +704,60 @@ def test_duplicate_output_lock_is_rejected(tmp_path):
             )
     finally:
         os.close(descriptor)
+
+
+def test_executor_rechecks_every_live_source_file_before_launch(tmp_path):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    source_file = repository / "module.py"
+    source_file.write_text("value = 1\n", encoding="utf-8")
+    records = [
+        {
+            "repository": "main",
+            "path": "module.py",
+            "size": source_file.stat().st_size,
+            "sha256": hashlib.sha256(source_file.read_bytes()).hexdigest(),
+        }
+    ]
+    source_hash = hashlib.sha256(canonical_json_bytes(records)).hexdigest()
+    (tmp_path / "source_snapshot.json").write_bytes(
+        canonical_json_bytes(
+            {
+                "repositories": {"main": str(repository.resolve())},
+                "files": records,
+                "manifest_sha256": source_hash,
+            }
+        )
+    )
+    command = _command(tmp_path, "source_bound")
+    command = StageCommand(
+        **{
+            **command.as_dict(),
+            "input_hashes": (("source_snapshot_sha256", source_hash),),
+        }
+    )
+    execute_stage_commands(
+        (command,),
+        stage_directory=tmp_path,
+        env=_runtime_env(),
+        runtime=_FakeRuntime(),
+    )
+
+    source_file.write_text("value = 2\n", encoding="utf-8")
+    changed = _command(tmp_path, "source_changed")
+    changed = StageCommand(
+        **{
+            **changed.as_dict(),
+            "input_hashes": (("source_snapshot_sha256", source_hash),),
+        }
+    )
+    with pytest.raises(RuntimeError, match="source file changed"):
+        execute_stage_commands(
+            (changed,),
+            stage_directory=tmp_path,
+            env=_runtime_env(),
+            runtime=_FakeRuntime(),
+        )
 
 
 def test_source_snapshot_is_ordered_complete_and_byte_sensitive(tmp_path):

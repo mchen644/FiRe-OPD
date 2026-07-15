@@ -32,6 +32,10 @@ from math_eval.select_opd_proxy_gradient_verify import (
 
 
 REFERENCE_REPO = Path("/home/mchen/prismatic-synthesis-reference")
+TEST_SOURCE_FILES = [{"path": "module.py", "sha256": "a" * 64}]
+TEST_SOURCE_HASH = hashlib.sha256(
+    canonical_json_bytes(TEST_SOURCE_FILES)
+).hexdigest()
 
 
 class _FakeClusterManager:
@@ -117,8 +121,11 @@ def _write_vector_directory(
         expected_vector_ids=vector_ids,
         record_factory=factory,
         representation=representation,
-        parent_hashes={"sample_manifest_sha256": parent_hash},
-        source_snapshot={"manifest_sha256": "b" * 64},
+        parent_hashes={
+            "sample_manifest_sha256": parent_hash,
+            "source_snapshot_sha256": TEST_SOURCE_HASH,
+        },
+        source_snapshot={"manifest_sha256": TEST_SOURCE_HASH},
         repository={"head": "c" * 40, "status": "", "status_sha256": "d" * 64},
         runtime={"runtime_profile": "synthetic_test"},
         metadata={"selection_name": name},
@@ -187,6 +194,10 @@ def _build_synthetic_stage(root: Path) -> Path:
         "provenance": {"synthetic_test_fixture": True},
     }
     atomic_write_json(root / "manifest.json", stage_manifest)
+    atomic_write_json(
+        root / "source_snapshot.json",
+        {"files": TEST_SOURCE_FILES, "manifest_sha256": TEST_SOURCE_HASH},
+    )
     stage_hash = sha256_file(root / "manifest.json")
     sample_hash = sha256_file(sample_path)
 
@@ -263,7 +274,10 @@ def _build_synthetic_stage(root: Path) -> Path:
         stage=0,
         candidate_rows=rows[:24],
         output_directory=selection_dir,
-        parent_hashes={"stage_manifest_sha256": stage_hash},
+        parent_hashes={
+            "source_snapshot_sha256": TEST_SOURCE_HASH,
+            "stage_manifest_sha256": stage_hash,
+        },
         expected_vector_manifest_hashes=vector_hashes,
         fake_cluster_manager=_FakeClusterManager,
     )
@@ -272,13 +286,17 @@ def _build_synthetic_stage(root: Path) -> Path:
         selected_size=5,
         draws=100,
         output_directory=selection_dir,
-        parent_hashes={"stage_manifest_sha256": stage_hash},
+        parent_hashes={
+            "source_snapshot_sha256": TEST_SOURCE_HASH,
+            "stage_manifest_sha256": stage_hash,
+        },
         stage=0,
     )
     inputs = {
         "schema_version": 1,
         "artifact_type": "opd_proxy_analysis_inputs",
         "stage_manifest_sha256": stage_hash,
+        "source_snapshot_sha256": TEST_SOURCE_HASH,
         "selection_directory": "selection",
         "selection_manifest_sha256": sha256_file(
             selection_dir / "selection.manifest.json"
@@ -341,6 +359,58 @@ def test_analysis_input_manifest_builder_binds_direct_and_sharded_sources(
     assert (stage / "analysis_inputs.json").read_bytes() == canonical_json_bytes(
         original
     )
+
+
+def test_analysis_input_manifest_allows_only_exact_stage1_sibling_sources(
+    synthetic_stage0_dir, tmp_path
+):
+    experiment = tmp_path / "experiment"
+    stage2 = _copy_stage(synthetic_stage0_dir, experiment / "stage_2")
+    original = _load(stage2 / "analysis_inputs.json")
+    (stage2 / "analysis_inputs.json").unlink()
+    first_name = EXPECTED_REPRESENTATIONS[0]
+    source = stage2 / original["representations"][first_name]["vector_directory"]
+    stage1_source = experiment / "stage_1" / "prior_vector"
+    stage1_source.parent.mkdir(parents=True)
+    shutil.copytree(source, stage1_source)
+
+    def paths(record):
+        if "vector_directory" in record:
+            return [stage2 / record["vector_directory"]]
+        return [stage2 / value for value in record["vector_directories"]]
+
+    representation_sources = {
+        name: paths(original["representations"][name])
+        for name in EXPECTED_REPRESENTATIONS
+    }
+    representation_sources[first_name] = [stage1_source]
+    rebuilt = write_analysis_input_manifest(
+        stage_dir=stage2,
+        selection_directory=stage2 / original["selection_directory"],
+        representation_sources=representation_sources,
+        target_heldout_sources={
+            seed: paths(original["target_heldout"][str(seed)])
+            for seed in (42, 43)
+        },
+    )
+    assert rebuilt["representations"][first_name]["vector_directory"] == (
+        "../stage_1/prior_vector"
+    )
+
+    outside = tmp_path / "outside"
+    shutil.copytree(source, outside)
+    (stage2 / "analysis_inputs.json").unlink()
+    representation_sources[first_name] = [outside]
+    with pytest.raises(ValueError, match="Stage-1 sibling"):
+        write_analysis_input_manifest(
+            stage_dir=stage2,
+            selection_directory=stage2 / original["selection_directory"],
+            representation_sources=representation_sources,
+            target_heldout_sources={
+                seed: paths(original["target_heldout"][str(seed)])
+                for seed in (42, 43)
+            },
+        )
 
 
 def test_json_and_markdown_share_one_report_dict(synthetic_report, tmp_path):
@@ -474,6 +544,18 @@ def test_changed_parent_hash_is_rejected(synthetic_stage0_dir, tmp_path):
     inputs["stage_manifest_sha256"] = "0" * 64
     inputs_path.write_bytes(canonical_json_bytes(inputs))
     with pytest.raises(ValueError, match="stage manifest SHA"):
+        run_analysis(stage_dir=stage, reference_repo=REFERENCE_REPO)
+
+
+def test_analysis_rejects_source_snapshot_parent_mismatch(
+    synthetic_stage0_dir, tmp_path
+):
+    stage = _copy_stage(synthetic_stage0_dir, tmp_path / "wrong-source")
+    inputs_path = stage / "analysis_inputs.json"
+    inputs = _load(inputs_path)
+    inputs["source_snapshot_sha256"] = "0" * 64
+    inputs_path.write_bytes(canonical_json_bytes(inputs))
+    with pytest.raises(ValueError, match="source snapshot"):
         run_analysis(stage_dir=stage, reference_repo=REFERENCE_REPO)
 
 

@@ -1347,6 +1347,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--stage-directory", type=Path, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
     parser.add_argument("--reference-repo", type=Path, required=True)
+    parser.add_argument("--source-snapshot", type=Path, required=True)
     parser.add_argument(
         "--vector",
         action="append",
@@ -1375,10 +1376,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         name: hashlib.sha256(canonical_json_bytes(vector.manifest)).hexdigest()
         for name, vector in vectors.items()
     }
+    source_snapshot = _load_canonical_json(
+        args.source_snapshot.resolve(strict=True), "experiment source snapshot"
+    )
+    source_files = source_snapshot.get("files")
+    if not isinstance(source_files, list) or not source_files:
+        raise ValueError("experiment source snapshot has no source files")
+    source_hash = hashlib.sha256(canonical_json_bytes(source_files)).hexdigest()
+    if source_snapshot.get("manifest_sha256") != source_hash:
+        raise ValueError("experiment source snapshot logical hash mismatch")
     parent_hashes = {
+        "source_snapshot_sha256": source_hash,
         "stage_manifest_sha256": sha256_file(
             Path(args.stage_directory) / "manifest.json"
-        )
+        ),
     }
     generate_random_schedules(
         candidate_rows,

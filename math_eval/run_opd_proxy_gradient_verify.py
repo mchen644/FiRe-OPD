@@ -42,6 +42,7 @@ _STAGE_LAYOUTS = {
 MAIN_SOURCE_FILES = (
     "docs/superpowers/specs/2026-07-14-vanilla-opd-proxy-gradient-selection-verify-design.md",
     "docs/superpowers/plans/2026-07-14-vanilla-opd-proxy-gradient-selection-verify.md",
+    "pytest.ini",
     "math_eval/build_gradient_eligibility.py",
     "math_eval/deepmath_gradient_diversity.py",
     "math_eval/select_gradient_diverse_deepmath.py",
@@ -65,6 +66,7 @@ MAIN_SOURCE_FILES = (
     "math_eval/test_opd_proxy_gradient_statistics.py",
     "math_eval/opd_proxy_gradient_classification.py",
     "math_eval/test_opd_proxy_gradient_classification.py",
+    "math_eval/test_opd_proxy_gradient_source_audit.py",
     "math_eval/analyze_opd_proxy_gradient_verify.py",
     "math_eval/test_analyze_opd_proxy_gradient_verify.py",
     "math_eval/run_opd_proxy_gradient_verify.py",
@@ -496,6 +498,17 @@ def _path_value(path: Path) -> str:
     return str(Path(path).resolve())
 
 
+def _source_snapshot_manifest_sha256(path: Path) -> str:
+    value = load_canonical_json(path, "experiment source snapshot")
+    files = value.get("files")
+    if not isinstance(files, list) or not files:
+        raise ValueError("experiment source snapshot has no source files")
+    actual = hashlib.sha256(canonical_json_bytes(files)).hexdigest()
+    if value.get("manifest_sha256") != actual:
+        raise ValueError("experiment source snapshot logical hash mismatch")
+    return actual
+
+
 def build_capture_hydra_overrides(
     *,
     stage: int,
@@ -524,6 +537,12 @@ def build_capture_hydra_overrides(
         student = repository / "models/Qwen3-0.6B"
         teacher = repository / "models/Qwen3-4B"
     sample_path = stage_root / str(manifest["sample_manifest"])
+    source_path = stage_root / "source_snapshot.json"
+    source_hash = (
+        _source_snapshot_manifest_sha256(source_path)
+        if source_path.is_file()
+        else "0" * 64
+    )
     train_path = stage_root / str(parquet_name)
     values = (
         ("data.train_files", _path_value(train_path)),
@@ -590,6 +609,8 @@ def build_capture_hydra_overrides(
         ("algorithm.opd_proxy_verify_capture.output_root", _path_value(output_root)),
         ("algorithm.opd_proxy_verify_capture.sample_manifest", _path_value(sample_path)),
         ("algorithm.opd_proxy_verify_capture.sample_manifest_sha256", str(manifest["sample_manifest_sha256"])),
+        ("algorithm.opd_proxy_verify_capture.source_snapshot", _path_value(source_path)),
+        ("algorithm.opd_proxy_verify_capture.source_snapshot_sha256", source_hash),
         ("algorithm.opd_proxy_verify_capture.stage", str(stage)),
         ("algorithm.opd_proxy_verify_capture.pair", pair),
         ("algorithm.opd_proxy_verify_capture.engine_seed", str(seed)),
@@ -641,7 +662,9 @@ def _source_dirs_for_stage(
             for path in _replay_dirs(root, "target", seed)
         )
     baseline = "sft" if representation == "S" else "embedding"
-    return tuple(root / "baselines" / baseline for root in roots)
+    # Stage-2 baseline collectors publish an append-only Stage-1+Stage-2 union;
+    # adding the Stage-1 directory again would duplicate every prior vector ID.
+    return (stage_directory / "baselines" / baseline,)
 
 
 def _first_candidate_id(stage_directory: Path, manifest: Mapping[str, object]) -> str:
@@ -898,6 +921,8 @@ def build_stage_commands(
         str(selection_root),
         "--reference-repo",
         str(reference),
+        "--source-snapshot",
+        str(source_snapshot),
     ]
     representations = tuple(
         [f"P_n1:seed={seed}:slot={slot}" for seed in SEEDS for slot in range(4)]
@@ -974,13 +999,68 @@ def build_stage_commands(
     stage_manifest_sha256 = hashlib.sha256(
         canonical_json_bytes(dict(manifest))
     ).hexdigest()
+    source_snapshot_sha256 = (
+        _source_snapshot_manifest_sha256(source_snapshot)
+        if source_snapshot.is_file()
+        else "0" * 64
+    )
     return tuple(
         replace(
             command,
-            input_hashes=(("stage_manifest_sha256", stage_manifest_sha256),),
+            input_hashes=(
+                ("source_snapshot_sha256", source_snapshot_sha256),
+                ("stage_manifest_sha256", stage_manifest_sha256),
+            ),
         )
         for command in commands
     )
+
+
+def _validate_live_source_snapshot(
+    stage_directory: Path, command: StageCommand
+) -> None:
+    expected = dict(command.input_hashes).get("source_snapshot_sha256")
+    if expected is None or expected == "0" * 64:
+        return
+    snapshot_path = Path(stage_directory) / "source_snapshot.json"
+    snapshot = load_canonical_json(snapshot_path, "experiment source snapshot")
+    if _source_snapshot_manifest_sha256(snapshot_path) != expected:
+        raise RuntimeError("work-unit source snapshot contract changed")
+    repositories = snapshot.get("repositories")
+    records = snapshot.get("files")
+    if not isinstance(repositories, Mapping) or not isinstance(records, list):
+        raise RuntimeError("experiment source snapshot is malformed")
+    roots = {
+        name: Path(path).resolve()
+        for name, path in repositories.items()
+        if isinstance(name, str) and isinstance(path, str)
+    }
+    if set(roots) != set(repositories):
+        raise RuntimeError("experiment source repository map is malformed")
+    for record in records:
+        if not isinstance(record, Mapping):
+            raise RuntimeError("experiment source file record is malformed")
+        repository = record.get("repository")
+        logical_path = record.get("path")
+        if repository not in roots or not isinstance(logical_path, str):
+            raise RuntimeError("experiment source file record has invalid identity")
+        logical = PurePosixPath(logical_path)
+        if logical.is_absolute() or ".." in logical.parts:
+            raise RuntimeError("experiment source file path is unsafe")
+        path = (roots[repository] / Path(*logical.parts)).resolve()
+        try:
+            path.relative_to(roots[repository])
+        except ValueError as error:
+            raise RuntimeError("experiment source file escaped its repository") from error
+        if (
+            not path.is_file()
+            or path.stat().st_size != record.get("size")
+            or sha256_file(path) != record.get("sha256")
+        ):
+            raise RuntimeError(
+                "experiment source file changed during the run: "
+                f"{repository}:{logical_path}"
+            )
 
 
 def _resolve_tokens(command: StageCommand, allocated: tuple[str, ...]) -> tuple[str, ...]:
@@ -1075,16 +1155,38 @@ def _validate_capture_output(root: Path) -> None:
         _validate_capture_subtree(directory, marker)
 
 
+def _require_output_source_parent(
+    command: StageCommand, manifest: Mapping[str, object]
+) -> None:
+    expected = dict(command.input_hashes).get("source_snapshot_sha256")
+    if expected is None or expected == "0" * 64:
+        return
+    parents = manifest.get("parent_hashes")
+    if not isinstance(parents, Mapping) or parents.get(
+        "source_snapshot_sha256"
+    ) != expected:
+        raise RuntimeError(
+            f"completed work unit {command.name} differs from its source snapshot"
+        )
+
+
 def _validate_completed_output(command: StageCommand) -> None:
     if not command.validate_output:
         return
     if command.output_kind == "capture":
         _validate_capture_output(command.output_root)
+        _require_output_source_parent(
+            command,
+            load_canonical_json(
+                command.output_root / "manifest.json", "capture manifest"
+            ),
+        )
         return
     if command.output_kind in {"replay", "baseline"}:
         from math_eval.opd_proxy_gradient_verify_artifacts import load_vector_set
 
-        load_vector_set(command.output_root)
+        vector_set = load_vector_set(command.output_root)
+        _require_output_source_parent(command, vector_set.manifest)
         return
     if command.output_kind == "direct_fixture":
         manifest = load_canonical_json(
@@ -1100,6 +1202,7 @@ def _validate_completed_output(command: StageCommand) -> None:
             or manifest.get("tensor_sha256") != sha256_file(tensor)
         ):
             raise RuntimeError("direct fixture completion mismatch")
+        _require_output_source_parent(command, manifest)
         return
     if command.output_kind == "selection":
         from math_eval.select_opd_proxy_gradient_verify import (
@@ -1107,12 +1210,25 @@ def _validate_completed_output(command: StageCommand) -> None:
             load_selection_bundle,
         )
 
-        load_selection_bundle(command.output_root)
-        load_random_schedules(command.output_root)
+        selection = load_selection_bundle(command.output_root)
+        random = load_random_schedules(command.output_root)
+        _require_output_source_parent(command, selection.manifest)
+        _require_output_source_parent(command, random.manifest)
         return
     if command.output_kind == "analysis":
         stage = int(command.output_root.name.rsplit("_", 1)[-1])
-        _validate_report_pair(stage, command.output_root)
+        report = _validate_report_pair(stage, command.output_root)
+        expected = dict(command.input_hashes).get("source_snapshot_sha256")
+        if report.get("provenance", {}).get("source_snapshot_sha256") != expected:
+            raise RuntimeError("analysis report source snapshot mismatch")
+        return
+    if command.output_kind == "analysis_inputs":
+        inputs = load_canonical_json(
+            command.completion_paths[0], "analysis input manifest"
+        )
+        expected = dict(command.input_hashes).get("source_snapshot_sha256")
+        if inputs.get("source_snapshot_sha256") != expected:
+            raise RuntimeError("analysis inputs source snapshot mismatch")
         return
     for path in command.completion_paths:
         if path.suffix == ".json":
@@ -1384,6 +1500,7 @@ def execute_stage_commands(
                     completed_names.append(command.name)
                     index += 1
                     continue
+                _validate_live_source_snapshot(stage_root, command)
                 tokens = _resolve_tokens(command, allocated)
                 if tokens:
                     for token in tokens:
@@ -1409,6 +1526,7 @@ def execute_stage_commands(
                         f"work unit {command.name} failed with exit code {returncode}"
                     )
                 duration = active_runtime.monotonic() - start
+                _validate_live_source_snapshot(stage_root, command)
                 _publish_unit_completion(stage_root, command, duration=duration)
                 completed_names.append(command.name)
                 index += 1
@@ -1439,6 +1557,7 @@ def execute_stage_commands(
                 None,
             )
             if exercise_resume and not resume_exercised and selected_resume is not None:
+                _validate_live_source_snapshot(stage_root, selected_resume)
                 _exercise_replay_interruption(
                     stage_root=stage_root,
                     command=selected_resume,
@@ -1451,6 +1570,7 @@ def execute_stage_commands(
             processes: list[tuple[StageCommand, object, float]] = []
             try:
                 for item in pending:
+                    _validate_live_source_snapshot(stage_root, item)
                     tokens = _resolve_tokens(item, allocated)
                     for token in tokens:
                         unexpected = set(active_runtime.gpu_processes(token)) - owned_pids
@@ -1475,6 +1595,7 @@ def execute_stage_commands(
                         raise RuntimeError(
                             f"work unit {item.name} failed with exit code {returncode}"
                         )
+                    _validate_live_source_snapshot(stage_root, item)
                     _publish_unit_completion(
                         stage_root,
                         item,
@@ -1486,6 +1607,8 @@ def execute_stage_commands(
                     [process for _, process, _ in processes], active_runtime
                 )
                 raise
+        for command in commands:
+            _validate_live_source_snapshot(stage_root, command)
         if exercise_resume:
             evidence_path = stage_root / "resume_exercise.interrupted.json"
             if not resume_exercised or not evidence_path.is_file():
@@ -1720,6 +1843,19 @@ def _internal_validate_vectors(stage: int, stage_directory: Path) -> None:
     stage_root = Path(stage_directory).resolve()
     manifest = _read_stage_manifest(stage_root, stage, require_files=True)
     candidate_ids, heldout_ids = _load_stage_ids(stage_root, manifest)
+    expected_source_hash = _source_snapshot_manifest_sha256(
+        stage_root / "source_snapshot.json"
+    )
+
+    def validate_source(vector_set, description: str) -> None:
+        parents = vector_set.manifest.get("parent_hashes")
+        if not isinstance(parents, Mapping) or parents.get(
+            "source_snapshot_sha256"
+        ) != expected_source_hash:
+            raise ValueError(
+                f"{description} vector source differs from experiment source snapshot"
+            )
+
     view_hashes: dict[str, str] = {}
     for name in _representation_names():
         expected_representation = (
@@ -1729,6 +1865,8 @@ def _internal_validate_vectors(stage: int, stage_directory: Path) -> None:
             load_vector_set(path, expected_representation=expected_representation)
             for path in _source_dirs_for_stage(stage, stage_root, name)
         ]
+        for source in sources:
+            validate_source(source, name)
         view = build_selection_vector_view(sources, name, candidate_ids)
         view_hashes[name] = hashlib.sha256(
             artifact_json_bytes(view.manifest)
@@ -1739,6 +1877,8 @@ def _internal_validate_vectors(stage: int, stage_directory: Path) -> None:
             load_vector_set(path, expected_representation="T")
             for path in _source_dirs_for_stage(stage, stage_root, name)
         ]
+        for source in sources:
+            validate_source(source, f"{name} held-out")
         build_selection_vector_view(sources, name, heldout_ids)
     marker = {
         "schema_version": 1,
@@ -1777,6 +1917,7 @@ def _capture_work_unit(args) -> int:
     expected_output = _capture_root(stage_root, args.pair, args.engine_seed).resolve()
     if Path(args.output_root).resolve() != expected_output:
         raise ValueError("capture output root differs from canonical pair/seed path")
+    _source_snapshot_manifest_sha256(stage_root / "source_snapshot.json")
     overrides = build_capture_hydra_overrides(
         stage=args.stage,
         manifest=manifest,
@@ -1828,6 +1969,13 @@ def validate_stage_prerequisite(stage: int, output_root: Path) -> None:
         raise RuntimeError("previous stage completion marker has wrong stage")
     if marker.get("report_sha256") != sha256_file(previous_root / "report.json"):
         raise RuntimeError("previous stage report differs from completion marker")
+    previous_source = previous_root / "source_snapshot.json"
+    if marker.get(
+        "source_snapshot_sha256"
+    ) != _source_snapshot_manifest_sha256(previous_source) or marker.get(
+        "source_snapshot_file_sha256"
+    ) != sha256_file(previous_source):
+        raise RuntimeError("previous stage source snapshot differs from completion marker")
     if stage == 1:
         resume_path = previous_root / "resume_exercise.json"
         direct_path = previous_root / "direct_gradient_fixture/COMPLETE.json"
@@ -1837,6 +1985,20 @@ def validate_stage_prerequisite(stage: int, output_root: Path) -> None:
             != sha256_file(direct_path)
         ):
             raise RuntimeError("Stage 0 smoke/resume evidence is incomplete")
+
+
+def validate_cross_stage_source(
+    stage: int, output_root: Path, current_source_sha256: str
+) -> None:
+    if stage == 0:
+        return
+    _require_sha(current_source_sha256, "current source snapshot SHA")
+    previous = load_canonical_json(
+        Path(output_root) / f"stage_{stage - 1}" / "STAGE_COMPLETE.json",
+        "previous stage completion",
+    )
+    if previous.get("source_snapshot_sha256") != current_source_sha256:
+        raise RuntimeError("scientific source bytes differ across stages")
 
 
 def validate_stage2_trigger(parent_report: Path) -> None:
@@ -1960,6 +2122,10 @@ def _validate_scientific_outputs(
         stage_root / "manifest.json"
     ):
         raise RuntimeError("analysis report is not bound to the stage manifest")
+    if report.get("provenance", {}).get(
+        "source_snapshot_sha256"
+    ) != _source_snapshot_manifest_sha256(stage_root / "source_snapshot.json"):
+        raise RuntimeError("analysis report is not bound to the source snapshot")
     if stage == 0:
         _validate_stage0_direct_fixture(stage_root, manifest)
     return report
@@ -1972,7 +2138,12 @@ def _write_stage_complete(stage: int, stage_root: Path, commands: Sequence[Stage
         "artifact_type": "opd_proxy_stage_complete",
         "stage": stage,
         "report_sha256": sha256_file(report_path),
-        "source_snapshot_sha256": sha256_file(stage_root / "source_snapshot.json"),
+        "source_snapshot_sha256": _source_snapshot_manifest_sha256(
+            stage_root / "source_snapshot.json"
+        ),
+        "source_snapshot_file_sha256": sha256_file(
+            stage_root / "source_snapshot.json"
+        ),
         "work_units": [command.name for command in commands],
     }
     if stage == 0:
@@ -2015,6 +2186,18 @@ def _run_stage(args) -> int:
     validate_reference_repository(args.reference_repo)
     source = build_experiment_source_snapshot(repository, args.reference_repo)
     write_or_validate_json(stage_root / "source_snapshot.json", source)
+    validate_cross_stage_source(
+        args.stage, output_root, str(source["manifest_sha256"])
+    )
+    # Freeze the source snapshot hash into every real work-unit contract. Dry-run
+    # plans use the all-zero sentinel because no stage bytes may be written.
+    commands = build_stage_commands(
+        stage=args.stage,
+        manifest=manifest,
+        repository_root=repository,
+        stage_directory=stage_root,
+        reference_repo=args.reference_repo,
+    )
     _validate_model_contract(repository, manifest)
     execute_stage_commands(
         commands,
@@ -2029,9 +2212,14 @@ def _run_stage(args) -> int:
 
 def _validate_stage_command(args) -> int:
     repository = Path.cwd().resolve()
-    stage_root = (repository / DEFAULT_OUTPUT_ROOT / f"stage_{args.stage}").resolve()
+    output_root = (repository / DEFAULT_OUTPUT_ROOT).resolve()
+    stage_root = (output_root / f"stage_{args.stage}").resolve()
+    validate_stage_prerequisite(args.stage, output_root)
     manifest = _read_stage_manifest(stage_root, args.stage, require_files=True)
-    validate_stage_parent(args.stage, manifest, None if args.stage < 2 else Path(manifest["parent_report"]["path"]))  # type: ignore[index]
+    parent = None if args.stage < 2 else Path(manifest["parent_report"]["path"])  # type: ignore[index]
+    validate_stage_parent(args.stage, manifest, parent)
+    if parent is not None:
+        validate_stage2_trigger(parent)
     validate_main_repository(repository, manifest)
     validate_reference_repository(args.reference_repo)
     current_source = build_experiment_source_snapshot(repository, args.reference_repo)
@@ -2040,6 +2228,9 @@ def _validate_stage_command(args) -> int:
         source_path, "stage source snapshot"
     ) != current_source:
         raise RuntimeError("stage source snapshot differs from current source bytes")
+    validate_cross_stage_source(
+        args.stage, output_root, str(current_source["manifest_sha256"])
+    )
     if args.require_complete and not source_path.is_file():
         raise RuntimeError("complete-stage validation requires the source snapshot")
     _validate_model_contract(repository, manifest)
@@ -2067,7 +2258,11 @@ def _validate_stage_command(args) -> int:
         _validate_scientific_outputs(args.stage, stage_root, manifest)
         if marker.get("report_sha256") != sha256_file(stage_root / "report.json"):
             raise RuntimeError("stage completion report hash mismatch")
-        if marker.get("source_snapshot_sha256") != sha256_file(source_path):
+        if marker.get(
+            "source_snapshot_sha256"
+        ) != _source_snapshot_manifest_sha256(source_path) or marker.get(
+            "source_snapshot_file_sha256"
+        ) != sha256_file(source_path):
             raise RuntimeError("stage completion source snapshot hash mismatch")
     return 0
 
@@ -2256,6 +2451,7 @@ __all__ = [
     "execute_stage_commands",
     "parse_cli_args",
     "parse_slurm_end_time",
+    "validate_cross_stage_source",
     "validate_main_repository",
     "validate_opd_cli_runtime",
     "validate_stage_parent",

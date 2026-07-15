@@ -14,13 +14,18 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
-from math_eval.opd_proxy_gradient_verify_artifacts import TrajectoryKey, sha256_file
+from math_eval.opd_proxy_gradient_verify_artifacts import (
+    TrajectoryKey,
+    canonical_json_bytes,
+    sha256_file,
+)
 from omegaconf import OmegaConf
 from tensordict import TensorDict
 
@@ -53,6 +58,14 @@ def _capture_config(tmp_path, *, enabled=True):
         '{"stable_id":"q0","split":"candidate"}\n'
         '{"stable_id":"q1","split":"held_out"}\n',
         encoding="utf-8",
+    )
+    source_snapshot = tmp_path / "source_snapshot.json"
+    source_files = [{"path": "module.py", "sha256": "9" * 64}]
+    source_hash = hashlib.sha256(canonical_json_bytes(source_files)).hexdigest()
+    source_snapshot.write_bytes(
+        canonical_json_bytes(
+            {"files": source_files, "manifest_sha256": source_hash}
+        )
     )
     return OmegaConf.create(
         {
@@ -109,6 +122,8 @@ def _capture_config(tmp_path, *, enabled=True):
                     "output_root": str(tmp_path / "capture"),
                     "sample_manifest": str(sample_manifest),
                     "sample_manifest_sha256": sha256_file(sample_manifest),
+                    "source_snapshot": str(source_snapshot),
+                    "source_snapshot_sha256": source_hash,
                     "stage": 0,
                     "pair": "target",
                     "engine_seed": 42,
@@ -276,7 +291,10 @@ def test_capture_parent_hashes_resolve_stage_model_tokenizer_and_source(tmp_path
 
     assert parents["student_model_sha256"] == "1" * 64
     assert parents["teacher_model_sha256"] == "2" * 64
-    assert parents["source_snapshot_sha256"] == "3" * 64
+    assert parents["source_snapshot_sha256"] == (
+        trainer.config.algorithm.opd_proxy_verify_capture.source_snapshot_sha256
+    )
+    assert parents["preparation_source_snapshot_sha256"] == "3" * 64
     assert parents["tokenizer_vocab_sha256"] == "4" * 64
     assert trainer._opd_proxy_capture_provenance_hashes["model_hashes"] == {
         "student": "1" * 64,

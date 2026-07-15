@@ -136,6 +136,19 @@ def _load_canonical_json(path: Path, description: str) -> dict[str, object]:
     return value
 
 
+def _load_source_snapshot_hash(stage_root: Path) -> str:
+    snapshot = _load_canonical_json(
+        stage_root / "source_snapshot.json", "experiment source snapshot"
+    )
+    files = snapshot.get("files")
+    if not isinstance(files, list) or not files:
+        raise ValueError("experiment source snapshot has no source files")
+    actual = hashlib.sha256(canonical_json_bytes(files)).hexdigest()
+    if snapshot.get("manifest_sha256") != actual:
+        raise ValueError("experiment source snapshot logical hash mismatch")
+    return actual
+
+
 def _load_canonical_jsonl(path: Path, description: str) -> tuple[dict, ...]:
     rows: list[dict] = []
     try:
@@ -162,14 +175,29 @@ def _relative_path(root: Path, value: object, description: str) -> Path:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{description} must be a nonempty relative path")
     logical = PurePosixPath(value)
-    if logical.is_absolute() or ".." in logical.parts or "." in logical.parts:
+    if logical.is_absolute() or "." in logical.parts:
         raise ValueError(f"{description} must be a normalized relative path")
     resolved_root = root.resolve()
     resolved = (root / Path(*logical.parts)).resolve()
+    if ".." not in logical.parts:
+        try:
+            resolved.relative_to(resolved_root)
+        except ValueError as error:
+            raise ValueError(f"{description} escapes the stage directory") from error
+        return resolved
+    if (
+        logical.parts.count("..") != 1
+        or logical.parts[0] != ".."
+        or resolved_root.name != "stage_2"
+    ):
+        raise ValueError(f"{description} has a forbidden parent path")
+    allowed_stage1 = resolved_root.parent / "stage_1"
     try:
-        resolved.relative_to(resolved_root)
+        resolved.relative_to(allowed_stage1)
     except ValueError as error:
-        raise ValueError(f"{description} escapes the stage directory") from error
+        raise ValueError(
+            f"{description} may reference only the exact Stage-1 sibling"
+        ) from error
     return resolved
 
 
@@ -289,6 +317,7 @@ def _load_vector_record(
     expected_vector_ids: Sequence[str],
     expected_representation: str,
     selection_name: str,
+    expected_source_hash: str,
     description: str,
 ) -> tuple[VectorSet, str]:
     if not isinstance(record, dict):
@@ -326,11 +355,17 @@ def _load_vector_record(
         manifest_path = directory / "manifest.json"
         if sha256_file(manifest_path) != expected_manifest_sha:
             raise ValueError(f"{description} vector manifest SHA mismatch")
-        sources.append(
-            load_vector_set(
-                directory, expected_representation=expected_representation
-            )
+        source = load_vector_set(
+            directory, expected_representation=expected_representation
         )
+        parents = source.manifest.get("parent_hashes")
+        if not isinstance(parents, dict) or parents.get(
+            "source_snapshot_sha256"
+        ) != expected_source_hash:
+            raise ValueError(
+                f"{description} vector source snapshot provenance mismatch"
+            )
+        sources.append(source)
         if sha256_file(manifest_path) != expected_manifest_sha:
             raise ValueError(f"{description} vector manifest changed while loading")
     loaded = build_selection_vector_view(sources, selection_name, expected_ids)
@@ -361,6 +396,7 @@ def write_analysis_input_manifest(
         raise ValueError("analysis target held-out sources must cover seeds 42/43")
     stage_manifest_path = stage_root / "manifest.json"
     _load_canonical_json(stage_manifest_path, "stage manifest")
+    source_snapshot_hash = _load_source_snapshot_hash(stage_root)
 
     def record(paths: Sequence[Path], description: str) -> dict[str, object]:
         declared = tuple(Path(path).resolve() for path in paths)
@@ -371,11 +407,31 @@ def write_analysis_input_manifest(
         for directory in declared:
             try:
                 logical = directory.relative_to(stage_root)
-            except ValueError as error:
-                raise ValueError(f"{description} source escapes stage directory") from error
+                logical_path = PurePosixPath(*logical.parts)
+            except ValueError:
+                allowed_stage1 = stage_root.parent / "stage_1"
+                if stage_root.name != "stage_2":
+                    raise ValueError(
+                        f"{description} source escapes stage directory"
+                    )
+                try:
+                    stage1_logical = directory.relative_to(allowed_stage1)
+                except ValueError as error:
+                    raise ValueError(
+                        f"{description} source is not in the Stage-1 sibling"
+                    ) from error
+                logical_path = PurePosixPath("..", "stage_1", *stage1_logical.parts)
             if not directory.is_dir():
                 raise ValueError(f"{description} source directory does not exist")
-            logical_paths.append(PurePosixPath(*logical.parts).as_posix())
+            logical_paths.append(logical_path.as_posix())
+            vector = load_vector_set(directory)
+            parents = vector.manifest.get("parent_hashes")
+            if not isinstance(parents, dict) or parents.get(
+                "source_snapshot_sha256"
+            ) != source_snapshot_hash:
+                raise ValueError(
+                    f"{description} vector source snapshot provenance mismatch"
+                )
             hashes.append(sha256_file(directory / "manifest.json"))
         if len(declared) == 1:
             return {
@@ -396,6 +452,7 @@ def write_analysis_input_manifest(
         "schema_version": 1,
         "artifact_type": "opd_proxy_analysis_inputs",
         "stage_manifest_sha256": sha256_file(stage_manifest_path),
+        "source_snapshot_sha256": source_snapshot_hash,
         "selection_directory": PurePosixPath(*selection_logical.parts).as_posix(),
         "selection_manifest_sha256": sha256_file(
             selection_root / "selection.manifest.json"
@@ -430,6 +487,7 @@ def _load_inputs(stage_dir: Path, reference_repo: Path) -> _LoadedInputs:
         heldout_ids,
         layout,
     ) = _validate_stage(stage_root)
+    source_snapshot_hash = _load_source_snapshot_hash(stage_root)
     inputs_path = stage_root / ANALYSIS_INPUTS_FILE
     inputs = _load_canonical_json(inputs_path, "analysis input manifest")
     if inputs.get("schema_version") != 1 or inputs.get("artifact_type") != (
@@ -438,6 +496,8 @@ def _load_inputs(stage_dir: Path, reference_repo: Path) -> _LoadedInputs:
         raise ValueError("invalid OPD proxy analysis input manifest contract")
     if inputs.get("stage_manifest_sha256") != stage_manifest_sha:
         raise ValueError("analysis input stage manifest SHA mismatch")
+    if inputs.get("source_snapshot_sha256") != source_snapshot_hash:
+        raise ValueError("analysis input source snapshot SHA mismatch")
 
     representation_records = inputs.get("representations")
     if not isinstance(representation_records, dict) or set(
@@ -457,6 +517,7 @@ def _load_inputs(stage_dir: Path, reference_repo: Path) -> _LoadedInputs:
             expected_vector_ids=expected_vector_ids,
             expected_representation=_source_representation(name),
             selection_name=name,
+            expected_source_hash=source_snapshot_hash,
             description=name,
         )
         vectors[name] = vector
@@ -478,6 +539,7 @@ def _load_inputs(stage_dir: Path, reference_repo: Path) -> _LoadedInputs:
             expected_vector_ids=expected_vector_ids,
             expected_representation="T",
             selection_name=name,
+            expected_source_hash=source_snapshot_hash,
             description=f"target held-out seed {seed}",
         )
 
@@ -494,7 +556,10 @@ def _load_inputs(stage_dir: Path, reference_repo: Path) -> _LoadedInputs:
         inputs.get("random_manifest_sha256"), "random manifest SHA"
     ):
         raise ValueError("analysis input random manifest SHA mismatch")
-    parent_hashes = {"stage_manifest_sha256": stage_manifest_sha}
+    parent_hashes = {
+        "source_snapshot_sha256": source_snapshot_hash,
+        "stage_manifest_sha256": stage_manifest_sha,
+    }
     selection = load_selection_bundle(
         selection_directory,
         expected_candidate_ids=candidate_ids,
@@ -1191,6 +1256,9 @@ def run_analysis(
                 "sample_manifest_sha256"
             ],
             "analysis_inputs_sha256": inputs.input_manifest_sha256,
+            "source_snapshot_sha256": inputs.input_manifest[
+                "source_snapshot_sha256"
+            ],
             "selection_manifest_sha256": inputs.input_manifest[
                 "selection_manifest_sha256"
             ],

@@ -198,6 +198,43 @@ def validate_capture_contract(config: Mapping[str, object]) -> dict[str, object]
             "sample manifest hash mismatch: "
             f"expected {declared_sample_hash}, got {actual_sample_hash}"
         )
+    source_snapshot = config.get("source_snapshot")
+    if not isinstance(source_snapshot, str) or not source_snapshot:
+        raise ValueError("capture source_snapshot must be a nonempty path")
+    try:
+        source_path = Path(source_snapshot).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ValueError(
+            f"capture source snapshot does not exist: {source_snapshot}"
+        ) from error
+    if not source_path.is_file():
+        raise ValueError("capture source snapshot is not a regular file")
+    declared_source_hash = _require_sha256(
+        config.get("source_snapshot_sha256"), "source_snapshot_sha256"
+    )
+    try:
+        source_value = _strict_json_text(
+            source_path.read_text(encoding="utf-8"),
+            "experiment source snapshot",
+        )
+    except (OSError, UnicodeError) as error:
+        raise ValueError(f"cannot read experiment source snapshot: {error}") from error
+    if not isinstance(source_value, dict):
+        raise ValueError("experiment source snapshot must be a JSON object")
+    source_files = source_value.get("files")
+    if not isinstance(source_files, list) or not source_files:
+        raise ValueError("experiment source snapshot must contain source files")
+    actual_source_hash = hashlib.sha256(
+        canonical_json_bytes(source_files)
+    ).hexdigest()
+    if (
+        source_value.get("manifest_sha256") != actual_source_hash
+        or actual_source_hash != declared_source_hash
+    ):
+        raise ValueError(
+            "source snapshot hash mismatch: "
+            f"expected {declared_source_hash}, got {actual_source_hash}"
+        )
 
     stage = _require_nonnegative_int(config.get("stage"), "stage")
     if stage not in {0, 1, 2}:
@@ -225,6 +262,8 @@ def validate_capture_contract(config: Mapping[str, object]) -> dict[str, object]
         "output_root": str(Path(output_root).expanduser().resolve()),
         "sample_manifest": str(sample_path),
         "sample_manifest_sha256": actual_sample_hash,
+        "source_snapshot": str(source_path),
+        "source_snapshot_sha256": actual_source_hash,
         "stage": stage,
         "pair": pair,
         "engine_seed": engine_seed,

@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -365,11 +366,21 @@ def test_compound_keys_attach_seed_and_reject_duplicate_missing_or_wrong_slots()
 def test_capture_contract_hashes_the_declared_sample_manifest(tmp_path: Path):
     sample_manifest = tmp_path / "samples.jsonl"
     sample_manifest.write_text('{"stable_id":"q0"}\n', encoding="utf-8")
+    source_snapshot = tmp_path / "source_snapshot.json"
+    source_files = [{"path": "module.py", "sha256": "1" * 64}]
+    source_hash = hashlib.sha256(canonical_json_bytes(source_files)).hexdigest()
+    source_snapshot.write_bytes(
+        canonical_json_bytes(
+            {"files": source_files, "manifest_sha256": source_hash}
+        )
+    )
     config = OpdProxyVerifyCaptureConfig(
         enabled=True,
         output_root=str(tmp_path / "capture"),
         sample_manifest=str(sample_manifest),
         sample_manifest_sha256=sha256_file(sample_manifest),
+        source_snapshot=str(source_snapshot),
+        source_snapshot_sha256=source_hash,
         stage=0,
         pair="proxy",
         engine_seed=42,
@@ -380,6 +391,7 @@ def test_capture_contract_hashes_the_declared_sample_manifest(tmp_path: Path):
     )
     normalized = validate_capture_contract(config)
     assert normalized["sample_manifest_sha256"] == sha256_file(sample_manifest)
+    assert normalized["source_snapshot_sha256"] == source_hash
     assert normalized["native_rollouts"] == 4
 
     wrong = OpdProxyVerifyCaptureConfig(
@@ -387,10 +399,24 @@ def test_capture_contract_hashes_the_declared_sample_manifest(tmp_path: Path):
         output_root=str(tmp_path / "capture"),
         sample_manifest=str(sample_manifest),
         sample_manifest_sha256="0" * 64,
+        source_snapshot=str(source_snapshot),
+        source_snapshot_sha256=source_hash,
         expected_questions=1,
     )
     with pytest.raises(ValueError, match="sample manifest hash"):
         validate_capture_contract(wrong)
+
+    wrong_source = OpdProxyVerifyCaptureConfig(
+        enabled=True,
+        output_root=str(tmp_path / "capture"),
+        sample_manifest=str(sample_manifest),
+        sample_manifest_sha256=sha256_file(sample_manifest),
+        source_snapshot=str(source_snapshot),
+        source_snapshot_sha256="0" * 64,
+        expected_questions=1,
+    )
+    with pytest.raises(ValueError, match="source snapshot hash"):
+        validate_capture_contract(wrong_source)
 
 
 def test_recursive_parameter_hash_changes_with_any_parameter_byte():

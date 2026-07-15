@@ -122,6 +122,12 @@ algorithm:
     # Expected SHA-256 of the stage sample manifest
     sample_manifest_sha256: null
 
+    # Full cross-runtime experiment source snapshot
+    source_snapshot: null
+
+    # Expected SHA-256 of the full experiment source snapshot
+    source_snapshot_sha256: null
+
     # Stage number
     stage: 0
 

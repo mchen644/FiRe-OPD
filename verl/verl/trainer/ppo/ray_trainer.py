@@ -66,6 +66,7 @@ from verl.trainer.ppo.opd_proxy_verify_capture import (
     finalize_capture_seed,
     load_and_join_capture_chunks,
     trajectory_keys_sha256,
+    validate_capture_contract,
     write_tensor_chunks_atomic,
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
@@ -639,7 +640,8 @@ def _truncate_response_tensor_to_batch(response_tensor: torch.Tensor, batch: Dat
         return response_tensor
     if response_tensor.shape[-1] < response_length:
         raise ValueError(
-            f"Cannot align response tensor length {response_tensor.shape[-1]} to batch response length {response_length}"
+            "Cannot align response tensor length "
+            f"{response_tensor.shape[-1]} to batch response length {response_length}"
         )
 
     response_mask = batch.batch["response_mask"].to(device=response_tensor.device)
@@ -1467,17 +1469,23 @@ class RayPPOTrainer:
         return batch
 
     def _opd_proxy_capture_parent_hashes(self, contract) -> dict[str, str]:
+        contract = validate_capture_contract(contract)
         resolved_config = OmegaConf.to_container(self.config, resolve=True)
         config_hash = hashlib.sha256(canonical_json_bytes(resolved_config)).hexdigest()
+        source_snapshot_sha256 = str(contract["source_snapshot_sha256"])
         parents = {
             "sample_manifest_sha256": contract["sample_manifest_sha256"],
+            "source_snapshot_sha256": source_snapshot_sha256,
             "resolved_config_sha256": config_hash,
         }
         stage_manifest = Path(contract["sample_manifest"]).with_name("manifest.json")
         provenance = {
             "model_hashes": {"student": contract["sample_manifest_sha256"]},
             "tokenizer_hashes": {"student": contract["sample_manifest_sha256"]},
-            "source_hashes": {"sample_manifest": contract["sample_manifest_sha256"]},
+            "source_hashes": {
+                "experiment_source_snapshot": source_snapshot_sha256,
+                "sample_manifest": contract["sample_manifest_sha256"],
+            },
         }
         if stage_manifest.is_file():
             parents["stage_manifest_sha256"] = sha256_file(stage_manifest)
@@ -1494,8 +1502,12 @@ class RayPPOTrainer:
             teacher_manifest = model_manifests.get(pair_names[1], {})
             student_hash = student_manifest.get("manifest_sha256")
             teacher_hash = teacher_manifest.get("manifest_sha256")
-            source_snapshot = stage_provenance.get("source_snapshot", {})
-            source_hash = source_snapshot.get("manifest_sha256")
+            preparation_source_snapshot = stage_provenance.get(
+                "source_snapshot", {}
+            )
+            preparation_source_hash = preparation_source_snapshot.get(
+                "manifest_sha256"
+            )
             compatibility = stage_provenance.get("tokenizer_compatibility", {}).get(
                 contract["pair"], {}
             )
@@ -1503,7 +1515,7 @@ class RayPPOTrainer:
             for name, value in {
                 "student_model_sha256": student_hash,
                 "teacher_model_sha256": teacher_hash,
-                "source_snapshot_sha256": source_hash,
+                "preparation_source_snapshot_sha256": preparation_source_hash,
                 "tokenizer_vocab_sha256": tokenizer_hash,
             }.items():
                 if not isinstance(value, str) or len(value) != 64:
@@ -1515,7 +1527,10 @@ class RayPPOTrainer:
                     "student": tokenizer_hash,
                     "teacher": tokenizer_hash,
                 },
-                "source_hashes": {"source_snapshot": source_hash},
+                "source_hashes": {
+                    "experiment_source_snapshot": source_snapshot_sha256,
+                    "preparation_source_snapshot": preparation_source_hash,
+                },
             }
         self._opd_proxy_capture_provenance_hashes = provenance
         return parents
