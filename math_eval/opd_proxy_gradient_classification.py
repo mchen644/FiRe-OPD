@@ -25,6 +25,7 @@ _STRICT_THRESHOLDS = {
     "gradient_norm": 0.10,
     "opd_signal": 0.10,
 }
+_PILOT_METRICS = ("g_vendi", "coverage", "gradient_norm", "opd_signal")
 
 
 def _finite_number(value: object, description: str) -> float:
@@ -41,6 +42,56 @@ def _percentile(value: object, description: str) -> float:
     if result < 0 or result > 1:
         raise ValueError(f"{description} must be in [0, 1]")
     return result
+
+
+def classify_efficacy_pilot(
+    percentiles_by_kmeans_seed: Mapping[int, Mapping[str, object]],
+) -> dict[str, object]:
+    """Apply the exact one-time primary/uniform efficacy-pilot gate."""
+    if not isinstance(percentiles_by_kmeans_seed, Mapping) or set(
+        percentiles_by_kmeans_seed
+    ) != {42, 43}:
+        raise ValueError("efficacy pilot requires exact K-means seeds 42 and 43")
+    normalized: dict[int, dict[str, float]] = {}
+    for seed in (42, 43):
+        row = percentiles_by_kmeans_seed[seed]
+        if not isinstance(row, Mapping) or set(row) != set(_PILOT_METRICS):
+            raise ValueError("efficacy pilot record has incorrect metric keys")
+        normalized[seed] = {
+            metric: _percentile(row[metric], f"pilot seed {seed} {metric}")
+            for metric in _PILOT_METRICS
+        }
+    go = all(
+        row["g_vendi"] >= 0.90
+        and row["coverage"] >= 0.90
+        and row["gradient_norm"] >= 0.25
+        and row["opd_signal"] >= 0.25
+        for row in normalized.values()
+    )
+    no_go = any(
+        row["g_vendi"] <= 0.60 or row["coverage"] <= 0.60
+        for row in normalized.values()
+    )
+    decision = "go" if go else "no_go" if no_go else "borderline"
+    return {
+        "status": "pilot_only",
+        "decision": decision,
+        "main_hypothesis": "not_evaluated",
+        "stage1_thresholds_modified": False,
+        "thresholds": {
+            "go": {
+                "g_vendi": 0.90,
+                "coverage": 0.90,
+                "gradient_norm": 0.25,
+                "opd_signal": 0.25,
+            },
+            "no_go": {
+                "g_vendi_at_or_below": 0.60,
+                "coverage_at_or_below": 0.60,
+            },
+        },
+        "primary_uniform_percentiles_by_kmeans_seed": normalized,
+    }
 
 
 def exact_median_of_eight(values: Sequence[float]) -> float:
@@ -485,6 +536,7 @@ def classify_stage2_sensitivity(
 
 
 __all__ = [
+    "classify_efficacy_pilot",
     "classify_stage1",
     "classify_stage2_sensitivity",
     "decide_stage2",

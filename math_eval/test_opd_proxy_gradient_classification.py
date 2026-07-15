@@ -3,6 +3,7 @@ import copy
 import pytest
 
 from math_eval.opd_proxy_gradient_classification import (
+    classify_efficacy_pilot,
     classify_stage1,
     classify_stage2_sensitivity,
     decide_stage2,
@@ -86,6 +87,85 @@ def _stage1_report(*, oracle_pass=True, pn1_g_vendi_median=0.95):
         sft_components=_passing_strict(1),
         embedding_components=_passing_strict(1),
     )
+
+
+def _pilot_records(*, overrides=None):
+    base = {
+        42: {
+            "g_vendi": 0.90,
+            "coverage": 0.90,
+            "gradient_norm": 0.25,
+            "opd_signal": 0.25,
+        },
+        43: {
+            "g_vendi": 0.90,
+            "coverage": 0.90,
+            "gradient_norm": 0.25,
+            "opd_signal": 0.25,
+        },
+    }
+    for seed, values in (overrides or {}).items():
+        base[seed].update(values)
+    return base
+
+
+def test_efficacy_pilot_go_gate_passes_both_exact_boundaries():
+    result = classify_efficacy_pilot(_pilot_records())
+    assert result["status"] == "pilot_only"
+    assert result["decision"] == "go"
+    assert result["main_hypothesis"] == "not_evaluated"
+    assert result["stage1_thresholds_modified"] is False
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {43: {"g_vendi": 0.60}},
+        {42: {"coverage": 0.60}},
+        {42: {"g_vendi": 0.0}, 43: {"coverage": 1.0}},
+    ),
+)
+def test_efficacy_pilot_no_go_uses_any_seed_diversity_or_coverage(overrides):
+    assert classify_efficacy_pilot(
+        _pilot_records(overrides=overrides)
+    )["decision"] == "no_go"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {42: {"gradient_norm": 0.249999}},
+        {43: {"opd_signal": 0.249999}},
+        {43: {"g_vendi": 0.899999}},
+        {42: {"coverage": 0.600001}},
+    ),
+)
+def test_efficacy_pilot_remaining_cases_are_borderline(overrides):
+    assert classify_efficacy_pilot(
+        _pilot_records(overrides=overrides)
+    )["decision"] == "borderline"
+
+
+def test_efficacy_pilot_gate_requires_exact_seeds_metrics_and_percentiles():
+    missing_seed = _pilot_records()
+    del missing_seed[43]
+    with pytest.raises(ValueError, match="seeds 42 and 43"):
+        classify_efficacy_pilot(missing_seed)
+    extra_seed = {**_pilot_records(), 44: _pilot_records()[42]}
+    with pytest.raises(ValueError, match="seeds 42 and 43"):
+        classify_efficacy_pilot(extra_seed)
+
+    for bad_record, message in (
+        ({"diagnostic": 1.0}, "metric keys"),
+        ({"stratified": 1.0}, "metric keys"),
+        ({"g_vendi": float("nan")}, "finite"),
+        ({"coverage": 1.1}, r"\[0, 1\]"),
+        ({"gradient_norm": True}, "finite"),
+    ):
+        records = _pilot_records()
+        records[42].update(bad_record)
+        with pytest.raises(ValueError, match=message):
+            classify_efficacy_pilot(records)
 
 
 def test_exact_median_of_eight_uses_fourth_and_fifth_sorted_values():
