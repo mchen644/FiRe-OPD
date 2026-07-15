@@ -16,6 +16,7 @@ from math_eval.select_opd_proxy_gradient_verify import (
     EXPECTED_REPRESENTATIONS,
     KMEANS_SEEDS,
     ROUND_ROBIN_SEED,
+    _parse_vector_specs,
     build_length_quartiles,
     build_selection_vector_view,
     generate_random_schedules,
@@ -26,6 +27,19 @@ from math_eval.select_opd_proxy_gradient_verify import (
     selection_vector_id,
 )
 from math_eval.select_gradient_diverse_deepmath import cluster_official
+
+
+def test_vector_spec_parser_preserves_equals_in_representation_names(tmp_path):
+    values = [
+        f"{name}={tmp_path / f'vector-{index}'}"
+        for index, name in enumerate(EXPECTED_REPRESENTATIONS)
+    ]
+    specs = _parse_vector_specs(values)
+    assert tuple(specs) == EXPECTED_REPRESENTATIONS
+    assert specs["P_n1:seed=42:slot=0"] == [tmp_path / "vector-0"]
+    assert specs["T:seed=43"] == [
+        tmp_path / f"vector-{len(EXPECTED_REPRESENTATIONS) - 1}"
+    ]
 
 
 def _rows(count: int) -> list[dict[str, object]]:

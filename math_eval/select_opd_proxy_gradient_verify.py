@@ -1333,7 +1333,7 @@ def _read_stage_inputs(stage_directory: Path) -> tuple[dict[str, object], list[d
 def _parse_vector_specs(values: Sequence[str]) -> dict[str, list[Path]]:
     specs: dict[str, list[Path]] = {}
     for value in values:
-        name, separator, path = value.partition("=")
+        name, separator, path = value.rpartition("=")
         if separator != "=" or name not in EXPECTED_REPRESENTATIONS or not path:
             raise ValueError("--vector must be REPRESENTATION=VECTOR_DIRECTORY")
         specs.setdefault(name, []).append(Path(path))
