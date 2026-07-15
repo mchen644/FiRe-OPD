@@ -52,12 +52,12 @@ def classify_efficacy_pilot(
         percentiles_by_kmeans_seed
     ) != {42, 43}:
         raise ValueError("efficacy pilot requires exact K-means seeds 42 and 43")
-    normalized: dict[int, dict[str, float]] = {}
+    normalized: dict[str, dict[str, float]] = {}
     for seed in (42, 43):
         row = percentiles_by_kmeans_seed[seed]
         if not isinstance(row, Mapping) or set(row) != set(_PILOT_METRICS):
             raise ValueError("efficacy pilot record has incorrect metric keys")
-        normalized[seed] = {
+        normalized[str(seed)] = {
             metric: _percentile(row[metric], f"pilot seed {seed} {metric}")
             for metric in _PILOT_METRICS
         }

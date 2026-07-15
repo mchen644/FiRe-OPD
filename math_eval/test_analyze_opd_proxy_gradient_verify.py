@@ -14,6 +14,9 @@ from math_eval.analyze_opd_proxy_gradient_verify import (
     write_analysis_input_manifest,
     write_reports,
 )
+from math_eval.opd_proxy_gradient_classification import classify_efficacy_pilot
+from math_eval.opd_proxy_gradient_stage_profiles import EFFICACY_PILOT
+from math_eval.opd_proxy_gradient_statistics import SubsetScores
 from math_eval.opd_proxy_gradient_verify_artifacts import (
     atomic_write_json,
     atomic_write_jsonl,
@@ -26,6 +29,7 @@ from math_eval.prepare_opd_proxy_gradient_verify import stage_layout
 from math_eval.replay_opd_proxy_gradients import ReplayVector, run_replay_shard
 from math_eval.select_opd_proxy_gradient_verify import (
     EXPECTED_REPRESENTATIONS,
+    KMEANS_SEEDS,
     generate_random_schedules,
     run_selection,
 )
@@ -47,6 +51,10 @@ class _FakeClusterManager:
 
 
 def _selection_vector_id(name: str, stable_id: str) -> str:
+    if name == "P_pilot":
+        return f"P_pilot:{stable_id}:seed=42"
+    if name == "T_pilot":
+        return f"T_pilot:{stable_id}:seed=42"
     if name.startswith("P_n1:"):
         seed = name.split(":")[1].split("=")[1]
         slot = name.split(":")[2].split("=")[1]
@@ -61,6 +69,8 @@ def _selection_vector_id(name: str, stable_id: str) -> str:
 
 
 def _source_representation(name: str) -> str:
+    if name in {"P_pilot", "T_pilot"}:
+        return name
     if name.startswith("P_"):
         return "P"
     if name.startswith("T:"):
@@ -88,7 +98,9 @@ def _write_vector_directory(
     representation = _source_representation(name)
     vector_ids = tuple(_selection_vector_id(name, stable_id) for stable_id in stable_ids)
     seed = int(name.rsplit("=", 1)[1]) if name.startswith("T:") else 0
-    if name.startswith("P_"):
+    if name in {"P_pilot", "T_pilot"}:
+        seed = 42
+    elif name.startswith("P_"):
         seed = int(name.split(":")[1].split("=")[1])
 
     def factory(index: int) -> ReplayVector:
@@ -311,6 +323,169 @@ def _build_synthetic_stage(root: Path) -> Path:
     return root
 
 
+def _pilot_sample_rows() -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for index in range(250):
+        rows.append(
+            {
+                "stable_id": f"pc{index:03d}",
+                "split": "candidate",
+                "manifest_index": index,
+                "parent_manifest_index": index,
+                "parent_row_sha256": hashlib.sha256(
+                    f"candidate-{index}".encode()
+                ).hexdigest(),
+                "leaf_topic": f"topic-{index % 5}",
+                "prompt_token_count_4b": 20 + index,
+                "prompt_token_count_0_6b": 18 + index,
+                "r1_completion_token_count_0_6b": 30 + index,
+                "sft_full_token_count_0_6b": 50 + index,
+                "sft_supervised_label_count": 29 + index,
+            }
+        )
+    for index in range(84):
+        rows.append(
+            {
+                "stable_id": f"ph{index:03d}",
+                "split": "held_out",
+                "manifest_index": 250 + index,
+                "parent_manifest_index": 768 + index,
+                "parent_row_sha256": hashlib.sha256(
+                    f"heldout-{index}".encode()
+                ).hexdigest(),
+                "leaf_topic": f"held-{index % 3}",
+                "prompt_token_count_4b": 25 + index,
+                "prompt_token_count_0_6b": 22 + index,
+                "r1_completion_token_count_0_6b": 35 + index,
+                "sft_full_token_count_0_6b": 55 + index,
+                "sft_supervised_label_count": 34 + index,
+            }
+        )
+    return rows
+
+
+def _build_synthetic_pilot(root: Path) -> Path:
+    root.mkdir(parents=True)
+    rows = _pilot_sample_rows()
+    sample_path = root / "sample_manifest.jsonl"
+    atomic_write_jsonl(sample_path, rows)
+    candidate_ids = [str(row["stable_id"]) for row in rows[:250]]
+    heldout_ids = [str(row["stable_id"]) for row in rows[250:]]
+    layout = stage_layout(EFFICACY_PILOT)
+    parent_sha = "e" * 64
+    stage_manifest = {
+        "schema_version": 1,
+        "artifact_type": "opd_proxy_stage",
+        "stage": EFFICACY_PILOT,
+        "candidate_count": 250,
+        "held_out_count": 84,
+        "selected_size": layout.selected_size,
+        "primary_k": layout.primary_k,
+        "diagnostic_k": layout.diagnostic_k,
+        "null_draws": layout.null_draws,
+        "candidate_ids_sha256": sha256_id_lines(candidate_ids),
+        "held_out_ids_sha256": sha256_id_lines(heldout_ids),
+        "all_ids_sha256": sha256_id_lines(candidate_ids + heldout_ids),
+        "sample_manifest": sample_path.name,
+        "sample_manifest_sha256": sha256_file(sample_path),
+        "parent_report": None,
+        "parent_stage_manifest": {
+            "path": "/synthetic/stage_1/manifest.json",
+            "sha256": parent_sha,
+        },
+        "algorithm_contract_sha256": "f" * 64,
+        "provenance": {"synthetic_test_fixture": True},
+    }
+    atomic_write_json(root / "manifest.json", stage_manifest)
+    atomic_write_json(
+        root / "source_snapshot.json",
+        {"files": TEST_SOURCE_FILES, "manifest_sha256": TEST_SOURCE_HASH},
+    )
+    stage_hash = sha256_file(root / "manifest.json")
+    sample_hash = sha256_file(sample_path)
+
+    vector_root = root / "analysis_vectors"
+    representations: dict[str, dict[str, str]] = {}
+    loaded: dict[str, object] = {}
+    for salt, name in enumerate(("P_pilot", "T_pilot"), start=1):
+        directory = vector_root / name
+        _write_vector_directory(
+            directory,
+            name=name,
+            stable_ids=candidate_ids,
+            vectors=_vectors(name, 250, salt=200 + salt),
+            parent_hash=sample_hash,
+            split="candidate",
+            verifier=False,
+        )
+        representations[name] = {
+            "vector_directory": directory.relative_to(root).as_posix(),
+            "vector_manifest_sha256": sha256_file(directory / "manifest.json"),
+        }
+        loaded[name] = load_vector_set(directory)
+
+    heldout_directory = vector_root / "T_pilot_heldout"
+    _write_vector_directory(
+        heldout_directory,
+        name="T_pilot",
+        stable_ids=heldout_ids,
+        vectors=_vectors("T_pilot", 84, salt=242),
+        parent_hash=sample_hash,
+        split="held_out",
+        verifier=False,
+    )
+    selection_dir = root / "selection"
+    proxy = loaded["P_pilot"]
+    proxy_hash = hashlib.sha256(canonical_json_bytes(proxy.manifest)).hexdigest()
+    run_selection(
+        {"P_pilot": proxy},
+        stage=EFFICACY_PILOT,
+        candidate_rows=rows[:250],
+        output_directory=selection_dir,
+        parent_hashes={
+            "source_snapshot_sha256": TEST_SOURCE_HASH,
+            "stage_manifest_sha256": stage_hash,
+        },
+        expected_vector_manifest_hashes={"P_pilot": proxy_hash},
+        fake_cluster_manager=_FakeClusterManager,
+    )
+    generate_random_schedules(
+        rows[:250],
+        selected_size=56,
+        draws=10_000,
+        output_directory=selection_dir,
+        parent_hashes={
+            "source_snapshot_sha256": TEST_SOURCE_HASH,
+            "stage_manifest_sha256": stage_hash,
+        },
+        stage=EFFICACY_PILOT,
+    )
+    inputs = {
+        "schema_version": 1,
+        "artifact_type": "opd_proxy_analysis_inputs",
+        "stage_manifest_sha256": stage_hash,
+        "source_snapshot_sha256": TEST_SOURCE_HASH,
+        "selection_directory": "selection",
+        "selection_manifest_sha256": sha256_file(
+            selection_dir / "selection.manifest.json"
+        ),
+        "random_manifest_sha256": sha256_file(
+            selection_dir / "random.manifest.json"
+        ),
+        "representations": representations,
+        "target_heldout": {
+            "42": {
+                "vector_directory": heldout_directory.relative_to(root).as_posix(),
+                "vector_manifest_sha256": sha256_file(
+                    heldout_directory / "manifest.json"
+                ),
+            }
+        },
+    }
+    atomic_write_json(root / "analysis_inputs.json", inputs)
+    return root
+
+
 @pytest.fixture(scope="module")
 def synthetic_stage0_dir(tmp_path_factory):
     return _build_synthetic_stage(tmp_path_factory.mktemp("opd-analyzer") / "stage_0")
@@ -319,6 +494,155 @@ def synthetic_stage0_dir(tmp_path_factory):
 @pytest.fixture(scope="module")
 def synthetic_report(synthetic_stage0_dir):
     return run_analysis(stage_dir=synthetic_stage0_dir, reference_repo=REFERENCE_REPO)
+
+
+@pytest.fixture(scope="module")
+def synthetic_pilot_dir(tmp_path_factory):
+    return _build_synthetic_pilot(
+        tmp_path_factory.mktemp("opd-pilot-analyzer") / EFFICACY_PILOT
+    )
+
+
+def _patch_pilot_statistics(monkeypatch):
+    table_calls = 0
+    subset_calls = 0
+
+    def fake_table(space, subsets):
+        nonlocal table_calls
+        del space
+        table_calls += 1
+        # Uniform is the first table; make the stratified diagnostic maximally bad.
+        values = (
+            np.linspace(0.0, 1.0, len(subsets), dtype=np.float64)
+            if table_calls == 1
+            else np.ones(len(subsets), dtype=np.float64)
+        )
+        return {
+            "g_vendi": values,
+            "coverage": values,
+            "full_gradient_norm": values,
+            "opd_signal_rms": values,
+            "valid_token_count": values,
+            "sampled_reverse_kl": values,
+            "response_length": values,
+        }
+
+    def fake_subset(space, positions):
+        nonlocal subset_calls
+        del space, positions
+        subset_calls += 1
+        # Primary K runs are first. Diagnostic-K runs deliberately fail the gate.
+        quality = 0.95 if subset_calls <= len(KMEANS_SEEDS) else 0.10
+        signal = 0.50 if subset_calls <= len(KMEANS_SEEDS) else 0.10
+        return SubsetScores(
+            g_vendi=quality,
+            coverage=quality,
+            full_gradient_norm=signal,
+            opd_signal_rms=signal,
+            valid_token_count=signal,
+            sampled_reverse_kl=signal,
+            response_length=signal,
+        )
+
+    def forbidden(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("single-seed pilot must not compute cross-seed diagnostics")
+
+    monkeypatch.setattr(analyzer_module, "evaluate_subset_table", fake_table)
+    monkeypatch.setattr(analyzer_module, "evaluate_subset", fake_subset)
+    monkeypatch.setattr(analyzer_module, "target_dependence_permutation_test", forbidden)
+    monkeypatch.setattr(analyzer_module, "_secondary_diagnostics", forbidden)
+
+
+def test_pilot_report_is_forced_pilot_only_with_unavailable_cross_seed_diagnostics(
+    synthetic_pilot_dir, monkeypatch, tmp_path
+):
+    _patch_pilot_statistics(monkeypatch)
+    seen = {}
+
+    def gate(records):
+        seen.update(records)
+        return classify_efficacy_pilot(records)
+
+    monkeypatch.setattr(analyzer_module, "classify_efficacy_pilot", gate)
+    report = run_analysis(
+        stage_dir=synthetic_pilot_dir, reference_repo=REFERENCE_REPO
+    )
+
+    assert report["stage"] == EFFICACY_PILOT
+    assert report["counts"] == {
+        "candidate": 250,
+        "held_out": 84,
+        "selected": 56,
+        "primary_k": 25,
+        "diagnostic_k": 3,
+        "random_draws": 10_000,
+        "representations": 2,
+    }
+    assert report["classification"]["status"] == "pilot_only"
+    assert report["classification"]["decision"] == "go"
+    assert report["classification"]["main_hypothesis"] == "not_evaluated"
+    assert set(seen) == {42, 43}
+    assert all(set(row) == {
+        "g_vendi", "coverage", "gradient_norm", "opd_signal"
+    } for row in seen.values())
+    unavailable = report["unavailable_diagnostics"]
+    assert unavailable["cross_seed_oracle"]["status"] == "unavailable"
+    assert unavailable["target_seed_dependence"]["status"] == "unavailable"
+    assert "one generation seed and one rollout" in unavailable[
+        "cross_seed_oracle"
+    ]["reason"]
+    assert report["provenance"]["parent_stage1_manifest_sha256"] == "e" * 64
+
+    json_path = tmp_path / "pilot-report.json"
+    markdown_path = tmp_path / "pilot-report.md"
+    write_reports(report, json_path, markdown_path)
+    assert json.loads(json_path.read_text()) == report
+    markdown = markdown_path.read_text()
+    assert "One-Time Efficacy Pilot" in markdown
+    assert "does not establish downstream or OOD improvement" in markdown
+    assert "main Stage-1 hypothesis was not evaluated" in markdown
+
+
+def test_pilot_analyzer_rejects_any_non_pilot_classification(
+    synthetic_pilot_dir, monkeypatch
+):
+    _patch_pilot_statistics(monkeypatch)
+    monkeypatch.setattr(
+        analyzer_module,
+        "classify_efficacy_pilot",
+        lambda records: {"status": "pass", "decision": "go"},
+    )
+    with pytest.raises(ValueError, match="pilot_only"):
+        run_analysis(stage_dir=synthetic_pilot_dir, reference_repo=REFERENCE_REPO)
+
+    monkeypatch.setattr(
+        analyzer_module,
+        "classify_efficacy_pilot",
+        lambda records: {
+            **classify_efficacy_pilot(records),
+            "main_hypothesis_result": "pass",
+        },
+    )
+    with pytest.raises(ValueError, match="pilot_only"):
+        run_analysis(stage_dir=synthetic_pilot_dir, reference_repo=REFERENCE_REPO)
+
+
+@pytest.mark.parametrize("mutation", ["extra_representation", "extra_target_seed"])
+def test_pilot_analyzer_rejects_non_pilot_analysis_inputs(
+    synthetic_pilot_dir, monkeypatch, tmp_path, mutation
+):
+    _patch_pilot_statistics(monkeypatch)
+    bad = _copy_stage(synthetic_pilot_dir, tmp_path / mutation)
+    inputs_path = bad / "analysis_inputs.json"
+    inputs = json.loads(inputs_path.read_text())
+    if mutation == "extra_representation":
+        inputs["representations"]["S"] = dict(inputs["representations"]["P_pilot"])
+    else:
+        inputs["target_heldout"]["43"] = dict(inputs["target_heldout"]["42"])
+    atomic_write_json(inputs_path, inputs)
+    with pytest.raises(ValueError, match="incomplete|unexpected|stage seeds"):
+        run_analysis(stage_dir=bad, reference_repo=REFERENCE_REPO)
 
 
 def _copy_stage(source: Path, destination: Path) -> Path:

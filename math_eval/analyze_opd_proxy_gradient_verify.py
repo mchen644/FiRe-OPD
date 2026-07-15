@@ -16,11 +16,17 @@ from pathlib import Path, PurePosixPath
 import numpy as np
 
 from math_eval.opd_proxy_gradient_classification import (
+    classify_efficacy_pilot,
     classify_stage1,
     classify_stage2_sensitivity,
     evaluate_oracle_gate,
     evaluate_pn1_components,
     evaluate_strict_arm_components,
+)
+from math_eval.opd_proxy_gradient_stage_profiles import (
+    EFFICACY_PILOT,
+    parse_stage_kind,
+    stage_profile,
 )
 from math_eval.opd_proxy_gradient_statistics import (
     TargetSpace,
@@ -51,6 +57,7 @@ from math_eval.select_opd_proxy_gradient_verify import (
     DIAGNOSTIC_RATIO,
     EXPECTED_REPRESENTATIONS,
     KMEANS_SEEDS,
+    expected_representations,
     PRIMARY_RATIO,
     RandomSchedules,
     SelectionBundle,
@@ -84,6 +91,23 @@ _PN1 = EXPECTED_REPRESENTATIONS[:8]
 _PN4 = EXPECTED_REPRESENTATIONS[8:10]
 _NON_TARGET = EXPECTED_REPRESENTATIONS[:12]
 _TARGETS = EXPECTED_REPRESENTATIONS[12:]
+
+
+def _analysis_representations(stage: str | int) -> tuple[str, ...]:
+    profile = stage_profile(stage)
+    return tuple(
+        dict.fromkeys(
+            profile.selection_representations + profile.target_representations
+        )
+    )
+
+
+def _target_representation(stage: str | int, seed: int) -> str:
+    if parse_stage_kind(stage) == EFFICACY_PILOT:
+        if seed != 42:
+            raise ValueError("efficacy_pilot has no target seed other than 42")
+        return "T_pilot"
+    return f"T:seed={seed}"
 
 
 @dataclass(frozen=True)
@@ -227,9 +251,7 @@ def _validate_stage(
         "opd_proxy_stage"
     ):
         raise ValueError("invalid OPD proxy stage manifest contract")
-    stage = manifest.get("stage")
-    if isinstance(stage, bool) or not isinstance(stage, int):
-        raise ValueError("stage manifest stage must be an integer")
+    stage = parse_stage_kind(manifest.get("stage"))
     layout = stage_layout(stage)
     expected_fields = {
         "candidate_count": len(layout.candidate_clean_positions),
@@ -287,10 +309,19 @@ def _validate_stage(
     for field, values in hash_fields.items():
         if manifest.get(field) != sha256_id_lines(values):
             raise ValueError(f"stage {field} mismatch")
-    if stage in (0, 1) and manifest.get("parent_report") is not None:
-        raise ValueError("Stage 0/1 cannot declare a parent report")
+    if stage in (0, 1, EFFICACY_PILOT) and manifest.get("parent_report") is not None:
+        raise ValueError("Stage 0/1 and efficacy_pilot cannot declare a parent report")
     if stage == 2 and not isinstance(manifest.get("parent_report"), dict):
         raise ValueError("Stage 2 requires its frozen Stage-1 parent report")
+    if stage == EFFICACY_PILOT:
+        parent_stage = manifest.get("parent_stage_manifest")
+        if not isinstance(parent_stage, dict):
+            raise ValueError("efficacy_pilot requires its frozen Stage-1 parent")
+        _require_sha(parent_stage.get("sha256"), "pilot parent Stage-1 manifest SHA")
+        _require_sha(
+            manifest.get("algorithm_contract_sha256"),
+            "pilot algorithm contract SHA",
+        )
     return (
         manifest,
         sha256_file(manifest_path),
@@ -302,6 +333,8 @@ def _validate_stage(
 
 
 def _source_representation(name: str) -> str:
+    if name in {"P_pilot", "T_pilot"}:
+        return name
     if name.startswith("P_"):
         return "P"
     if name.startswith("T:"):
@@ -390,12 +423,15 @@ def write_analysis_input_manifest(
 ) -> dict[str, object]:
     """Bind declared source shards into the analyzer's immutable input manifest."""
     stage_root = Path(stage_dir).resolve()
-    if set(representation_sources) != set(EXPECTED_REPRESENTATIONS):
-        raise ValueError("analysis input representations are incomplete or unexpected")
-    if set(target_heldout_sources) != {42, 43}:
-        raise ValueError("analysis target held-out sources must cover seeds 42/43")
     stage_manifest_path = stage_root / "manifest.json"
-    _load_canonical_json(stage_manifest_path, "stage manifest")
+    stage_manifest = _load_canonical_json(stage_manifest_path, "stage manifest")
+    stage = parse_stage_kind(stage_manifest.get("stage"))
+    representations = _analysis_representations(stage)
+    target_seeds = stage_profile(stage).generation_seeds
+    if set(representation_sources) != set(representations):
+        raise ValueError("analysis input representations are incomplete or unexpected")
+    if set(target_heldout_sources) != set(target_seeds):
+        raise ValueError("analysis target held-out sources differ from stage seeds")
     source_snapshot_hash = _load_source_snapshot_hash(stage_root)
 
     def record(paths: Sequence[Path], description: str) -> dict[str, object]:
@@ -462,13 +498,13 @@ def write_analysis_input_manifest(
         ),
         "representations": {
             name: record(representation_sources[name], name)
-            for name in EXPECTED_REPRESENTATIONS
+            for name in representations
         },
         "target_heldout": {
             str(seed): record(
                 target_heldout_sources[seed], f"target held-out seed {seed}"
             )
-            for seed in (42, 43)
+            for seed in target_seeds
         },
     }
     write_or_validate_manifest(stage_root / ANALYSIS_INPUTS_FILE, manifest)
@@ -488,6 +524,9 @@ def _load_inputs(stage_dir: Path, reference_repo: Path) -> _LoadedInputs:
         layout,
     ) = _validate_stage(stage_root)
     source_snapshot_hash = _load_source_snapshot_hash(stage_root)
+    representations = _analysis_representations(layout.stage)
+    selection_representations = expected_representations(layout.stage)
+    target_seeds = stage_profile(layout.stage).generation_seeds
     inputs_path = stage_root / ANALYSIS_INPUTS_FILE
     inputs = _load_canonical_json(inputs_path, "analysis input manifest")
     if inputs.get("schema_version") != 1 or inputs.get("artifact_type") != (
@@ -502,11 +541,11 @@ def _load_inputs(stage_dir: Path, reference_repo: Path) -> _LoadedInputs:
     representation_records = inputs.get("representations")
     if not isinstance(representation_records, dict) or set(
         representation_records
-    ) != set(EXPECTED_REPRESENTATIONS):
+    ) != set(representations):
         raise ValueError("analysis input representations are incomplete or unexpected")
     vectors: dict[str, VectorSet] = {}
     vector_hashes: dict[str, str] = {}
-    for name in EXPECTED_REPRESENTATIONS:
+    for name in representations:
         expected_vector_ids = tuple(
             selection_vector_id(name, stable_id) for stable_id in candidate_ids
         )
@@ -524,11 +563,12 @@ def _load_inputs(stage_dir: Path, reference_repo: Path) -> _LoadedInputs:
         vector_hashes[name] = manifest_sha
 
     heldout_records = inputs.get("target_heldout")
-    if not isinstance(heldout_records, dict) or set(heldout_records) != {"42", "43"}:
-        raise ValueError("analysis input target held-out records must cover seeds 42/43")
+    expected_heldout_keys = {str(seed) for seed in target_seeds}
+    if not isinstance(heldout_records, dict) or set(heldout_records) != expected_heldout_keys:
+        raise ValueError("analysis target held-out records differ from stage seeds")
     target_heldout: dict[int, VectorSet] = {}
-    for seed in (42, 43):
-        name = f"T:seed={seed}"
+    for seed in target_seeds:
+        name = _target_representation(layout.stage, seed)
         expected_vector_ids = tuple(
             selection_vector_id(name, stable_id) for stable_id in heldout_ids
         )
@@ -537,7 +577,7 @@ def _load_inputs(stage_dir: Path, reference_repo: Path) -> _LoadedInputs:
             heldout_records[str(seed)],
             expected_ids=heldout_ids,
             expected_vector_ids=expected_vector_ids,
-            expected_representation="T",
+            expected_representation=_source_representation(name),
             selection_name=name,
             expected_source_hash=source_snapshot_hash,
             description=f"target held-out seed {seed}",
@@ -563,7 +603,9 @@ def _load_inputs(stage_dir: Path, reference_repo: Path) -> _LoadedInputs:
     selection = load_selection_bundle(
         selection_directory,
         expected_candidate_ids=candidate_ids,
-        expected_vector_manifest_hashes=vector_hashes,
+        expected_vector_manifest_hashes={
+            name: vector_hashes[name] for name in selection_representations
+        },
         expected_parent_hashes=parent_hashes,
     )
     random = load_random_schedules(
@@ -629,8 +671,9 @@ def _required_scalar(vector_set: VectorSet, name: str) -> np.ndarray:
 
 def _target_spaces(inputs: _LoadedInputs) -> dict[int, TargetSpace]:
     result: dict[int, TargetSpace] = {}
-    for seed in (42, 43):
-        candidate = inputs.vectors[f"T:seed={seed}"]
+    for seed in stage_profile(inputs.layout.stage).generation_seeds:
+        target_name = _target_representation(inputs.layout.stage, seed)
+        candidate = inputs.vectors[target_name]
         heldout = inputs.target_heldout[seed]
         result[seed] = TargetSpace(
             seed=seed,
@@ -811,6 +854,9 @@ def _selected_and_null_metrics(
     dict[str, object],
     list[dict[str, object]],
 ]:
+    profile = stage_profile(inputs.layout.stage)
+    target_seeds = profile.generation_seeds
+    selection_representations = profile.selection_representations
     null_tables: dict[int, dict[str, dict[str, np.ndarray]]] = {}
     random_report: dict[str, object] = {
         "schedule": {
@@ -839,7 +885,8 @@ def _selected_and_null_metrics(
         random_report["metadata"][kind] = _random_metadata_diagnostics(  # type: ignore[index]
             inputs.candidate_rows, schedules
         )
-    for seed in (42, 43):
+    for seed in target_seeds:
+        target_name = _target_representation(inputs.layout.stage, seed)
         null_tables[seed] = {
             "uniform": evaluate_subset_table(spaces[seed], inputs.random.uniform),
             "stratified": evaluate_subset_table(
@@ -850,7 +897,7 @@ def _selected_and_null_metrics(
             kind: {
                 **_score_table_summary(table),
                 "verifier": _random_verifier(
-                    inputs.vectors[f"T:seed={seed}"],
+                    inputs.vectors[target_name],
                     inputs.random.uniform
                     if kind == "uniform"
                     else inputs.random.stratified,
@@ -887,7 +934,7 @@ def _selected_and_null_metrics(
                 ),
             }
         )
-        for target_seed in (42, 43):
+        for target_seed in target_seeds:
             raw = _score_dict(evaluate_subset(spaces[target_seed], positions))
             uniform_percentiles = {
                 name: inclusive_percentile(
@@ -914,7 +961,10 @@ def _selected_and_null_metrics(
                 "uniform_percentiles": uniform_percentiles,
                 "stratified_percentiles": stratified_percentiles,
                 "target_verifier": _verifier_subset(
-                    inputs.vectors[f"T:seed={target_seed}"], positions
+                    inputs.vectors[
+                        _target_representation(inputs.layout.stage, target_seed)
+                    ],
+                    positions,
                 ),
             }
             records.append(record)
@@ -923,10 +973,14 @@ def _selected_and_null_metrics(
                 if primary_key in index:
                     raise RuntimeError("duplicate primary selected metric record")
                 index[primary_key] = record
-    expected_records = len(EXPECTED_REPRESENTATIONS) * 2 * 2 * 2
+    expected_records = (
+        len(selection_representations) * 2 * len(KMEANS_SEEDS) * len(target_seeds)
+    )
     if len(records) != expected_records:
         raise RuntimeError("selected metric record coverage is incomplete")
-    if len(index) != len(EXPECTED_REPRESENTATIONS) * 2 * 2:
+    if len(index) != (
+        len(selection_representations) * len(KMEANS_SEEDS) * len(target_seeds)
+    ):
         raise RuntimeError("primary selected metric index coverage is incomplete")
     return records, index, null_tables, random_report, selected_diagnostics
 
@@ -941,6 +995,52 @@ def _corner_record(record: Mapping[str, object]) -> dict[str, object]:
         "gradient_norm": float(uniform["full_gradient_norm"]),
         "opd_signal": float(uniform["opd_signal_rms"]),
     }
+
+
+def _pilot_unavailable_diagnostics() -> dict[str, dict[str, str]]:
+    reason = "efficacy_pilot has one generation seed and one rollout per question"
+    return {
+        "cross_seed_oracle": {"status": "unavailable", "reason": reason},
+        "target_seed_dependence": {"status": "unavailable", "reason": reason},
+    }
+
+
+def _pilot_gate_diagnostics(
+    metric_index: Mapping[tuple[str, int, int], Mapping[str, object]],
+) -> dict[str, object]:
+    records: dict[int, dict[str, float]] = {}
+    for kmeans_seed in KMEANS_SEEDS:
+        record = metric_index[("P_pilot", kmeans_seed, 42)]
+        uniform = record.get("uniform_percentiles")
+        if not isinstance(uniform, Mapping):
+            raise ValueError("pilot primary metric record lacks uniform percentiles")
+        records[kmeans_seed] = {
+            "g_vendi": float(uniform["g_vendi"]),
+            "coverage": float(uniform["coverage"]),
+            "gradient_norm": float(uniform["full_gradient_norm"]),
+            "opd_signal": float(uniform["opd_signal_rms"]),
+        }
+    classification = classify_efficacy_pilot(records)
+    expected_fields = {
+        "status",
+        "decision",
+        "main_hypothesis",
+        "stage1_thresholds_modified",
+        "primary_uniform_percentiles_by_kmeans_seed",
+        "thresholds",
+    }
+    if set(classification) != expected_fields:
+        raise ValueError("efficacy pilot classification must contain only pilot_only fields")
+    required = {
+        "status": "pilot_only",
+        "main_hypothesis": "not_evaluated",
+        "stage1_thresholds_modified": False,
+    }
+    if any(classification.get(key) != value for key, value in required.items()):
+        raise ValueError("efficacy pilot classification must be forced pilot_only")
+    if classification.get("decision") not in {"go", "no_go", "borderline"}:
+        raise ValueError("efficacy pilot classification has an invalid decision")
+    return classification
 
 
 def _gate_diagnostics(
@@ -1214,28 +1314,83 @@ def run_analysis(
         random_report,
         selected_diagnostics,
     ) = _selected_and_null_metrics(inputs, spaces)
-    target_cka = target_dependence_permutation_test(
-        inputs.vectors["T:seed=42"].vectors,
-        inputs.vectors["T:seed=43"].vectors,
-    )
-    gate_diagnostics = _gate_diagnostics(metric_index, target_cka)
-    secondary = _secondary_diagnostics(inputs, target_cka)
-    if inputs.layout.stage == 0:
-        classification: dict[str, object] = {"status": "smoke_only"}
-    elif inputs.layout.stage == 1:
-        classification = gate_diagnostics
-    else:
-        parent_report, parent_sha = _load_parent_stage1_report(inputs)
-        sensitivity = classify_stage2_sensitivity(
-            stage1_report=parent_report["classification"],
-            expanded_oracle=gate_diagnostics["oracle"],
-            expanded_pn1_components=gate_diagnostics["P_n1"]["components"],
-        )
-        classification = {
-            "status": sensitivity["classification"],
-            "stage1_report_sha256": parent_sha,
-            "sensitivity": sensitivity,
+    unavailable: dict[str, object] | None = None
+    if inputs.layout.stage == EFFICACY_PILOT:
+        classification = _pilot_gate_diagnostics(metric_index)
+        unavailable = _pilot_unavailable_diagnostics()
+        gate_diagnostics: dict[str, object] = {
+            "pilot_gate": classification,
+            **unavailable,
         }
+        secondary: dict[str, object] = {
+            "status": "pilot_only",
+            "diagnostic_k_sensitivity": {
+                "status": "reported_not_gated",
+                "selected_metric_records": sum(
+                    record["ratio_name"] == "diagnostic"
+                    for record in selected_metrics
+                ),
+            },
+            **unavailable,
+        }
+    else:
+        target_cka = target_dependence_permutation_test(
+            inputs.vectors["T:seed=42"].vectors,
+            inputs.vectors["T:seed=43"].vectors,
+        )
+        gate_diagnostics = _gate_diagnostics(metric_index, target_cka)
+        secondary = _secondary_diagnostics(inputs, target_cka)
+        if inputs.layout.stage == 0:
+            classification = {"status": "smoke_only"}
+        elif inputs.layout.stage == 1:
+            classification = gate_diagnostics
+        else:
+            parent_report, parent_sha = _load_parent_stage1_report(inputs)
+            sensitivity = classify_stage2_sensitivity(
+                stage1_report=parent_report["classification"],
+                expanded_oracle=gate_diagnostics["oracle"],
+                expanded_pn1_components=gate_diagnostics["P_n1"]["components"],
+            )
+            classification = {
+                "status": sensitivity["classification"],
+                "stage1_report_sha256": parent_sha,
+                "sensitivity": sensitivity,
+            }
+
+    target_seeds = stage_profile(inputs.layout.stage).generation_seeds
+    report_provenance: dict[str, object] = {
+        "stage_manifest_sha256": inputs.stage_manifest_sha256,
+        "sample_manifest_sha256": inputs.stage_manifest[
+            "sample_manifest_sha256"
+        ],
+        "analysis_inputs_sha256": inputs.input_manifest_sha256,
+        "source_snapshot_sha256": inputs.input_manifest[
+            "source_snapshot_sha256"
+        ],
+        "selection_manifest_sha256": inputs.input_manifest[
+            "selection_manifest_sha256"
+        ],
+        "random_manifest_sha256": inputs.input_manifest[
+            "random_manifest_sha256"
+        ],
+        "representation_vector_manifest_sha256": inputs.selection.manifest[
+            "representation_vector_manifest_sha256"
+        ],
+        "target_heldout_vector_manifest_sha256": {
+            str(seed): inputs.input_manifest["target_heldout"][str(seed)][
+                "vector_manifest_sha256"
+            ]
+            for seed in target_seeds
+        },
+        "reference_commit": inputs.reference["reference_commit"],
+        "reference_tree": inputs.reference["reference_tree"],
+    }
+    if inputs.layout.stage == EFFICACY_PILOT:
+        parent_stage = inputs.stage_manifest["parent_stage_manifest"]
+        report_provenance["parent_stage1_manifest_sha256"] = parent_stage["sha256"]
+        report_provenance["algorithm_contract_sha256"] = inputs.stage_manifest[
+            "algorithm_contract_sha256"
+        ]
 
     report: dict[str, object] = {
         "schema_version": REPORT_SCHEMA_VERSION,
@@ -1248,35 +1403,9 @@ def run_analysis(
             "primary_k": inputs.layout.primary_k,
             "diagnostic_k": inputs.layout.diagnostic_k,
             "random_draws": inputs.layout.null_draws,
-            "representations": len(EXPECTED_REPRESENTATIONS),
+            "representations": len(_analysis_representations(inputs.layout.stage)),
         },
-        "provenance": {
-            "stage_manifest_sha256": inputs.stage_manifest_sha256,
-            "sample_manifest_sha256": inputs.stage_manifest[
-                "sample_manifest_sha256"
-            ],
-            "analysis_inputs_sha256": inputs.input_manifest_sha256,
-            "source_snapshot_sha256": inputs.input_manifest[
-                "source_snapshot_sha256"
-            ],
-            "selection_manifest_sha256": inputs.input_manifest[
-                "selection_manifest_sha256"
-            ],
-            "random_manifest_sha256": inputs.input_manifest[
-                "random_manifest_sha256"
-            ],
-            "representation_vector_manifest_sha256": inputs.selection.manifest[
-                "representation_vector_manifest_sha256"
-            ],
-            "target_heldout_vector_manifest_sha256": {
-                seed: inputs.input_manifest["target_heldout"][seed][
-                    "vector_manifest_sha256"
-                ]
-                for seed in ("42", "43")
-            },
-            "reference_commit": inputs.reference["reference_commit"],
-            "reference_tree": inputs.reference["reference_tree"],
-        },
+        "provenance": report_provenance,
         "random_nulls": random_report,
         "selected_metrics": selected_metrics,
         "selected_diagnostics": selected_diagnostics,
@@ -1284,6 +1413,8 @@ def run_analysis(
         "secondary_diagnostics": secondary,
         "classification": classification,
     }
+    if unavailable is not None:
+        report["unavailable_diagnostics"] = unavailable
     canonical_json_bytes(report)
     if output_json is not None and output_markdown is not None:
         write_reports(report, output_json, output_markdown)
@@ -1294,9 +1425,55 @@ def render_markdown(report: Mapping[str, object]) -> str:
     """Render Markdown solely from a validated report dictionary."""
     if report.get("artifact_type") != "opd_proxy_gradient_verification_report":
         raise ValueError("cannot render a non-OPD verification report")
-    stage = int(report["stage"])
+    stage = parse_stage_kind(report["stage"])
     counts = report["counts"]
     classification = report["classification"]
+    if stage == EFFICACY_PILOT:
+        if not isinstance(classification, Mapping) or classification.get(
+            "status"
+        ) != "pilot_only":
+            raise ValueError("efficacy pilot report must remain pilot_only")
+        lines = [
+            "# Vanilla-OPD Proxy-Gradient Verification — One-Time Efficacy Pilot",
+            "",
+            "**Classification status:** `pilot_only`.",
+            f"**Operational decision:** `{classification['decision']}`.",
+            "The main Stage-1 hypothesis was not evaluated.",
+            "",
+            "## Frozen cardinalities",
+            "",
+            f"- Candidates: {counts['candidate']}",
+            f"- Held out: {counts['held_out']}",
+            f"- Selected: {counts['selected']}",
+            f"- Primary / diagnostic K: {counts['primary_k']} / {counts['diagnostic_k']}",
+            f"- Random draws per null: {counts['random_draws']}",
+            "",
+            "## Primary uniform gate",
+            "",
+        ]
+        records = classification["primary_uniform_percentiles_by_kmeans_seed"]
+        for seed in (42, 43):
+            row = records.get(seed, records.get(str(seed)))
+            if not isinstance(row, Mapping):
+                raise ValueError("pilot report lacks a K-means gate realization")
+            lines.append(
+                "- K-means seed "
+                f"{seed}: G-Vendi={row['g_vendi']:.6g}, "
+                f"coverage={row['coverage']:.6g}, "
+                f"gradient norm={row['gradient_norm']:.6g}, "
+                f"OPD signal={row['opd_signal']:.6g}"
+            )
+        lines.extend(
+            [
+                "",
+                "Cross-seed oracle and target-seed dependence are unavailable because "
+                "the pilot uses one generation seed and one rollout per question.",
+                "",
+                "This pilot does not establish downstream or OOD improvement.",
+                "",
+            ]
+        )
+        return "\n".join(lines)
     lines = [
         f"# Vanilla-OPD Proxy-Gradient Verification — Stage {stage}",
         "",

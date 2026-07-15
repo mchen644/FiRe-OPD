@@ -115,6 +115,10 @@ def test_efficacy_pilot_go_gate_passes_both_exact_boundaries():
     assert result["decision"] == "go"
     assert result["main_hypothesis"] == "not_evaluated"
     assert result["stage1_thresholds_modified"] is False
+    assert set(result["primary_uniform_percentiles_by_kmeans_seed"]) == {
+        "42",
+        "43",
+    }
 
 
 @pytest.mark.parametrize(
