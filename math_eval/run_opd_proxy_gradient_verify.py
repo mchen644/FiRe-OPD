@@ -1313,6 +1313,12 @@ def _unit_environment(
 ) -> dict[str, str]:
     env = dict(base)
     env.update({key: value for key, value in command.extra_env})
+    # This NVIDIA allocation exports ROCm aliases too. VERL/Ray correctly
+    # rejects simultaneous CUDA and ROCR/HIP visibility because their index
+    # spaces compose differently. Child work units use only the allocated CUDA
+    # tokens resolved above; remove the irrelevant aliases at this boundary.
+    env.pop("ROCR_VISIBLE_DEVICES", None)
+    env.pop("HIP_VISIBLE_DEVICES", None)
     env["CUDA_VISIBLE_DEVICES"] = ",".join(tokens)
     env["PYTHONPATH"] = "verl:." + (
         f":{env['PYTHONPATH']}" if env.get("PYTHONPATH") else ""

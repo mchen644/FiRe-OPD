@@ -10,6 +10,7 @@ from math_eval.run_opd_proxy_gradient_verify import (
     GVENDI_PYTHON,
     VERL_PYTHON,
     StageCommand,
+    _unit_environment,
     build_capture_hydra_overrides,
     build_experiment_source_snapshot,
     build_source_snapshot,
@@ -189,6 +190,22 @@ def _command(
         log_path=tmp_path / "logs" / f"{name}.log",
         validate_output=False,
     )
+
+
+def test_child_environment_removes_conflicting_rocm_visibility_aliases(tmp_path):
+    command = _command(tmp_path, "environment")
+    env = _unit_environment(
+        {
+            "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+            "ROCR_VISIBLE_DEVICES": "0,1,2,3",
+            "HIP_VISIBLE_DEVICES": "0,1,2,3",
+        },
+        command,
+        ("0", "1", "2", "3"),
+    )
+    assert env["CUDA_VISIBLE_DEVICES"] == "0,1,2,3"
+    assert "ROCR_VISIBLE_DEVICES" not in env
+    assert "HIP_VISIBLE_DEVICES" not in env
 
 
 def test_runtime_requires_four_unique_allocated_tokens():
