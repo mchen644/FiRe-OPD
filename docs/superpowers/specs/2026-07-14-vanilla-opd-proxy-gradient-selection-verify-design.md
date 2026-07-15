@@ -321,6 +321,19 @@ sample view.
 
 ## Staged execution
 
+The frozen execution order is:
+
+| Order | Stage | Role |
+|---:|---|---|
+| 1 | Stage 0 | correctness and resume smoke |
+| 2 | `efficacy_pilot` | one-time operational efficacy gate |
+| 3 | Stage 1 | preregistered main probe |
+| 4 | conditional Stage 2 | expanded-pool sensitivity only |
+
+Thus the protocol is `Stage 0 -> efficacy_pilot -> Stage 1 -> conditional Stage 2`.
+The pilot can guide the operational decision to incur Stage-1 GPU cost, but it
+cannot alter Stage-1 thresholds or emit the main hypothesis pass/fail.
+
 ### Stage 0: 32-question smoke
 
 Use the first 24 candidate and first 8 held-out IDs from the frozen manifest.
@@ -330,6 +343,111 @@ and analysis. Its test-only selected size is
 random-null generator emits 100 subsets. These smoke constants never enter a
 scientific report. The smoke does not produce a pass/fail result for the
 hypothesis.
+
+### One-time `efficacy_pilot`: target-space efficacy gate
+
+Before Stage 1, run one isolated pilot to answer only whether proxy-selected
+questions are clearly better than equal-size random subsets in target-gradient
+space. This is a gradient-geometry gate, not selected-data training: it does
+not measure downstream or OOD accuracy and cannot establish the main
+hypothesis. Every pilot report is forced to `status = pilot_only` with exactly
+one operational decision in `go|no_go|borderline` and
+`main_hypothesis = not_evaluated`.
+
+The immutable membership parent is the existing Stage-1 manifest with SHA-256
+`6d698d75995c777d6faaf1abd385a758977ca0350ce862284f1e9d8751eddd83`.
+Pilot membership is derived without resampling or replacement:
+
+- candidates are the first 250 rows of the ordered Stage-1 candidate block
+  (parent manifest indices `0..249`);
+- held-out references are the first 84 rows of the ordered Stage-1 held-out
+  block (parent manifest indices `768..851`);
+- every pilot row stores its parent index and canonical parent-row SHA-256;
+- the Stage-1 manifest and all Stage-0/Stage-1 artifacts remain byte-identical.
+
+The only approved algorithm deviations from Stage 1 are:
+
+| Field | Stage 1 | `efficacy_pilot` |
+|---|---:|---:|
+| capture `rollout.n` | 4 | 1 |
+| generation seed set | `[42, 43]` | `[42]` |
+
+In particular, the pilot uses one native vLLM request with `rollout.n = 1` per
+pair and seed; it does not emulate this with repeated calls. Every other
+algorithm field is frozen exactly:
+
+| Frozen field | Stage 1 | `efficacy_pilot` |
+|---|---|---|
+| student prompt | normal/raw OPD prompt | identical |
+| chat-template thinking | disabled | identical |
+| rollout temperature / top-p | `1.0 / 1.0` | identical |
+| maximum prompt length | `2,048` | identical |
+| maximum response length | `16,384` | identical |
+| policy loss / advantages | Vanilla / reverse-KL only | identical |
+| PPO epochs / mini-batches per actor rank | `1 / 1` | identical |
+| micro-batch per GPU / dynamic batching | `1 / false` | identical |
+| loss aggregation | token mean | identical |
+| rollout correction | token-level IS | identical |
+| IS upper threshold / batch normalization | `5.0 / false` | identical |
+| entropy coefficient | `0` | identical |
+| explicit KL teacher path / coefficient | enabled / `0` | identical |
+| KL in reward | disabled | identical |
+| candidate selection in capture | disabled | identical |
+| length-aware OPD | disabled | identical |
+| difficulty-aware OPD | disabled | identical |
+| TALE/ESR | disabled | identical |
+| teacher prompt routing | disabled | identical |
+| rethinking probe | disabled | identical |
+| optimizer construction/step | forbidden | identical |
+| gradient clipping | forbidden | identical |
+| parameter update | forbidden | identical |
+| projection family/type | TRAK `CudaProjector` / Rademacher | identical |
+| projection dimension / seed | `1,024 / 0` | identical |
+| projection block / max batch / model ID | `128 / 16 / 0` | identical |
+
+The pilot creates exactly two representations:
+
+- `P_pilot`: one seed-42, slot-0 proxy trajectory gradient for each of the 250
+  candidates; this is the sole selection representation;
+- `T_pilot`: one seed-42, slot-0 target trajectory gradient for all 250
+  candidates and 84 held-out references; this is the sole evaluation space.
+
+It creates no `P_n4`, SFT-gradient, prompt-embedding, seed-43 generation,
+target oracle, or selected-data training arm. The selector has selected size
+56, primary K 25, diagnostic K 3, K-means seeds 42 and 43, and round-robin seed
+42. It generates 10,000 uniform and 10,000 metadata-stratified without-
+replacement null subsets from `SeedSequence(2026071402)`. Only the two
+primary-K uniform-null realizations enter the decision; diagnostic K and the
+stratified null are reported diagnostics.
+
+For each K-means seed `k in {42,43}`, let `G_k`, `C_k`, `N_k`, and `S_k` be the
+inclusive uniform-null percentiles for target G-Vendi, held-out coverage,
+full-gradient norm, and OPD-signal RMS. Evaluate in this fixed order:
+
+```text
+go       iff both seeds have G_k >= 0.90, C_k >= 0.90,
+                         N_k >= 0.25, and S_k >= 0.25
+no_go    otherwise, iff either seed has G_k <= 0.60 or C_k <= 0.60
+borderline otherwise
+```
+
+All inequalities are inclusive. Cross-seed oracle and target-seed dependence
+are explicitly unavailable because the pilot has one generation seed and one
+rollout per question. Their absence cannot be restated as a Stage-1 oracle
+result.
+
+The pilot has an independent source commit, source snapshot, algorithm-
+contract hash, artifact namespace, work-unit ledgers, and completion marker
+under `data/opd_proxy_gradient_verify/efficacy_pilot/`. The frozen Stage-1
+source commit remains
+`174849613a9c61445765f0b913174d286f3819e4`; its old source identity appears
+only as hashed parent provenance. No pilot path writes beneath `stage_1/`, and
+no pilot capture, replay, selection, or report may satisfy Stage-1 resume (or
+vice versa), even if logical work-unit names match.
+
+A pilot `go`, `no_go`, or `borderline` is only an operational cost gate. It does
+not modify any preregistered Stage-1 threshold, does not produce the main
+`pass|fail|inconclusive` classification, and does not change Stage 2's trigger.
 
 ### Stage 1: 1,024-question main probe
 
@@ -385,7 +503,9 @@ or downgrade the Stage-1 classification in the interpretation matrix.
 
 ## Frozen vanilla-OPD contract
 
-Both target and proxy capture use the same algorithmic contract:
+For numbered Stages 0/1/2, target and proxy capture use the same algorithmic
+contract below. The one-time pilot uses the explicit two-field amendment above
+and is identical in every other row:
 
 ```text
 student prompt:                    normal/raw OPD prompt
@@ -705,9 +825,10 @@ to select it is diagnostic only and cannot satisfy the oracle gate.
 
 ## Random null distributions
 
-Let `B=100` for Stage 0 and `B=10,000` for Stages 1 and 2. Generate `B`
+Let `B=100` for Stage 0 and `B=10,000` for the `efficacy_pilot`, Stage 1,
+and Stage 2. Generate `B`
 uniform subsets and `B` stratified subsets of the manifest-selected cardinality
-(5, 172, or 345) without replacement. Create
+(5, 56, 172, or 345) without replacement. Create
 `numpy.random.SeedSequence(2026071402)`, call `spawn(2)` once, and initialize
 the uniform PCG64 generator from child 0 and the stratified PCG64 generator
 from child 1. The two nulls never share or continue one another's RNG stream.
@@ -992,15 +1113,22 @@ data/opd_proxy_gradient_verify/stage_{0,1,2}/gradients/sft/
 data/opd_proxy_gradient_verify/stage_{0,1,2}/embeddings/prompt/
 data/opd_proxy_gradient_verify/stage_{0,1,2}/selection/
 data/opd_proxy_gradient_verify/stage_{0,1,2}/report.{json,md}
+data/opd_proxy_gradient_verify/efficacy_pilot/{manifest.json,sample_manifest.jsonl}
+data/opd_proxy_gradient_verify/efficacy_pilot/capture/{target,proxy}/seed_42/
+data/opd_proxy_gradient_verify/efficacy_pilot/replay/{target,proxy}/seed_42/
+data/opd_proxy_gradient_verify/efficacy_pilot/{selection,report.json,report.md}
 logs/opd_proxy_gradient_verify/stage_{0,1,2}/
+logs/opd_proxy_gradient_verify/efficacy_pilot/
 ```
 
 The root sampling contract binds the eligible-ID order, benchmark hashes,
 decontamination artifacts, PCG64 algorithm and seed, skipped original
 permutation positions, and the first 2,048 retained clean positions before any
-GPU output exists. Stage 0 and Stage 1 are immutable views of that contract. A
-Stage-2 manifest is created only when the predeclared extension gate fires and
-includes the exact Stage-1 report hash and the deterministic added-ID blocks as
+GPU output exists. Stage 0 and Stage 1 are immutable views of that contract.
+The pilot is a separate immutable prefix view parented by the frozen Stage-1
+manifest and bound to its own live source identity. A Stage-2 manifest is
+created only when the predeclared extension gate fires and includes the exact
+Stage-1 report hash and the deterministic added-ID blocks as
 parents.
 
 Every directory has a manifest binding:
@@ -1042,7 +1170,8 @@ Fail before or during GPU work when:
 - either teacher/student pair fails exact token-ID compatibility;
 - any sampled ID is missing, duplicated, in the wrong split, over context, or
   collides with an evaluation question under the pinned audit;
-- any question lacks exactly four slots for an expected engine seed;
+- any numbered-stage question lacks exactly four slots for an expected engine
+  seed, or any pilot question lacks exactly slot 0 for seed 42;
 - capture uses multiple generation calls/engine restarts for one declared work
   unit or a prompt/slot order differs from its manifest;
 - actor parameters change during capture;
