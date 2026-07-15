@@ -126,6 +126,18 @@ def _require_positive_int(value: object, field: str) -> int:
     return parsed
 
 
+def _normalize_capture_stage(value: object) -> int | str:
+    if isinstance(value, bool):
+        raise ValueError("capture stage must be 0, 1, 2, or efficacy_pilot")
+    if isinstance(value, int) and value in {0, 1, 2}:
+        return value
+    if isinstance(value, str) and value in {"0", "1", "2"}:
+        return int(value)
+    if value == "efficacy_pilot":
+        return "efficacy_pilot"
+    raise ValueError("capture stage must be 0, 1, 2, or efficacy_pilot")
+
+
 def _require_sha256(value: object, field: str) -> str:
     if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
         raise ValueError(f"{field} must be a lowercase SHA-256 digest")
@@ -236,9 +248,7 @@ def validate_capture_contract(config: Mapping[str, object]) -> dict[str, object]
             f"expected {declared_source_hash}, got {actual_source_hash}"
         )
 
-    stage = _require_nonnegative_int(config.get("stage"), "stage")
-    if stage not in {0, 1, 2}:
-        raise ValueError("capture stage must be 0, 1, or 2")
+    stage = _normalize_capture_stage(config.get("stage"))
     pair = config.get("pair")
     if pair not in {"target", "proxy"}:
         raise ValueError("capture pair must be target or proxy")
@@ -246,8 +256,25 @@ def validate_capture_contract(config: Mapping[str, object]) -> dict[str, object]
     native_rollouts = _require_positive_int(
         config.get("native_rollouts"), "native_rollouts"
     )
-    if native_rollouts != 4:
-        raise ValueError("capture native_rollouts must equal 4")
+    algorithm_value = config.get("algorithm_contract_sha256")
+    algorithm_contract_sha256 = (
+        None
+        if algorithm_value is None
+        else _require_sha256(algorithm_value, "algorithm_contract_sha256")
+    )
+    if stage == "efficacy_pilot":
+        if engine_seed != 42 or native_rollouts != 1:
+            raise ValueError(
+                "efficacy_pilot capture requires seed 42 and native_rollouts 1"
+            )
+        if algorithm_contract_sha256 is None:
+            raise ValueError(
+                "efficacy_pilot capture requires algorithm_contract_sha256"
+            )
+    elif engine_seed not in {42, 43} or native_rollouts != 4:
+        raise ValueError(
+            "numbered-stage capture requires seeds 42/43 and native_rollouts 4"
+        )
     expected_questions = _require_positive_int(
         config.get("expected_questions"), "expected_questions"
     )
@@ -264,6 +291,7 @@ def validate_capture_contract(config: Mapping[str, object]) -> dict[str, object]
         "sample_manifest_sha256": actual_sample_hash,
         "source_snapshot": str(source_path),
         "source_snapshot_sha256": actual_source_hash,
+        "algorithm_contract_sha256": algorithm_contract_sha256,
         "stage": stage,
         "pair": pair,
         "engine_seed": engine_seed,

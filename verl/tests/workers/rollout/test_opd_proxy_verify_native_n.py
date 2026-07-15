@@ -192,7 +192,23 @@ def test_native_n_calls_one_generation_and_expands_every_prompt_field():
     assert len(rollout.inference_engine.calls) == 1
 
 
-def test_native_n_requires_capture_mode_exactly_four_and_unique_prompt_ids():
+def test_pilot_native_n1_uses_one_generation_call_and_assigns_slot_zero():
+    rollout = _bare_rollout(_request_outputs(1))
+    prompts = _prompts()
+    prompts.meta_info["opd_proxy_verify_stage"] = "efficacy_pilot"
+
+    result = _generate_without_device_decorators(
+        rollout, prompts, opd_proxy_verify_native_n=1
+    )
+
+    assert len(rollout.inference_engine.calls) == 1
+    assert rollout.inference_engine.calls[0]["sampling_params"].n == 1
+    assert result.non_tensor_batch["opd_verify_stable_id"].tolist() == ["q0", "q1"]
+    assert result.batch["opd_proxy_verify_rollout_slot"].tolist() == [0, 0]
+    assert result.batch["responses"][:, 0].tolist() == [10, 20]
+
+
+def test_native_n_requires_capture_mode_stage_rollouts_and_unique_prompt_ids():
     rollout = _bare_rollout(_request_outputs(4))
     with pytest.raises(ValueError, match="capture enabled"):
         _generate_without_device_decorators(
@@ -200,9 +216,15 @@ def test_native_n_requires_capture_mode_exactly_four_and_unique_prompt_ids():
             _prompts(capture_enabled=False),
             opd_proxy_verify_native_n=4,
         )
-    with pytest.raises(ValueError, match="exactly 4"):
+    with pytest.raises(ValueError, match="numbered stage.*exactly 4"):
         _generate_without_device_decorators(
             rollout, _prompts(), opd_proxy_verify_native_n=2
+        )
+    pilot_prompts = _prompts()
+    pilot_prompts.meta_info["opd_proxy_verify_stage"] = "efficacy_pilot"
+    with pytest.raises(ValueError, match="efficacy_pilot.*exactly 1"):
+        _generate_without_device_decorators(
+            rollout, pilot_prompts, opd_proxy_verify_native_n=4
         )
     with pytest.raises(ValueError, match="unique.*stable"):
         _generate_without_device_decorators(

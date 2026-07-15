@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -417,6 +418,53 @@ def test_capture_contract_hashes_the_declared_sample_manifest(tmp_path: Path):
     )
     with pytest.raises(ValueError, match="source snapshot hash"):
         validate_capture_contract(wrong_source)
+
+
+def test_efficacy_pilot_capture_contract_requires_seed42_native_n1_and_identity(
+    tmp_path: Path,
+):
+    sample_manifest = tmp_path / "samples.jsonl"
+    sample_manifest.write_text('{"stable_id":"q0"}\n', encoding="utf-8")
+    source_snapshot = tmp_path / "source_snapshot.json"
+    source_files = [{"path": "module.py", "sha256": "1" * 64}]
+    source_hash = hashlib.sha256(canonical_json_bytes(source_files)).hexdigest()
+    source_snapshot.write_bytes(
+        canonical_json_bytes(
+            {"files": source_files, "manifest_sha256": source_hash}
+        )
+    )
+    config = OpdProxyVerifyCaptureConfig(
+        enabled=True,
+        output_root=str(tmp_path / "capture"),
+        sample_manifest=str(sample_manifest),
+        sample_manifest_sha256=sha256_file(sample_manifest),
+        source_snapshot=str(source_snapshot),
+        source_snapshot_sha256=source_hash,
+        stage="efficacy_pilot",
+        pair="proxy",
+        engine_seed=42,
+        native_rollouts=1,
+        expected_questions=1,
+        chunk_size=1,
+        schema_version=1,
+        algorithm_contract_sha256="a" * 64,
+    )
+    normalized = validate_capture_contract(config)
+    assert normalized["stage"] == "efficacy_pilot"
+    assert normalized["engine_seed"] == 42
+    assert normalized["native_rollouts"] == 1
+    assert normalized["algorithm_contract_sha256"] == "a" * 64
+
+    with pytest.raises(ValueError, match="seed 42.*native_rollouts 1"):
+        validate_capture_contract(replace(config, engine_seed=43))
+    with pytest.raises(ValueError, match="seed 42.*native_rollouts 1"):
+        validate_capture_contract(replace(config, native_rollouts=4))
+    with pytest.raises(ValueError, match="algorithm_contract_sha256"):
+        validate_capture_contract(replace(config, algorithm_contract_sha256=None))
+    with pytest.raises(ValueError, match="native_rollouts 4"):
+        validate_capture_contract(
+            replace(config, stage=1, native_rollouts=1, algorithm_contract_sha256=None)
+        )
 
 
 def test_recursive_parameter_hash_changes_with_any_parameter_byte():

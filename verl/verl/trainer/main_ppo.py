@@ -58,7 +58,7 @@ def validate_opd_proxy_capture_runtime_config(config) -> dict[str, object] | Non
         "data.shuffle": False,
         "actor_rollout_ref.rollout.name": "vllm",
         "actor_rollout_ref.rollout.mode": "sync",
-        "actor_rollout_ref.rollout.n": 4,
+        "actor_rollout_ref.rollout.n": contract["native_rollouts"],
         "actor_rollout_ref.rollout.seed": contract["engine_seed"],
         "actor_rollout_ref.rollout.temperature": 1.0,
         "actor_rollout_ref.rollout.top_p": 1.0,

@@ -1478,6 +1478,9 @@ class RayPPOTrainer:
             "source_snapshot_sha256": source_snapshot_sha256,
             "resolved_config_sha256": config_hash,
         }
+        algorithm_contract_sha256 = contract.get("algorithm_contract_sha256")
+        if algorithm_contract_sha256 is not None:
+            parents["algorithm_contract_sha256"] = algorithm_contract_sha256
         stage_manifest = Path(contract["sample_manifest"]).with_name("manifest.json")
         provenance = {
             "model_hashes": {"student": contract["sample_manifest_sha256"]},
@@ -1841,6 +1844,7 @@ class RayPPOTrainer:
                 "do_sample": True,
                 "validate": False,
                 "opd_proxy_verify_capture_enabled": True,
+                "opd_proxy_verify_stage": contract["stage"],
                 "generation_kwargs": {
                     "opd_proxy_verify_native_n": contract["native_rollouts"]
                 },

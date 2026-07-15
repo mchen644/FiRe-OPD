@@ -642,6 +642,21 @@ def test_actor_capture_uses_micro_batch_one_and_never_backward_or_updates(
     assert (tmp_path / "actor/rank_0/chunk_1_2.safetensors").is_file()
 
 
+def test_efficacy_pilot_runtime_contract_uses_native_n1(tmp_path):
+    config = _capture_config(tmp_path)
+    config.actor_rollout_ref.rollout.n = 1
+    capture = config.algorithm.opd_proxy_verify_capture
+    capture.stage = "efficacy_pilot"
+    capture.native_rollouts = 1
+    capture.algorithm_contract_sha256 = "a" * 64
+
+    contract = validate_opd_proxy_capture_runtime_config(config)
+
+    assert contract["stage"] == "efficacy_pilot"
+    assert contract["native_rollouts"] == 1
+    assert contract["algorithm_contract_sha256"] == "a" * 64
+
+
 def test_capture_contract_rejects_forbidden_config_and_batch_keys(tmp_path):
     config = _capture_config(tmp_path)
     validate_opd_proxy_capture_runtime_config(config)

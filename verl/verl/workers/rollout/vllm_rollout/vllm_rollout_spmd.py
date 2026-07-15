@@ -374,8 +374,21 @@ class vLLMRollout(BaseRollout):
                 raise ValueError(
                     "opd_proxy_verify_native_n requires capture enabled metadata"
                 )
-            if isinstance(native_n, bool) or not isinstance(native_n, int) or native_n != 4:
-                raise ValueError("OPD proxy native capture requires exactly 4 completions")
+            capture_stage = prompts.meta_info.get("opd_proxy_verify_stage", 0)
+            if isinstance(native_n, bool) or not isinstance(native_n, int):
+                raise ValueError("OPD proxy native capture count must be an integer")
+            if capture_stage == "efficacy_pilot":
+                if native_n != 1:
+                    raise ValueError(
+                        "efficacy_pilot native capture requires exactly 1 completion"
+                    )
+            elif capture_stage in {None, 0, 1, 2, "0", "1", "2"}:
+                if native_n != 4:
+                    raise ValueError(
+                        "numbered stage native capture requires exactly 4 completions"
+                    )
+            else:
+                raise ValueError(f"unsupported OPD proxy capture stage: {capture_stage}")
             if getattr(self, "_opd_proxy_verify_capture_generated", False):
                 raise RuntimeError(
                     "second native capture generation on the same engine is forbidden"

@@ -417,7 +417,8 @@ class OpdProxyVerifyCaptureConfig(BaseConfig):
     sample_manifest_sha256: Optional[str] = None
     source_snapshot: Optional[str] = None
     source_snapshot_sha256: Optional[str] = None
-    stage: int = 0
+    algorithm_contract_sha256: Optional[str] = None
+    stage: Any = 0
     pair: str = "target"
     engine_seed: int = 42
     native_rollouts: int = 4

@@ -139,6 +139,19 @@ class TestAlgoConfig(unittest.TestCase):
         assert isinstance(instantiated, OpdProxyVerifyCaptureConfig)
         assert AlgoConfig().opd_proxy_verify_capture.enabled is False
 
+    def test_capture_config_structured_omegaconf_accepts_pilot_stage(self):
+        config = OmegaConf.structured(
+            OpdProxyVerifyCaptureConfig(
+                stage="efficacy_pilot",
+                native_rollouts=1,
+                engine_seed=42,
+                algorithm_contract_sha256="a" * 64,
+            )
+        )
+        self.assertEqual(config.stage, "efficacy_pilot")
+        self.assertEqual(config.native_rollouts, 1)
+        self.assertEqual(config.algorithm_contract_sha256, "a" * 64)
+
     def test_config_init_from_yaml(self):
         import os
 

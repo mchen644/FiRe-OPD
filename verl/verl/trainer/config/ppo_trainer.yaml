@@ -128,7 +128,10 @@ algorithm:
     # Expected SHA-256 of the full experiment source snapshot
     source_snapshot_sha256: null
 
-    # Stage number
+    # Stage-specific algorithm contract identity (required by efficacy_pilot)
+    algorithm_contract_sha256: null
+
+    # Numbered stage or the string efficacy_pilot
     stage: 0
 
     # Model pair: target or proxy
