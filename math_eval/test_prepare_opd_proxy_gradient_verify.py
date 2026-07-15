@@ -391,7 +391,7 @@ def test_stage_rows_use_raw_prompt_and_completion_only_sft_labels():
     assert rows[0]["raw_opd_messages"] == [
         {
             "role": "user",
-            "content": PREPARED_ROW["prompt"].rstrip() + "\n" + OPD_SUFFIX,
+            "content": PREPARED_ROW["prompt"] + "\n" + OPD_SUFFIX,
         }
     ]
     assert rows[0]["leaf_topic"] == "Other"
@@ -414,9 +414,9 @@ def test_completion_mask_uses_response_marker_not_generation_only_thinking_suffi
     assert rows[0]["sft_supervised_label_count"] == 3
 
 
-def test_raw_prompt_builder_appends_exactly_one_newline_and_one_suffix():
+def test_raw_prompt_builder_preserves_exact_question_before_suffix():
     assert build_raw_opd_prompt("question   \n")[0]["content"] == (
-        "question\n" + OPD_SUFFIX
+        "question   \n\n" + OPD_SUFFIX
     )
 
 

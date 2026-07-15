@@ -641,7 +641,7 @@ def build_raw_opd_prompt(question: str) -> list[dict[str, str]]:
     return [
         {
             "role": "user",
-            "content": question.rstrip() + "\n" + OPD_SUFFIX,
+            "content": question + "\n" + OPD_SUFFIX,
         }
     ]
 
