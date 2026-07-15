@@ -521,6 +521,45 @@ def test_replay_shard_resumes_only_a_contiguous_vector_prefix(tmp_path: Path):
     assert loaded.manifest["verifier"] == {"status": "not_computed"}
 
 
+def test_explicit_resume_exercise_interrupts_after_immutable_chunk(tmp_path: Path):
+    first_calls = []
+    with pytest.raises(RuntimeError, match="intentional replay interruption"):
+        run_replay_shard(
+            **_run_kwargs(
+                tmp_path,
+                lambda index: first_calls.append(index) or _vector(index),
+            ),
+            exercise_interrupt_after_chunks=1,
+        )
+    assert first_calls == [0]
+    assert (tmp_path / ".vectors_0_1.complete.json").is_file()
+    assert not (tmp_path / "COMPLETE.json").exists()
+
+    resumed_calls = []
+    loaded = run_replay_shard(
+        **_run_kwargs(
+            tmp_path,
+            lambda index: resumed_calls.append(index) or _vector(index),
+        )
+    )
+    assert resumed_calls == [1]
+    assert loaded.vector_ids == tuple(_vector(index).vector_id for index in range(2))
+
+    uninterrupted = tmp_path.parent / f"{tmp_path.name}-uninterrupted"
+    run_replay_shard(**_run_kwargs(uninterrupted, _vector))
+    resumed_hashes = {
+        path.name: sha256_file(path)
+        for path in tmp_path.iterdir()
+        if path.is_file() and not path.name.endswith(".lock")
+    }
+    uninterrupted_hashes = {
+        path.name: sha256_file(path)
+        for path in uninterrupted.iterdir()
+        if path.is_file() and not path.name.endswith(".lock")
+    }
+    assert resumed_hashes == uninterrupted_hashes
+
+
 def test_replay_resume_rejects_tampered_completed_prefix(tmp_path: Path):
     def interrupted(index):
         if index == 1:

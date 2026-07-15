@@ -1282,6 +1282,7 @@ def run_replay_shard(
     metadata: Mapping[str, object],
     chunk_size: int = 16,
     verifier_status: str = "not_computed",
+    exercise_interrupt_after_chunks: int | None = None,
 ) -> VectorSet:
     """Create or resume one immutable vector shard from a contiguous prefix."""
     root = Path(output_directory)
@@ -1295,6 +1296,12 @@ def run_replay_shard(
         raise ValueError("replay representation must be nonempty")
     if verifier_status not in {"computed", "not_computed"}:
         raise ValueError("invalid verifier status")
+    if exercise_interrupt_after_chunks is not None and (
+        isinstance(exercise_interrupt_after_chunks, bool)
+        or not isinstance(exercise_interrupt_after_chunks, int)
+        or exercise_interrupt_after_chunks <= 0
+    ):
+        raise ValueError("exercise interrupt chunk count must be positive")
     normalized_parents = dict(parent_hashes)
     if not normalized_parents or any(
         not isinstance(name, str)
@@ -1331,6 +1338,7 @@ def run_replay_shard(
     prefix = _resume_prefix(
         root, expected, shard_contract_sha256=shard_contract_sha256
     )
+    written_chunks = 0
     for start in range(prefix, len(expected), chunk_size):
         end = min(start + chunk_size, len(expected))
         records = []
@@ -1350,6 +1358,11 @@ def run_replay_shard(
             records=records,
             shard_contract_sha256=shard_contract_sha256,
         )
+        written_chunks += 1
+        if written_chunks == exercise_interrupt_after_chunks:
+            raise RuntimeError(
+                "intentional replay interruption after immutable chunk publication"
+            )
 
     chunks = _discover_chunks(root)
     if not chunks or chunks[-1][1] != len(expected):
@@ -1597,6 +1610,7 @@ def run_capture_replay_shard(
     reference_repo: Path,
     repository_root: Path,
     chunk_size: int = 16,
+    exercise_interrupt_after_chunks: int | None = None,
 ) -> VectorSet:
     """Run one production replay shard from a completed capture root."""
     if pair not in {"target", "proxy"}:
@@ -1750,6 +1764,7 @@ def run_capture_replay_shard(
         },
         chunk_size=chunk_size,
         verifier_status=verifier_status,
+        exercise_interrupt_after_chunks=exercise_interrupt_after_chunks,
     )
 
 
@@ -1768,6 +1783,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reference-repo", type=Path, required=True)
     parser.add_argument("--repository-root", type=Path, default=Path.cwd())
     parser.add_argument("--chunk-size", type=int, default=16)
+    parser.add_argument(
+        "--exercise-interrupt-after-chunks",
+        type=int,
+        help="Stage-0 resume fixture only: stop after N immutable chunks",
+    )
     return parser
 
 
@@ -1785,6 +1805,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         reference_repo=args.reference_repo,
         repository_root=args.repository_root,
         chunk_size=args.chunk_size,
+        exercise_interrupt_after_chunks=args.exercise_interrupt_after_chunks,
     )
     return 0
 
