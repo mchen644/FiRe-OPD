@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 import torch
 
+from math_eval.opd_proxy_gradient_stage_profiles import EFFICACY_PILOT
 from math_eval.opd_proxy_gradient_verify_artifacts import (
     VectorSet,
     canonical_json_bytes,
@@ -130,6 +131,68 @@ def test_stage1_selector_uses_both_kmeans_seeds_and_fixed_round_robin_seed():
     assert len(_FakeClusterManager.calls) == 14 * 2 * 2
     assert {call[1] for call in _FakeClusterManager.calls} == {76, 7}
     assert all(call[2:] == (20, False) for call in _FakeClusterManager.calls)
+
+
+def test_pilot_selector_uses_only_proxy_and_exact_fixed_cardinalities():
+    rows = _rows(250)
+    vectors = {"P_pilot": _vector_set("P_pilot", rows)}
+    _FakeClusterManager.calls.clear()
+
+    bundle = run_selection(
+        vectors,
+        stage=EFFICACY_PILOT,
+        candidate_rows=rows,
+        fake_cluster_manager=_FakeClusterManager,
+    )
+
+    assert bundle.representations == ("P_pilot",)
+    assert bundle.k_values == (25, 3)
+    assert bundle.kmeans_seeds == (42, 43)
+    assert bundle.round_robin_seed == 42
+    assert len(bundle.selected_positions) == 4
+    assert all(len(value) == 56 for value in bundle.selected_positions.values())
+    assert len(_FakeClusterManager.calls) == 4
+    assert {call[1] for call in _FakeClusterManager.calls} == {25, 3}
+    diagnostic = [
+        record for record in bundle.manifest["runs"]
+        if record["ratio_name"] == "diagnostic"
+    ]
+    assert {record["effective_cluster_ratio"] for record in diagnostic} == {3 / 250}
+
+    with pytest.raises(ValueError, match="unexpected.*T_pilot"):
+        run_selection(
+            {**vectors, "T_pilot": _vector_set("T_pilot", rows)},
+            stage=EFFICACY_PILOT,
+            candidate_rows=rows,
+            fake_cluster_manager=_FakeClusterManager,
+        )
+
+
+def test_pilot_random_schedules_are_independent_deterministic_and_target_seed42_only():
+    rows = _rows(250)
+    first = generate_random_schedules(
+        rows,
+        selected_size=56,
+        draws=10_000,
+        stage=EFFICACY_PILOT,
+    )
+    second = generate_random_schedules(
+        rows,
+        selected_size=56,
+        draws=10_000,
+        stage=EFFICACY_PILOT,
+    )
+
+    assert first.uniform.shape == first.stratified.shape == (10_000, 56)
+    assert first.uniform.dtype.str == first.stratified.dtype.str == "<i4"
+    assert first.manifest["paired_target_seeds"] == [42]
+    assert first.manifest["stage"] == EFFICACY_PILOT
+    assert first.manifest["uniform_logical_sha256"] != first.manifest[
+        "stratified_logical_sha256"
+    ]
+    assert np.array_equal(first.uniform, second.uniform)
+    assert np.array_equal(first.stratified, second.stratified)
+    assert first.manifest == second.manifest
 
 
 def test_selection_vector_view_joins_shards_and_restores_candidate_order():

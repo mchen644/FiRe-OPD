@@ -16,6 +16,12 @@ import numpy as np
 import torch
 
 from math_eval.deepmath_gradient_diversity import balanced_round_robin
+from math_eval.opd_proxy_gradient_stage_profiles import (
+    EFFICACY_PILOT,
+    StageKind,
+    parse_stage_kind,
+    stage_profile,
+)
 from math_eval.opd_proxy_gradient_verify_artifacts import (
     VectorSet,
     atomic_save_npy,
@@ -59,6 +65,10 @@ EXPECTED_REPRESENTATIONS = tuple(
     + ["S", "E"]
     + [f"T:seed={seed}" for seed in KMEANS_SEEDS]
 )
+
+
+def expected_representations(stage: str | int) -> tuple[str, ...]:
+    return stage_profile(stage).selection_representations
 
 
 @dataclass(frozen=True)
@@ -350,7 +360,7 @@ def generate_random_schedules(
     draws: int,
     output_directory: Path | None = None,
     parent_hashes: Mapping[str, str] | None = None,
-    stage: int | None = None,
+    stage: str | int | None = None,
 ) -> RandomSchedules:
     """Generate the two pre-registered independent random subset streams."""
     stable_ids, rows = _validate_candidate_rows(candidate_rows, len(candidate_rows))
@@ -366,14 +376,14 @@ def generate_random_schedules(
         raise ValueError("selected_size must be in [1, candidate_count]")
     if isinstance(draws, bool) or not isinstance(draws, int) or draws <= 0:
         raise ValueError("draws must be a positive integer")
+    parsed_stage: StageKind | None = None
     if stage is not None:
-        if isinstance(stage, bool) or not isinstance(stage, int):
-            raise ValueError("random schedule stage must be an integer")
-        layout = stage_layout(stage)
+        parsed_stage = parse_stage_kind(stage)
+        profile = stage_profile(parsed_stage)
         if (
-            candidate_count != len(layout.candidate_clean_positions)
-            or selected_size != layout.selected_size
-            or draws != layout.null_draws
+            candidate_count != profile.candidate_count
+            or selected_size != profile.selected_size
+            or draws != profile.null_draws
         ):
             raise ValueError("random schedule cardinalities differ from stage layout")
 
@@ -452,7 +462,11 @@ def generate_random_schedules(
         "choice_replace": False,
         "choice_shuffle": False,
         "stored_order": "ascending_candidate_position",
-        "paired_target_seeds": list(KMEANS_SEEDS),
+        "paired_target_seeds": list(
+            KMEANS_SEEDS
+            if parsed_stage is None
+            else stage_profile(parsed_stage).generation_seeds
+        ),
         "length_quartile_rule": "floor(4 * rank / candidate_count)",
         "stratification_fields": [
             "leaf_topic",
@@ -472,8 +486,8 @@ def generate_random_schedules(
         "stratified_logical_sha256": sha256_int_rows(stratified),
         "parent_hashes": normalized_parents,
     }
-    if stage is not None:
-        manifest["stage"] = stage
+    if parsed_stage is not None:
+        manifest["stage"] = parsed_stage
     if output_directory is not None:
         root = Path(output_directory)
         root.mkdir(parents=True, exist_ok=True)
@@ -525,14 +539,14 @@ def load_random_schedules(
     selected_size = int(manifest["selected_size"])
     draws = int(manifest["draws"])
     stored_stage = manifest.get("stage")
+    parsed_stored_stage: StageKind | None = None
     if stored_stage is not None:
-        if isinstance(stored_stage, bool) or not isinstance(stored_stage, int):
-            raise ValueError("random schedule stage must be an integer")
-        layout = stage_layout(stored_stage)
+        parsed_stored_stage = parse_stage_kind(stored_stage)
+        profile = stage_profile(parsed_stored_stage)
         if (
-            candidate_count != len(layout.candidate_clean_positions)
-            or selected_size != layout.selected_size
-            or draws != layout.null_draws
+            candidate_count != profile.candidate_count
+            or selected_size != profile.selected_size
+            or draws != profile.null_draws
         ):
             raise ValueError("random schedule cardinalities differ from stage layout")
     candidate_ids_value = manifest.get("candidate_ids")
@@ -578,7 +592,11 @@ def load_random_schedules(
         "choice_replace": False,
         "choice_shuffle": False,
         "stored_order": "ascending_candidate_position",
-        "paired_target_seeds": list(KMEANS_SEEDS),
+        "paired_target_seeds": list(
+            KMEANS_SEEDS
+            if parsed_stored_stage is None
+            else stage_profile(parsed_stored_stage).generation_seeds
+        ),
         "length_quartile_rule": "floor(4 * rank / candidate_count)",
         "stratification_fields": [
             "leaf_topic",
@@ -700,11 +718,11 @@ def load_random_schedules(
     return RandomSchedules(arrays["uniform"], arrays["stratified"], manifest)
 
 
-def _infer_stage(candidate_count: int) -> int:
+def _infer_stage(candidate_count: int) -> StageKind:
     matches = [
         stage
-        for stage in (0, 1, 2)
-        if len(stage_layout(stage).candidate_clean_positions) == candidate_count
+        for stage in (0, 1, 2, EFFICACY_PILOT)
+        if stage_profile(stage).candidate_count == candidate_count
     ]
     if len(matches) != 1:
         raise ValueError(f"cannot infer stage from {candidate_count} candidate rows")
@@ -714,21 +732,23 @@ def _infer_stage(candidate_count: int) -> int:
 def _validate_vector_sets(
     vector_sets: Mapping[str, VectorSet],
     *,
+    representations: tuple[str, ...],
     candidate_ids: tuple[str, ...] | None,
     candidate_count: int,
     expected_vector_manifest_hashes: Mapping[str, str] | None,
 ) -> tuple[tuple[str, ...], dict[str, str]]:
-    if tuple(vector_sets.keys()) != EXPECTED_REPRESENTATIONS:
-        if set(vector_sets) != set(EXPECTED_REPRESENTATIONS):
-            missing = sorted(set(EXPECTED_REPRESENTATIONS) - set(vector_sets))
-            extra = sorted(set(vector_sets) - set(EXPECTED_REPRESENTATIONS))
+    if tuple(vector_sets.keys()) != representations:
+        if set(vector_sets) != set(representations):
+            missing = sorted(set(representations) - set(vector_sets))
+            extra = sorted(set(vector_sets) - set(representations))
             raise ValueError(
-                f"selector representations mismatch; missing={missing}, extra={extra}"
+                "selector representations mismatch; "
+                f"missing={missing}, unexpected={extra}"
             )
-        vector_sets = {name: vector_sets[name] for name in EXPECTED_REPRESENTATIONS}
+        vector_sets = {name: vector_sets[name] for name in representations}
     first_ids: tuple[str, ...] | None = candidate_ids
     actual_manifest_hashes: dict[str, str] = {}
-    for name in EXPECTED_REPRESENTATIONS:
+    for name in representations:
         vector_set = vector_sets[name]
         if not isinstance(vector_set, VectorSet):
             raise TypeError(f"selector input {name} must be a VectorSet")
@@ -772,9 +792,9 @@ def _validate_vector_sets(
     assert first_ids is not None
     if expected_vector_manifest_hashes is not None:
         expected = dict(expected_vector_manifest_hashes)
-        if set(expected) != set(EXPECTED_REPRESENTATIONS):
+        if set(expected) != set(representations):
             raise ValueError("expected vector manifest hash keys are incomplete")
-        for name in EXPECTED_REPRESENTATIONS:
+        for name in representations:
             _require_sha256(expected[name], f"expected {name} vector manifest hash")
             if expected[name] != actual_manifest_hashes[name]:
                 raise ValueError(f"{name} vector manifest hash mismatch")
@@ -802,7 +822,7 @@ def _selection_file_record(path: Path, logical_hash: str) -> dict[str, object]:
 def run_selection(
     vector_sets: Mapping[str, VectorSet],
     *,
-    stage: int | None = None,
+    stage: str | int | None = None,
     candidate_rows: Sequence[Mapping[str, object]] | None = None,
     reference_repo: Path = Path("/home/mchen/prismatic-synthesis-reference"),
     output_directory: Path | None = None,
@@ -817,10 +837,11 @@ def run_selection(
     if not isinstance(first_vector, VectorSet):
         raise TypeError("selector inputs must be VectorSet objects")
     candidate_count = len(first_vector.stable_ids)
-    if stage is not None and (isinstance(stage, bool) or not isinstance(stage, int)):
-        raise ValueError("selector stage must be an integer")
-    selected_stage = _infer_stage(candidate_count) if stage is None else stage
+    selected_stage = (
+        _infer_stage(candidate_count) if stage is None else parse_stage_kind(stage)
+    )
     layout = stage_layout(selected_stage)
+    representations = expected_representations(selected_stage)
     if candidate_count != len(layout.candidate_clean_positions):
         raise ValueError("vector candidate count differs from the selected stage layout")
     if candidate_rows is None:
@@ -832,11 +853,12 @@ def run_selection(
         )
     stable_ids, actual_manifest_hashes = _validate_vector_sets(
         vector_sets,
+        representations=representations,
         candidate_ids=candidate_ids,
         candidate_count=candidate_count,
         expected_vector_manifest_hashes=expected_vector_manifest_hashes,
     )
-    vector_sets = {name: vector_sets[name] for name in EXPECTED_REPRESENTATIONS}
+    vector_sets = {name: vector_sets[name] for name in representations}
     normalized_parents = _normalize_parent_hashes(parent_hashes)
 
     if fake_cluster_manager is None:
@@ -868,19 +890,22 @@ def run_selection(
     if root is not None:
         root.mkdir(parents=True, exist_ok=True)
     run_index = 0
-    for representation in EXPECTED_REPRESENTATIONS:
+    for representation in representations:
         vectors = np.ascontiguousarray(
             np.asarray(vector_sets[representation].vectors), dtype=np.float32
         )
         tensor = torch.from_numpy(vectors)
         for ratio, expected_k, ratio_name in ratios_and_k:
             derived_k = max(2, min(candidate_count, math.floor(ratio * candidate_count)))
-            if derived_k != expected_k:
+            if selected_stage != EFFICACY_PILOT and derived_k != expected_k:
                 raise ValueError("stage K does not match ratio-derived cardinality")
+            effective_ratio = (
+                ratio if derived_k == expected_k else expected_k / candidate_count
+            )
             for kmeans_seed in KMEANS_SEEDS:
                 labels64 = cluster_official(
                     tensor,
-                    ratio=ratio,
+                    ratio=effective_ratio,
                     iterations=CLUSTER_ITERATIONS,
                     seed=kmeans_seed,
                     reference_repo=Path(reference_repo),
@@ -922,6 +947,11 @@ def run_selection(
                     "k": expected_k,
                     "kmeans_seed": kmeans_seed,
                     "round_robin_seed": ROUND_ROBIN_SEED,
+                    **(
+                        {"effective_cluster_ratio": effective_ratio}
+                        if selected_stage == EFFICACY_PILOT
+                        else {}
+                    ),
                     "labels_logical_sha256": sha256_int_rows(
                         labels.reshape(1, -1)
                     ),
@@ -951,7 +981,7 @@ def run_selection(
         "selected_size": layout.selected_size,
         "candidate_ids": list(stable_ids),
         "candidate_ids_sha256": sha256_id_lines(stable_ids),
-        "representations": list(EXPECTED_REPRESENTATIONS),
+        "representations": list(representations),
         "representation_vector_manifest_sha256": actual_manifest_hashes,
         "cluster_ratios": [PRIMARY_RATIO, DIAGNOSTIC_RATIO],
         "k_values": [layout.primary_k, layout.diagnostic_k],
@@ -981,7 +1011,7 @@ def run_selection(
     if root is not None:
         write_or_validate_manifest(root / SELECTION_MANIFEST_FILE, manifest)
     return SelectionBundle(
-        representations=EXPECTED_REPRESENTATIONS,
+        representations=representations,
         stable_ids=stable_ids,
         selected_positions=selected_positions,
         labels=labels_by_key,
@@ -994,15 +1024,14 @@ def run_selection(
 
 def _validate_selection_manifest_header(
     manifest: Mapping[str, object],
-) -> tuple[int, int, int, tuple[str, ...]]:
+) -> tuple[StageKind, int, int, tuple[str, ...]]:
     if manifest.get("schema_version") != 1 or manifest.get("artifact_type") != (
         "opd_proxy_selection_bundle"
     ):
         raise ValueError("invalid selection bundle manifest contract")
-    stage = manifest.get("stage")
-    if isinstance(stage, bool) or not isinstance(stage, int):
-        raise ValueError("selection stage must be an integer")
+    stage = parse_stage_kind(manifest.get("stage"))
     layout = stage_layout(stage)
+    representations = expected_representations(stage)
     candidate_count = len(layout.candidate_clean_positions)
     if manifest.get("candidate_count") != candidate_count:
         raise ValueError("selection candidate count differs from stage layout")
@@ -1018,7 +1047,7 @@ def _validate_selection_manifest_header(
         raise ValueError("selection round-robin seed differs from fixed contract")
     if manifest.get("cluster_iterations") != CLUSTER_ITERATIONS:
         raise ValueError("selection iteration count differs from official contract")
-    if manifest.get("representations") != list(EXPECTED_REPRESENTATIONS):
+    if manifest.get("representations") != list(representations):
         raise ValueError("selection representations differ from fixed contract")
     candidate_ids_value = manifest.get("candidate_ids")
     if not isinstance(candidate_ids_value, list) or any(
@@ -1045,15 +1074,15 @@ def load_selection_bundle(
     stage, candidate_count, selected_size, candidate_ids = (
         _validate_selection_manifest_header(manifest)
     )
-    del stage
+    representations = expected_representations(stage)
     if expected_candidate_ids is not None and tuple(expected_candidate_ids) != candidate_ids:
         raise ValueError("selection candidate IDs differ from expected order")
     vector_hashes = manifest.get("representation_vector_manifest_sha256")
     if not isinstance(vector_hashes, dict) or set(vector_hashes) != set(
-        EXPECTED_REPRESENTATIONS
+        representations
     ):
         raise ValueError("selection vector manifest hash coverage is incomplete")
-    for name in EXPECTED_REPRESENTATIONS:
+    for name in representations:
         _require_sha256(vector_hashes[name], f"selection {name} vector manifest hash")
     if expected_vector_manifest_hashes is not None and dict(
         expected_vector_manifest_hashes
@@ -1083,13 +1112,13 @@ def load_selection_bundle(
         raise ValueError("selection official reference provenance mismatch")
 
     records = manifest.get("runs")
-    expected_run_count = len(EXPECTED_REPRESENTATIONS) * 2 * len(KMEANS_SEEDS)
+    expected_run_count = len(representations) * 2 * len(KMEANS_SEEDS)
     if not isinstance(records, list) or len(records) != expected_run_count:
         raise ValueError("selection run coverage is incomplete")
-    layout = stage_layout(int(manifest["stage"]))
+    layout = stage_layout(stage)
     expected_specs = [
         (representation, ratio, k, ratio_name, seed)
-        for representation in EXPECTED_REPRESENTATIONS
+        for representation in representations
         for ratio, k, ratio_name in (
             (PRIMARY_RATIO, layout.primary_k, "primary"),
             (DIAGNOSTIC_RATIO, layout.diagnostic_k, "diagnostic"),
@@ -1168,7 +1197,7 @@ def load_selection_bundle(
     if discovered != listed_files:
         raise ValueError("selection directory has missing or unlisted array artifacts")
     return SelectionBundle(
-        representations=EXPECTED_REPRESENTATIONS,
+        representations=representations,
         stable_ids=candidate_ids,
         selected_positions=selected_positions,
         labels=labels_by_key,
@@ -1180,6 +1209,10 @@ def load_selection_bundle(
 
 
 def selection_vector_id(representation: str, stable_id: str) -> str:
+    if representation == "P_pilot":
+        return f"P_pilot:{stable_id}:seed=42"
+    if representation == "T_pilot":
+        return f"T_pilot:{stable_id}:seed=42"
     if representation.startswith("P_n1:"):
         match = re.fullmatch(r"P_n1:seed=(42|43):slot=([0-3])", representation)
         if match is None:
@@ -1330,14 +1363,18 @@ def _read_stage_inputs(stage_directory: Path) -> tuple[dict[str, object], list[d
     return manifest, rows
 
 
-def _parse_vector_specs(values: Sequence[str]) -> dict[str, list[Path]]:
+def _parse_vector_specs(
+    values: Sequence[str],
+    expected: Sequence[str] = EXPECTED_REPRESENTATIONS,
+) -> dict[str, list[Path]]:
+    expected_names = tuple(expected)
     specs: dict[str, list[Path]] = {}
     for value in values:
         name, separator, path = value.rpartition("=")
-        if separator != "=" or name not in EXPECTED_REPRESENTATIONS or not path:
+        if separator != "=" or name not in expected_names or not path:
             raise ValueError("--vector must be REPRESENTATION=VECTOR_DIRECTORY")
         specs.setdefault(name, []).append(Path(path))
-    if set(specs) != set(EXPECTED_REPRESENTATIONS):
+    if set(specs) != set(expected_names):
         raise ValueError("--vector specifications must cover all representations")
     return specs
 
@@ -1357,14 +1394,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     stage_manifest, rows = _read_stage_inputs(args.stage_directory)
-    stage = int(stage_manifest["stage"])
+    stage = parse_stage_kind(stage_manifest["stage"])
+    representations = expected_representations(stage)
     candidate_count = int(stage_manifest["candidate_count"])
     candidate_rows = rows[:candidate_count]
     candidate_ids = [str(row["stable_id"]) for row in candidate_rows]
-    specs = _parse_vector_specs(args.vector)
+    specs = _parse_vector_specs(args.vector, representations)
     source_cache: dict[Path, VectorSet] = {}
     vectors: dict[str, VectorSet] = {}
-    for name in EXPECTED_REPRESENTATIONS:
+    for name in representations:
         sources: list[VectorSet] = []
         for declared_path in specs[name]:
             source_path = declared_path.resolve()
@@ -1421,6 +1459,7 @@ __all__ = [
     "SelectionBundle",
     "build_length_quartiles",
     "build_selection_vector_view",
+    "expected_representations",
     "generate_random_schedules",
     "largest_remainder_allocation",
     "load_random_schedules",
