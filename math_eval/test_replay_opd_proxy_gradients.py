@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 
+from math_eval.opd_proxy_gradient_stage_profiles import EFFICACY_PILOT
 from math_eval.opd_proxy_gradient_projection import (
     ProjectionConfig,
     project_full_gradient,
@@ -28,8 +29,10 @@ from math_eval.replay_opd_proxy_gradients import (
     compute_replay_loss,
     flatten_float32_gradients,
     load_capture_trajectories,
+    pilot_vector_id,
     proxy_group_vector_id,
     proxy_vector_id,
+    replay_pilot_trajectory,
     replay_proxy_group,
     replay_proxy_trajectory,
     replay_target_group,
@@ -240,6 +243,53 @@ def test_proxy_vector_ids_encode_seed_slot_and_aggregation():
     assert proxy_vector_id("q7", 43, rollout_slot=2) == "P:q7:seed=43:slot=2:n1"
     assert proxy_group_vector_id("q7", 43) == "P:q7:seed=43:n4"
     assert target_group_vector_id("q7", 42) == "T:q7:seed=42:n4"
+
+
+def test_pilot_single_trajectory_replay_has_dedicated_proxy_and_target_identity():
+    trajectory = _trajectory(0)
+    actor = ToyReplayActor()
+    projector = LinearProjector(build_parameter_layout(actor.actor_module).total_numel)
+
+    proxy = replay_pilot_trajectory(
+        actor, trajectory, projector, pair="proxy"
+    )
+    target = replay_pilot_trajectory(
+        actor, trajectory, projector, pair="target"
+    )
+
+    assert proxy.representation == "P_pilot"
+    assert target.representation == "T_pilot"
+    assert proxy.aggregation == target.aggregation == "single_trajectory"
+    assert proxy.rollout_slot == target.rollout_slot == 0
+    assert proxy.vector_id == "P_pilot:q0:seed=42"
+    assert target.vector_id == "T_pilot:q0:seed=42"
+    torch.testing.assert_close(proxy.projected_gradient, target.projected_gradient)
+    assert pilot_vector_id("proxy", "q0", 42) == proxy.vector_id
+    assert pilot_vector_id("target", "q0", 42) == target.vector_id
+    assert "n4" not in proxy.vector_id + target.vector_id
+
+    with pytest.raises(ValueError, match="seed 42 slot 0"):
+        replay_pilot_trajectory(
+            actor, _trajectory(1), projector, pair="proxy"
+        )
+    with pytest.raises(ValueError, match="target or proxy"):
+        replay_pilot_trajectory(actor, trajectory, projector, pair="other")
+
+
+def test_pilot_capture_groups_require_exactly_one_slot_zero_trajectory():
+    groups = replay_module._group_capture_trajectories(
+        [_trajectory(0)], native_rollouts=1
+    )
+    assert len(groups) == 1
+    assert groups[0][0].rollout_slot == 0
+    with pytest.raises(ValueError, match="exact rollout slots.*0"):
+        replay_module._group_capture_trajectories(
+            [_trajectory(1)], native_rollouts=1
+        )
+    with pytest.raises(ValueError, match="exactly 1"):
+        replay_module._group_capture_trajectories(
+            list(_trajectories()), native_rollouts=1
+        )
 
 
 def test_proxy_group_norm_and_projection_use_mean_full_gradient():
@@ -506,6 +556,121 @@ def test_production_replay_shard_wires_capture_group_actor_and_projector(
     assert loaded.vector_ids == (target_group_vector_id("q0", 42),)
     assert loaded.manifest["metadata"]["pair"] == "target"
     assert loaded.manifest["metadata"]["parameter_layout"]["total_numel"] == 2
+
+
+@pytest.mark.parametrize(
+    ("pair", "expected_representation"),
+    (("proxy", "P_pilot"), ("target", "T_pilot")),
+)
+def test_pilot_production_replay_shard_emits_one_single_trajectory_vector(
+    monkeypatch, tmp_path: Path, pair: str, expected_representation: str
+):
+    capture_root = tmp_path / f"capture-{pair}"
+    capture_root.mkdir()
+    (capture_root / "manifest.json").write_bytes(
+        canonical_json_bytes(
+            {
+                "sampling_args": {"n": 1},
+                "parent_hashes": {"algorithm_contract_sha256": "9" * 64},
+            }
+        )
+    )
+    capture_hash = sha256_file(capture_root / "manifest.json")
+    trajectory = replace(_trajectory(0), source_capture_sha256=capture_hash)
+    actor = ToyReplayActor()
+    projector = LinearProjector(build_parameter_layout(actor.actor_module).total_numel)
+    source_snapshot_path = tmp_path / "source_snapshot.json"
+    source_snapshot_path.write_bytes(
+        canonical_json_bytes({"manifest_sha256": "2" * 64})
+    )
+    monkeypatch.setattr(
+        replay_module, "load_capture_trajectories", lambda path: (trajectory,)
+    )
+    monkeypatch.setattr(replay_module, "load_replay_actor", lambda *args, **kwargs: actor)
+    monkeypatch.setattr(
+        replay_module, "verify_prismatic_reference", lambda path: object()
+    )
+    monkeypatch.setattr(
+        replay_module, "construct_cuda_projector", lambda *args, **kwargs: projector
+    )
+    monkeypatch.setattr(
+        replay_module,
+        "build_projection_manifest",
+        lambda **kwargs: {"dimension": 1024},
+    )
+    monkeypatch.setattr(
+        replay_module,
+        "repository_state",
+        lambda path: {
+            "head": "3" * 40,
+            "status": "",
+            "status_sha256": "4" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        replay_module,
+        "build_runtime_metadata",
+        lambda profile: {"runtime_profile": profile},
+    )
+
+    loaded = run_capture_replay_shard(
+        capture_root=capture_root,
+        model_path=tmp_path / "model",
+        output_directory=tmp_path / f"vectors-{pair}",
+        pair=pair,
+        num_shards=1,
+        shard_index=0,
+        expected_model_sha256="1" * 64,
+        source_snapshot_path=source_snapshot_path,
+        reference_repo=tmp_path / "reference",
+        repository_root=tmp_path,
+        expected_stage=EFFICACY_PILOT,
+        chunk_size=1,
+    )
+
+    assert loaded.vector_ids == (pilot_vector_id(pair, "q0", 42),)
+    assert loaded.manifest["representation"] == expected_representation
+    assert loaded.manifest["metadata"]["stage"] == EFFICACY_PILOT
+    assert loaded.manifest["metadata"]["native_rollouts"] == 1
+
+
+def test_pilot_replay_shard_rejects_n4_capture_before_model_load(
+    monkeypatch, tmp_path: Path
+):
+    capture_root = tmp_path / "capture"
+    capture_root.mkdir()
+    (capture_root / "manifest.json").write_bytes(
+        canonical_json_bytes(
+            {
+                "sampling_args": {"n": 4},
+                "parent_hashes": {"algorithm_contract_sha256": "9" * 64},
+            }
+        )
+    )
+    source_snapshot_path = tmp_path / "source_snapshot.json"
+    source_snapshot_path.write_bytes(
+        canonical_json_bytes({"manifest_sha256": "2" * 64})
+    )
+    monkeypatch.setattr(
+        replay_module,
+        "load_replay_actor",
+        lambda *args, **kwargs: pytest.fail("model loaded before identity validation"),
+    )
+    with pytest.raises(ValueError, match="native rollout count"):
+        run_capture_replay_shard(
+            capture_root=capture_root,
+            model_path=tmp_path / "model",
+            output_directory=tmp_path / "vectors",
+            pair="proxy",
+            num_shards=1,
+            shard_index=0,
+            expected_model_sha256="1" * 64,
+            source_snapshot_path=source_snapshot_path,
+            reference_repo=tmp_path / "reference",
+            repository_root=tmp_path,
+            expected_stage=EFFICACY_PILOT,
+            chunk_size=1,
+        )
 
 
 def _vector(index: int, *, stable_id: str = "q0") -> ReplayVector:

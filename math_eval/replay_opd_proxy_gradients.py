@@ -17,6 +17,11 @@ import torch
 from safetensors.torch import load_file as load_safetensors
 
 from math_eval.deepmath_gradient_diversity import official_shard_bounds
+from math_eval.opd_proxy_gradient_stage_profiles import (
+    EFFICACY_PILOT,
+    parse_stage_kind,
+    stage_profile,
+)
 from math_eval.opd_proxy_gradient_projection import (
     PROJECTION_LINEARITY_ATOL,
     PROJECTION_LINEARITY_RTOL,
@@ -688,13 +693,24 @@ def _zero_grad(actor) -> None:
 
 
 def _validate_group(
-    trajectories: Sequence[ReplayTrajectory],
+    trajectories: Sequence[ReplayTrajectory], native_rollouts: int = 4
 ) -> tuple[ReplayTrajectory, ...]:
-    if not isinstance(trajectories, Sequence) or len(trajectories) != 4:
-        raise ValueError("replay group requires exactly rollout slots 0,1,2,3")
+    if (
+        isinstance(native_rollouts, bool)
+        or not isinstance(native_rollouts, int)
+        or native_rollouts <= 0
+    ):
+        raise ValueError("native_rollouts must be a positive integer")
+    if not isinstance(trajectories, Sequence) or len(trajectories) != native_rollouts:
+        raise ValueError(
+            f"replay group requires exactly {native_rollouts} trajectory slots"
+        )
     ordered = tuple(sorted(trajectories, key=lambda row: row.rollout_slot))
-    if tuple(row.rollout_slot for row in ordered) != (0, 1, 2, 3):
-        raise ValueError("replay group must contain exact unique rollout slots 0,1,2,3")
+    expected_slots = tuple(range(native_rollouts))
+    if tuple(row.rollout_slot for row in ordered) != expected_slots:
+        raise ValueError(
+            f"replay group must contain exact rollout slots {expected_slots}"
+        )
     stable_ids = {row.stable_id for row in ordered}
     if len(stable_ids) != 1:
         raise ValueError("replay group stable IDs do not agree")
@@ -740,6 +756,13 @@ def proxy_group_vector_id(stable_id: str, engine_seed: int) -> str:
 
 def target_group_vector_id(stable_id: str, engine_seed: int) -> str:
     return f"T:{stable_id}:seed={engine_seed}:n4"
+
+
+def pilot_vector_id(pair: str, stable_id: str, engine_seed: int) -> str:
+    if pair not in {"target", "proxy"}:
+        raise ValueError("pilot vector pair must be target or proxy")
+    prefix = "T_pilot" if pair == "target" else "P_pilot"
+    return f"{prefix}:{stable_id}:seed={engine_seed}"
 
 
 def _make_vector(
@@ -788,11 +811,16 @@ def _make_vector(
     )
 
 
-def _replay_proxy_one(
+def _replay_one(
     actor,
     trajectory: ReplayTrajectory,
     projector,
     config: ProjectionConfig,
+    *,
+    vector_id: str,
+    representation: str,
+    aggregation: str,
+    rollout_slot: int | None,
 ) -> _TrajectoryReplay:
     validate_replay_trajectory_integrity(trajectory)
     verify_captured_actor_log_prob(actor, trajectory)
@@ -805,6 +833,32 @@ def _replay_proxy_one(
     projected = project_full_gradient(projector, full_gradient, config).squeeze(0)
     diagnostics = _trajectory_diagnostics(replay_loss, trajectory)
     vector = _make_vector(
+        vector_id=vector_id,
+        representation=representation,
+        aggregation=aggregation,
+        trajectory=trajectory,
+        projected_gradient=projected,
+        full_gradient_norm=norm,
+        diagnostics=diagnostics,
+        rollout_slot=rollout_slot,
+        verifier_correct_count=trajectory.verifier_correct_count,
+        verifier_total=trajectory.verifier_total,
+    )
+    _zero_grad(actor)
+    return _TrajectoryReplay(replay_loss, full_gradient, vector)
+
+
+def _replay_proxy_one(
+    actor,
+    trajectory: ReplayTrajectory,
+    projector,
+    config: ProjectionConfig,
+) -> _TrajectoryReplay:
+    return _replay_one(
+        actor,
+        trajectory,
+        projector,
+        config,
         vector_id=proxy_vector_id(
             trajectory.stable_id,
             trajectory.engine_seed,
@@ -812,16 +866,35 @@ def _replay_proxy_one(
         ),
         representation="P",
         aggregation="n1",
-        trajectory=trajectory,
-        projected_gradient=projected,
-        full_gradient_norm=norm,
-        diagnostics=diagnostics,
         rollout_slot=trajectory.rollout_slot,
-        verifier_correct_count=trajectory.verifier_correct_count,
-        verifier_total=trajectory.verifier_total,
     )
-    _zero_grad(actor)
-    return _TrajectoryReplay(replay_loss, full_gradient, vector)
+
+
+def replay_pilot_trajectory(
+    actor,
+    trajectory: ReplayTrajectory,
+    projector,
+    *,
+    pair: str,
+    config: ProjectionConfig = ProjectionConfig(),
+) -> ReplayVector:
+    if pair not in {"target", "proxy"}:
+        raise ValueError("pilot replay pair must be target or proxy")
+    if trajectory.engine_seed != 42 or trajectory.rollout_slot != 0:
+        raise ValueError("efficacy_pilot replay requires seed 42 slot 0")
+    representation = "T_pilot" if pair == "target" else "P_pilot"
+    return _replay_one(
+        actor,
+        trajectory,
+        projector,
+        config,
+        vector_id=pilot_vector_id(
+            pair, trajectory.stable_id, trajectory.engine_seed
+        ),
+        representation=representation,
+        aggregation="single_trajectory",
+        rollout_slot=0,
+    ).vector
 
 
 def replay_proxy_trajectory(
@@ -1577,7 +1650,7 @@ def load_replay_actor(
 
 
 def _group_capture_trajectories(
-    trajectories: Sequence[ReplayTrajectory],
+    trajectories: Sequence[ReplayTrajectory], *, native_rollouts: int = 4
 ) -> tuple[tuple[ReplayTrajectory, ...], ...]:
     groups: list[tuple[ReplayTrajectory, ...]] = []
     current: list[ReplayTrajectory] = []
@@ -1585,12 +1658,12 @@ def _group_capture_trajectories(
     for trajectory in trajectories:
         key = (trajectory.stable_id, trajectory.engine_seed)
         if current_key is not None and key != current_key:
-            groups.append(_validate_group(current))
+            groups.append(_validate_group(current, native_rollouts))
             current = []
         current_key = key
         current.append(trajectory)
     if current:
-        groups.append(_validate_group(current))
+        groups.append(_validate_group(current, native_rollouts))
     if not groups:
         raise ValueError("capture contains no replay trajectory groups")
     group_keys = [(group[0].stable_id, group[0].engine_seed) for group in groups]
@@ -1611,14 +1684,47 @@ def run_capture_replay_shard(
     source_snapshot_path: Path,
     reference_repo: Path,
     repository_root: Path,
+    expected_stage: str | int | None = None,
     chunk_size: int = 16,
     exercise_interrupt_after_chunks: int | None = None,
 ) -> VectorSet:
     """Run one production replay shard from a completed capture root."""
     if pair not in {"target", "proxy"}:
         raise ValueError("replay pair must be target or proxy")
+    parsed_stage = None if expected_stage is None else parse_stage_kind(expected_stage)
+    native_rollouts = 4
+    algorithm_hash: str | None = None
+    if parsed_stage is not None:
+        profile = stage_profile(parsed_stage)
+        capture_manifest = _read_canonical_json(
+            Path(capture_root) / "manifest.json", "capture manifest"
+        )
+        sampling_args = capture_manifest.get("sampling_args")
+        captured_n = (
+            sampling_args.get("n") if isinstance(sampling_args, Mapping) else None
+        )
+        if captured_n != profile.native_rollouts:
+            raise ValueError(
+                "capture native rollout count differs from expected stage contract"
+            )
+        native_rollouts = profile.native_rollouts
+        if parsed_stage == EFFICACY_PILOT:
+            parents = capture_manifest.get("parent_hashes")
+            algorithm_hash = (
+                parents.get("algorithm_contract_sha256")
+                if isinstance(parents, Mapping)
+                else None
+            )
+            if not isinstance(algorithm_hash, str) or _SHA256_RE.fullmatch(
+                algorithm_hash
+            ) is None:
+                raise ValueError(
+                    "efficacy_pilot capture lacks algorithm contract identity"
+                )
     trajectories = load_capture_trajectories(capture_root)
-    groups = _group_capture_trajectories(trajectories)
+    groups = _group_capture_trajectories(
+        trajectories, native_rollouts=native_rollouts
+    )
     start, end = official_shard_bounds(len(groups), num_shards, shard_index)
     if start >= end:
         raise ValueError("replay shard has no trajectory groups")
@@ -1665,6 +1771,8 @@ def run_capture_replay_shard(
         "model_manifest_sha256": expected_model_sha256,
         "source_snapshot_sha256": source_snapshot_hash,
     }
+    if algorithm_hash is not None:
+        parent_hashes["algorithm_contract_sha256"] = algorithm_hash
     layout_metadata = {
         "total_numel": layout.total_numel,
         "sha256": layout.sha256,
@@ -1689,7 +1797,19 @@ def run_capture_replay_shard(
 
     cached_group_index: int | None = None
     cached_records: tuple[ReplayVector, ...] = ()
-    if pair == "target":
+    if parsed_stage == EFFICACY_PILOT:
+        expected_vector_ids = tuple(
+            pilot_vector_id(pair, group[0].stable_id, group[0].engine_seed)
+            for group in shard_groups
+        )
+
+        def record_factory(index: int) -> ReplayVector:
+            return replay_pilot_trajectory(
+                actor, shard_groups[index][0], projector, pair=pair
+            )
+
+        representation = "T_pilot" if pair == "target" else "P_pilot"
+    elif pair == "target":
         expected_vector_ids = tuple(
             target_group_vector_id(group[0].stable_id, group[0].engine_seed)
             for group in shard_groups
@@ -1747,6 +1867,11 @@ def run_capture_replay_shard(
             "shard_index": shard_index,
             "group_start": start,
             "group_end": end,
+            **(
+                {"stage": parsed_stage, "native_rollouts": native_rollouts}
+                if parsed_stage is not None
+                else {}
+            ),
             "projection": projection_manifest,
             "parameter_layout": layout_metadata,
             "replay_actor": {
@@ -1784,6 +1909,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-snapshot", type=Path, required=True)
     parser.add_argument("--reference-repo", type=Path, required=True)
     parser.add_argument("--repository-root", type=Path, default=Path.cwd())
+    parser.add_argument("--expected-stage", type=parse_stage_kind)
     parser.add_argument("--chunk-size", type=int, default=16)
     parser.add_argument(
         "--exercise-interrupt-after-chunks",
@@ -1806,6 +1932,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         source_snapshot_path=args.source_snapshot,
         reference_repo=args.reference_repo,
         repository_root=args.repository_root,
+        expected_stage=args.expected_stage,
         chunk_size=args.chunk_size,
         exercise_interrupt_after_chunks=args.exercise_interrupt_after_chunks,
     )
@@ -1825,8 +1952,10 @@ __all__ = [
     "flatten_float32_gradients",
     "load_capture_trajectories",
     "load_replay_actor",
+    "pilot_vector_id",
     "proxy_group_vector_id",
     "proxy_vector_id",
+    "replay_pilot_trajectory",
     "replay_proxy_group",
     "replay_proxy_trajectory",
     "replay_target_group",
