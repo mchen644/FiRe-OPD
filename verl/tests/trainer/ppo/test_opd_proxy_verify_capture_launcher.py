@@ -428,6 +428,7 @@ def test_capture_finalizer_binds_rank_hashes_and_generation_provenance(
     )
 
     assert result == {"complete": True}
+    assert seen["native_rollouts"] == 4
     assert seen["expected_keys"] == keys
     assert seen["actor_rank_expected_keys"] == {
         0: list(keys[:4]),
@@ -781,6 +782,18 @@ def test_actor_capture_computes_but_never_publishes_internal_padding(
         return None, current, {}
 
     actor._forward_micro_batch = fake_forward
+    observed_native_rollouts = []
+    original_attach_and_validate_keys = actor_module.attach_and_validate_keys
+
+    def recording_attach_and_validate_keys(*args, **kwargs):
+        observed_native_rollouts.append(kwargs["native_rollouts"])
+        return original_attach_and_validate_keys(*args, **kwargs)
+
+    monkeypatch.setattr(
+        actor_module,
+        "attach_and_validate_keys",
+        recording_attach_and_validate_keys,
+    )
     monkeypatch.setattr(actor_module, "get_device_id", lambda: torch.device("cpu"))
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 3)
     data = _actor_capture_data(tmp_path)
@@ -810,6 +823,7 @@ def test_actor_capture_computes_but_never_publishes_internal_padding(
     calls.clear()
     method(actor, data)
     assert calls == ["q0", "padding-q0"]
+    assert observed_native_rollouts == [1, 1]
     assert not (tmp_path / "actor/rank_3/chunk_1_2.safetensors").exists()
 
 

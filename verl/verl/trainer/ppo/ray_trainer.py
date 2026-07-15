@@ -1821,6 +1821,7 @@ class RayPPOTrainer:
         }
         return finalize_capture_seed(
             Path(contract["output_root"]),
+            native_rollouts=contract["native_rollouts"],
             expected_keys=keys,
             actor_rank_expected_keys=rank_keys,
             parent_hashes=parent_hashes,

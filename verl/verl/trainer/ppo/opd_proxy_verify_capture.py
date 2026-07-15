@@ -1110,6 +1110,7 @@ def _validate_hash_group(seed_manifest: Mapping[str, object], field: str) -> dic
 def finalize_capture_seed(
     seed_root: Path,
     *,
+    native_rollouts: int,
     expected_keys: Sequence[TrajectoryKey],
     actor_rank_expected_keys: Mapping[int, Sequence[TrajectoryKey]],
     parent_hashes: Mapping[str, object],
@@ -1119,11 +1120,12 @@ def finalize_capture_seed(
 ) -> dict[str, object]:
     """Validate global coverage and publish immutable COMPLETE markers."""
     root = Path(seed_root)
+    rollout_count = _require_positive_int(native_rollouts, "native_rollouts")
     expected = tuple(expected_keys)
     validate_exact_key_coverage(expected, expected)
     if not expected:
         raise ValueError("capture seed requires at least one trajectory")
-    _validate_exact_rollout_slots(expected, 4)
+    _validate_exact_rollout_slots(expected, rollout_count)
     parents = _normalize_hashes(parent_hashes, "parent_hashes")
     before = _require_sha256(
         actor_parameter_sha256_before, "actor_parameter_sha256_before"
@@ -1156,8 +1158,10 @@ def finalize_capture_seed(
     engine_seeds = {key.engine_seed for key in expected}
     if len(engine_seeds) != 1 or engine_args.get("seed") != next(iter(engine_seeds)):
         raise ValueError("seed manifest engine seed mismatch")
-    if sampling_args.get("n") != 4:
-        raise ValueError("seed manifest sampling n must equal 4")
+    if sampling_args.get("n") != rollout_count:
+        raise ValueError(
+            "seed manifest sampling n must equal the native rollout count"
+        )
     prompt_ids = list(dict.fromkeys(key.stable_id for key in expected))
     if seed_manifest.get("ordered_prompt_keys_sha256") != sha256_id_lines(prompt_ids):
         raise ValueError("seed manifest ordered prompt-key hash mismatch")

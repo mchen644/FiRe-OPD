@@ -659,12 +659,14 @@ def test_resume_rejects_sidecar_tensor_row_count_mismatch(tmp_path: Path):
         )
 
 
-def _seed_manifest(keys: tuple[TrajectoryKey, ...]):
+def _seed_manifest(
+    keys: tuple[TrajectoryKey, ...], *, native_rollouts: int = 4
+):
     prompt_ids = list(dict.fromkeys(key.stable_id for key in keys))
     return {
         "vllm_version": "0.8.5",
         "engine_args": {"seed": 42, "tensor_parallel_size": 1},
-        "sampling_args": {"n": 4, "temperature": 1.0},
+        "sampling_args": {"n": native_rollouts, "temperature": 1.0},
         "ordered_prompt_keys_sha256": sha256_id_lines(prompt_ids),
         "returned_compound_keys_sha256": trajectory_keys_sha256(keys),
         "model_hashes": {"student": "1" * 64, "teacher": "2" * 64},
@@ -688,6 +690,7 @@ def test_finalize_rejects_compound_keys_without_four_slots_per_question(
     with pytest.raises(ValueError, match="exact rollout slots"):
         finalize_capture_seed(
             tmp_path,
+            native_rollouts=4,
             expected_keys=malformed,
             actor_rank_expected_keys={0: malformed},
             parent_hashes=PARENT_HASHES,
@@ -695,6 +698,44 @@ def test_finalize_rejects_compound_keys_without_four_slots_per_question(
             actor_parameter_sha256_after="d" * 64,
             seed_manifest=_seed_manifest(malformed),
         )
+
+
+def test_finalize_accepts_pilot_single_slot_contract(tmp_path: Path):
+    keys = (
+        TrajectoryKey("q0", 42, 0),
+        TrajectoryKey("q1", 42, 0),
+    )
+    for subtree in ("rollout", "trainer_boundary"):
+        write_tensor_chunks_atomic(
+            tmp_path / subtree,
+            tensors=_tensors(2),
+            sidecar_rows=_rows(keys),
+            parent_hashes=PARENT_HASHES,
+            chunk_size=2,
+        )
+    rank_keys = {0: keys[:1], 1: keys[1:]}
+    for rank, local_keys in rank_keys.items():
+        write_tensor_chunks_atomic(
+            tmp_path / f"actor/rank_{rank}",
+            tensors=_tensors(1, offset=rank),
+            sidecar_rows=_rows(local_keys, offset=rank),
+            parent_hashes=PARENT_HASHES,
+            chunk_size=1,
+        )
+
+    manifest = finalize_capture_seed(
+        tmp_path,
+        native_rollouts=1,
+        expected_keys=keys,
+        actor_rank_expected_keys=rank_keys,
+        parent_hashes=PARENT_HASHES,
+        actor_parameter_sha256_before="d" * 64,
+        actor_parameter_sha256_after="d" * 64,
+        seed_manifest=_seed_manifest(keys, native_rollouts=1),
+    )
+
+    assert manifest["expected_trajectory_count"] == 2
+    assert manifest["sampling_args"]["n"] == 1
 
 
 def test_finalize_requires_exact_coverage_one_call_and_unchanged_actor(
@@ -726,6 +767,7 @@ def test_finalize_requires_exact_coverage_one_call_and_unchanged_actor(
     digest = "d" * 64
     manifest = finalize_capture_seed(
         tmp_path,
+        native_rollouts=4,
         expected_keys=keys,
         actor_rank_expected_keys=rank_keys,
         parent_hashes=PARENT_HASHES,
@@ -753,6 +795,7 @@ def test_finalize_requires_exact_coverage_one_call_and_unchanged_actor(
     with pytest.raises(ValueError, match="actor parameter hash changed"):
         finalize_capture_seed(
             tmp_path,
+            native_rollouts=4,
             expected_keys=keys,
             actor_rank_expected_keys=rank_keys,
             parent_hashes=PARENT_HASHES,
@@ -764,6 +807,7 @@ def test_finalize_requires_exact_coverage_one_call_and_unchanged_actor(
     with pytest.raises(ValueError, match="exactly one generation call"):
         finalize_capture_seed(
             tmp_path,
+            native_rollouts=4,
             expected_keys=keys,
             actor_rank_expected_keys=rank_keys,
             parent_hashes=PARENT_HASHES,

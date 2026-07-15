@@ -1179,7 +1179,7 @@ class DataParallelPPOActor(BasePPOActor):
         data, local_keys = attach_and_validate_keys(
             data,
             engine_seed=engine_seed,
-            native_rollouts=4,
+            native_rollouts=int(self.config.rollout_n),
             require_complete_slots=False,
         )
         real_keys = local_keys[:real_count]

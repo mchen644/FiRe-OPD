@@ -462,6 +462,7 @@ def test_completed_capture_loader_joins_actor_tensors_by_compound_key(tmp_path):
         )
     finalize_capture_seed(
         root,
+        native_rollouts=4,
         expected_keys=keys,
         actor_rank_expected_keys={0: keys},
         parent_hashes=parent_hashes,
