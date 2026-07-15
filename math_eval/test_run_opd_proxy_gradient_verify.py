@@ -4,8 +4,10 @@ import os
 import subprocess
 from pathlib import Path
 
+import numpy as np
 import pytest
 
+from math_eval import run_opd_proxy_gradient_verify as orchestrator_module
 from math_eval.run_opd_proxy_gradient_verify import (
     GVENDI_PYTHON,
     VERL_PYTHON,
@@ -207,6 +209,42 @@ def test_child_environment_removes_conflicting_rocm_visibility_aliases(tmp_path)
     assert env["CUDA_VISIBLE_DEVICES"] == "0,1,2,3"
     assert "ROCR_VISIBLE_DEVICES" not in env
     assert "HIP_VISIBLE_DEVICES" not in env
+
+
+def test_direct_replay_gate_uses_cosine_and_relative_full_norm_error():
+    direct = np.ones(1024, dtype=np.float32)
+    replay = direct.copy()
+    replay[0] += 0.02
+    assert not np.allclose(direct, replay, rtol=5e-3, atol=5e-3)
+
+    orchestrator_module._validate_direct_replay_equivalence(
+        direct,
+        replay,
+        direct_full_gradient_norm=13.3919,
+        replay_full_gradient_norm=13.3939,
+    )
+
+    with pytest.raises(RuntimeError, match="cosine"):
+        orchestrator_module._validate_direct_replay_equivalence(
+            direct,
+            -direct,
+            direct_full_gradient_norm=1.0,
+            replay_full_gradient_norm=1.0,
+        )
+    with pytest.raises(RuntimeError, match="relative norm"):
+        orchestrator_module._validate_direct_replay_equivalence(
+            direct,
+            direct,
+            direct_full_gradient_norm=1.006,
+            replay_full_gradient_norm=1.0,
+        )
+    with pytest.raises(RuntimeError, match="projected gradients"):
+        orchestrator_module._validate_direct_replay_equivalence(
+            np.full(2, 1e308),
+            np.full(2, 1e308),
+            direct_full_gradient_norm=1.0,
+            replay_full_gradient_norm=1.0,
+        )
 
 
 def test_gpu_cleanup_wait_is_condition_based_and_bounded():

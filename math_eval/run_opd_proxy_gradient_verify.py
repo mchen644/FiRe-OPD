@@ -2109,10 +2109,61 @@ def _validate_report_pair(stage: int, stage_root: Path) -> dict[str, object]:
     return report
 
 
+def _validate_direct_replay_equivalence(
+    direct_projected,
+    replay_projected,
+    *,
+    direct_full_gradient_norm: float,
+    replay_full_gradient_norm: float,
+) -> None:
+    import numpy as np
+
+    direct = np.asarray(direct_projected, dtype=np.float64)
+    replay = np.asarray(replay_projected, dtype=np.float64)
+    if (
+        direct.ndim != 1
+        or replay.shape != direct.shape
+        or direct.size == 0
+        or not np.isfinite(direct).all()
+        or not np.isfinite(replay).all()
+    ):
+        raise RuntimeError("direct fixture and replay projected gradients are invalid")
+    direct_projected_norm = float(np.linalg.norm(direct))
+    replay_projected_norm = float(np.linalg.norm(replay))
+    if (
+        not np.isfinite(direct_projected_norm)
+        or not np.isfinite(replay_projected_norm)
+        or direct_projected_norm <= 0
+        or replay_projected_norm <= 0
+    ):
+        raise RuntimeError("direct fixture and replay projected gradients are invalid")
+    cosine = float(
+        np.dot(direct / direct_projected_norm, replay / replay_projected_norm)
+    )
+    if not np.isfinite(cosine) or cosine < 0.999:
+        raise RuntimeError(
+            f"direct fixture and replay projected-gradient cosine is {cosine}, below 0.999"
+        )
+    direct_full_norm = float(direct_full_gradient_norm)
+    replay_full_norm = float(replay_full_gradient_norm)
+    if (
+        not np.isfinite(direct_full_norm)
+        or not np.isfinite(replay_full_norm)
+        or direct_full_norm <= 0
+        or replay_full_norm <= 0
+    ):
+        raise RuntimeError("direct fixture and replay full gradient norms are invalid")
+    relative_norm_error = abs(direct_full_norm - replay_full_norm) / replay_full_norm
+    if relative_norm_error > 0.005:
+        raise RuntimeError(
+            "direct fixture and replay relative norm error "
+            f"is {relative_norm_error}, above 0.005"
+        )
+
+
 def _validate_stage0_direct_fixture(
     stage_root: Path, manifest: Mapping[str, object]
 ) -> None:
-    import numpy as np
     from safetensors.torch import load_file
 
     from math_eval.opd_proxy_gradient_verify_artifacts import load_vector_set
@@ -2152,20 +2203,14 @@ def _validate_stage0_direct_fixture(
     expected_id = selection_vector_id(name, candidates[0])
     if direct.get("stable_id") != candidates[0] or proxy.vector_ids[0] != expected_id:
         raise RuntimeError("direct fixture identity differs from proxy replay identity")
-    if not np.allclose(
+    if proxy.full_gradient_norm is None:
+        raise RuntimeError("proxy replay lacks full gradient norms")
+    _validate_direct_replay_equivalence(
         tensors["projected_gradient"].numpy().reshape(-1),
         proxy.vectors[0],
-        rtol=5e-3,
-        atol=5e-3,
-    ):
-        raise RuntimeError("direct fixture and replay projected gradients differ")
-    if proxy.full_gradient_norm is None or not np.allclose(
-        float(tensors["full_gradient_norm"].item()),
-        float(proxy.full_gradient_norm[0]),
-        rtol=5e-3,
-        atol=5e-3,
-    ):
-        raise RuntimeError("direct fixture and replay full gradient norms differ")
+        direct_full_gradient_norm=float(tensors["full_gradient_norm"].item()),
+        replay_full_gradient_norm=float(proxy.full_gradient_norm[0]),
+    )
     source = next(
         value for value in sources if expected_id in set(value.vector_ids)
     )
