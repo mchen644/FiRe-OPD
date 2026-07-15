@@ -28,7 +28,10 @@ from math_eval.build_gradient_eligibility import (
 from math_eval.opd_proxy_gradient_stage_profiles import (
     EFFICACY_PILOT,
     StageKind,
+    capture_algorithm_contract,
+    capture_algorithm_contract_sha256,
     parse_stage_kind,
+    stage_directory_name,
     stage_profile,
 )
 from math_eval.opd_proxy_gradient_verify_artifacts import (
@@ -106,6 +109,9 @@ EXPECTED_REJECTED_IDS_SHA256 = (
 EXPECTED_FIRST_2048_SHA256 = (
     "aebf0d9a4743b3bb6d2ee307b6194d3d95a948f699a4439b8c4d43f498efbfc4"
 )
+FROZEN_STAGE1_MANIFEST_SHA256 = (
+    "6d698d75995c777d6faaf1abd385a758977ca0350ce862284f1e9d8751eddd83"
+)
 EXPECTED_STAGE_HASHES = {
     "stage0_all": "bf4822f0cab82aa5461b30247ee9149506618e61ea087486d27712b2227709df",
     "stage1_candidate": "bd4b790e7db49cabc85aad41de792cce436ce60ee004be505554fd83a1a55e9e",
@@ -128,6 +134,18 @@ class StageLayout:
     primary_k: int
     diagnostic_k: int
     null_draws: int
+
+
+@dataclass(frozen=True)
+class EfficacyPilotParent:
+    manifest_path: Path
+    manifest_sha256: str
+    manifest: dict[str, object]
+    sample_path: Path
+    sample_sha256: str
+    rows: tuple[dict[str, object], ...]
+    target_capture_path: Path
+    proxy_capture_path: Path
 
 
 @dataclass(frozen=True)
@@ -1078,16 +1096,17 @@ def validate_publication_provenance(
 
 
 def validate_stage_parent(
-    stage: int,
+    stage: str | int,
     parent_report: Path | None,
     expected_parent_report_sha256: str | None,
 ) -> dict[str, object] | None:
-    if stage in {0, 1}:
+    parsed = parse_stage_kind(stage)
+    if parsed in {0, 1, EFFICACY_PILOT}:
         if parent_report is not None or expected_parent_report_sha256 is not None:
-            raise ValueError(f"stage {stage} does not accept a parent report")
+            raise ValueError(f"stage {parsed} does not accept a parent report")
         return None
-    if stage != 2:
-        raise ValueError(f"unsupported stage: {stage}")
+    if parsed != 2:
+        raise AssertionError(f"unhandled stage: {parsed}")
     if parent_report is None or expected_parent_report_sha256 is None:
         raise ValueError("stage 2 requires a parent report and exact hash")
     path = Path(parent_report).resolve(strict=True)
@@ -1134,6 +1153,217 @@ def _capture_rows(rows: Sequence[Mapping[str, object]]) -> list[dict[str, object
             }
         )
     return capture
+
+
+def _canonical_json_object(path: Path, description: str) -> dict[str, object]:
+    try:
+        payload = Path(path).read_bytes()
+        value = json.loads(payload)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid {description}: {error}") from error
+    if not isinstance(value, dict) or payload != canonical_json_bytes(value):
+        raise ValueError(f"{description} must use canonical JSON bytes")
+    return value
+
+
+def _stage1_child_path(stage_root: Path, value: object, field: str) -> Path:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"parent Stage-1 manifest lacks {field}")
+    relative = Path(value)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError(f"parent {field} must remain beneath the Stage-1 directory")
+    root = stage_root.resolve(strict=True)
+    try:
+        child = (root / relative).resolve(strict=True)
+        child.relative_to(root)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise ValueError(
+            f"parent {field} must remain beneath the Stage-1 directory"
+        ) from error
+    if not child.is_file():
+        raise ValueError(f"parent Stage-1 artifact is not a file: {field}")
+    return child
+
+
+def _canonical_jsonl_rows(path: Path, description: str) -> tuple[dict[str, object], ...]:
+    try:
+        payload = Path(path).read_bytes()
+    except OSError as error:
+        raise ValueError(f"cannot read {description}: {error}") from error
+    if not payload or not payload.endswith(b"\n"):
+        raise ValueError(f"{description} must be nonempty canonical JSONL")
+    rows: list[dict[str, object]] = []
+    for line_number, line in enumerate(payload.splitlines(keepends=True), start=1):
+        try:
+            value = json.loads(line)
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise ValueError(
+                f"invalid {description} line {line_number}: {error}"
+            ) from error
+        if not isinstance(value, dict) or line != canonical_json_bytes(value):
+            raise ValueError(
+                f"{description} line {line_number} must use canonical JSON bytes"
+            )
+        rows.append(value)
+    return tuple(rows)
+
+
+def _capture_input_keys(path: Path, description: str) -> tuple[tuple[str, str, int], ...]:
+    try:
+        rows = pq.read_table(
+            path,
+            columns=[
+                "opd_verify_stable_id",
+                "opd_verify_split",
+                "opd_verify_manifest_index",
+            ],
+        ).to_pylist()
+    except (OSError, pa.ArrowException) as error:
+        raise ValueError(f"invalid {description}: {error}") from error
+    keys: list[tuple[str, str, int]] = []
+    for row in rows:
+        stable_id = row.get("opd_verify_stable_id")
+        split = row.get("opd_verify_split")
+        index = row.get("opd_verify_manifest_index")
+        if (
+            not isinstance(stable_id, str)
+            or not stable_id
+            or split not in {"candidate", "held_out"}
+            or isinstance(index, bool)
+            or not isinstance(index, int)
+            or index < 0
+        ):
+            raise ValueError(f"invalid {description} identity row")
+        keys.append((stable_id, str(split), index))
+    return tuple(keys)
+
+
+def load_efficacy_pilot_parent(
+    manifest_path: Path, expected_sha256: str
+) -> EfficacyPilotParent:
+    """Load and cross-check the immutable Stage-1 membership parent."""
+    path = Path(manifest_path).resolve(strict=True)
+    if re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None:
+        raise ValueError("expected parent Stage-1 manifest hash is invalid")
+    actual_sha256 = sha256_file(path)
+    if actual_sha256 != expected_sha256:
+        raise ValueError(
+            "parent Stage-1 manifest hash mismatch: "
+            f"expected {expected_sha256}, got {actual_sha256}"
+        )
+    manifest = _canonical_json_object(path, "parent Stage-1 manifest")
+    fixed = {
+        "schema_version": 1,
+        "artifact_type": "opd_proxy_stage",
+        "stage": 1,
+        "candidate_count": 768,
+        "held_out_count": 256,
+        "selected_size": 172,
+        "primary_k": 76,
+        "diagnostic_k": 7,
+        "null_draws": 10_000,
+        "target_capture_count": 1_024,
+        "proxy_capture_count": 768,
+    }
+    if any(manifest.get(field) != value for field, value in fixed.items()):
+        raise ValueError("parent Stage-1 manifest cardinality contract mismatch")
+    if not isinstance(manifest.get("provenance"), Mapping):
+        raise ValueError("parent Stage-1 manifest provenance is malformed")
+
+    root = path.parent
+    artifact_fields = (
+        ("sample_manifest", "sample_manifest_sha256"),
+        ("target_capture_parquet", "target_capture_parquet_sha256"),
+        ("proxy_capture_parquet", "proxy_capture_parquet_sha256"),
+    )
+    artifacts: dict[str, Path] = {}
+    for path_field, hash_field in artifact_fields:
+        artifact = _stage1_child_path(root, manifest.get(path_field), path_field)
+        expected_hash = manifest.get(hash_field)
+        if not isinstance(expected_hash, str) or sha256_file(artifact) != expected_hash:
+            raise ValueError(f"parent Stage-1 artifact hash mismatch: {path_field}")
+        artifacts[path_field] = artifact
+
+    sample_path = artifacts["sample_manifest"]
+    rows = _canonical_jsonl_rows(sample_path, "parent Stage-1 sample manifest")
+    if len(rows) != 1_024:
+        raise ValueError("parent Stage-1 sample manifest must contain 1,024 rows")
+    expected_splits = ("candidate",) * 768 + ("held_out",) * 256
+    keys: list[tuple[str, str, int]] = []
+    for index, (row, split) in enumerate(zip(rows, expected_splits, strict=True)):
+        stable_id = row.get("stable_id")
+        if not isinstance(stable_id, str) or not stable_id:
+            raise ValueError("parent Stage-1 sample row lacks stable ID")
+        if row.get("split") != split:
+            raise ValueError("parent Stage-1 sample split/order mismatch")
+        if row.get("manifest_index") != index:
+            raise ValueError("parent Stage-1 sample manifest_index/order mismatch")
+        if "parent_manifest_index" in row or "parent_row_sha256" in row:
+            raise ValueError("parent Stage-1 sample contains reserved pilot linkage fields")
+        keys.append((stable_id, split, index))
+    stable_ids = [key[0] for key in keys]
+    if len(set(stable_ids)) != len(stable_ids):
+        raise ValueError("parent Stage-1 sample contains duplicate stable IDs")
+    candidate_ids = stable_ids[:768]
+    held_out_ids = stable_ids[768:]
+    expected_id_hashes = {
+        "candidate_ids_sha256": sha256_id_lines(candidate_ids),
+        "held_out_ids_sha256": sha256_id_lines(held_out_ids),
+        "all_ids_sha256": sha256_id_lines(stable_ids),
+        "target_capture_ids_sha256": sha256_id_lines(stable_ids),
+        "proxy_capture_ids_sha256": sha256_id_lines(candidate_ids),
+    }
+    if any(manifest.get(field) != value for field, value in expected_id_hashes.items()):
+        raise ValueError("parent Stage-1 ordered-ID hash mismatch")
+
+    target_keys = _capture_input_keys(
+        artifacts["target_capture_parquet"], "parent target capture input"
+    )
+    proxy_keys = _capture_input_keys(
+        artifacts["proxy_capture_parquet"], "parent proxy capture input"
+    )
+    if target_keys != tuple(keys):
+        raise ValueError("parent target capture order differs from sample manifest")
+    if proxy_keys != tuple(keys[:768]):
+        raise ValueError("parent proxy capture order differs from sample manifest")
+    return EfficacyPilotParent(
+        manifest_path=path,
+        manifest_sha256=actual_sha256,
+        manifest=manifest,
+        sample_path=sample_path,
+        sample_sha256=sha256_file(sample_path),
+        rows=rows,
+        target_capture_path=artifacts["target_capture_parquet"],
+        proxy_capture_path=artifacts["proxy_capture_parquet"],
+    )
+
+
+def derive_efficacy_pilot_rows(
+    parent: EfficacyPilotParent,
+) -> list[dict[str, object]]:
+    if not isinstance(parent, EfficacyPilotParent):
+        raise TypeError("efficacy pilot parent must be an EfficacyPilotParent")
+    source_rows = parent.rows[:250] + parent.rows[768:852]
+    expected_splits = ("candidate",) * 250 + ("held_out",) * 84
+    output: list[dict[str, object]] = []
+    for local_index, (source_row, split) in enumerate(
+        zip(source_rows, expected_splits, strict=True)
+    ):
+        if source_row.get("split") != split:
+            raise ValueError("efficacy pilot parent prefix split mismatch")
+        parent_index = source_row.get("manifest_index")
+        if isinstance(parent_index, bool) or not isinstance(parent_index, int):
+            raise ValueError("efficacy pilot parent index is invalid")
+        row = dict(source_row)
+        row["parent_manifest_index"] = parent_index
+        row["parent_row_sha256"] = hashlib.sha256(
+            canonical_json_bytes(source_row)
+        ).hexdigest()
+        row["manifest_index"] = local_index
+        output.append(row)
+    if len(output) != 334:
+        raise RuntimeError("efficacy pilot prefix derivation changed cardinality")
+    return output
 
 
 def _validate_stage1_manifest_parent(
@@ -1185,14 +1415,17 @@ def _validate_stage1_manifest_parent(
 def write_stage_artifacts(
     *,
     output_root: Path,
-    stage: int,
+    stage: str | int,
     rows: Sequence[Mapping[str, object]],
     sampling_contract: SamplingContract,
     provenance: Mapping[str, object],
     parent_report: Path | None = None,
     expected_parent_report_sha256: str | None = None,
+    parent_stage1_manifest: Path | None = None,
+    expected_parent_stage1_manifest_sha256: str | None = None,
 ) -> dict[str, object]:
-    layout = stage_layout(stage)
+    parsed_stage = parse_stage_kind(stage)
+    layout = stage_layout(parsed_stage)
     expected_candidates = len(layout.candidate_clean_positions)
     expected_held_out = len(layout.held_out_clean_positions)
     normalized_rows = [dict(row) for row in rows]
@@ -1209,12 +1442,48 @@ def write_stage_artifacts(
     for index, row in enumerate(normalized_rows):
         if row.get("manifest_index") != index:
             raise ValueError("stage manifest_index must match row order")
-    parent = validate_stage_parent(stage, parent_report, expected_parent_report_sha256)
-    parent_stage_manifest = (
-        _validate_stage1_manifest_parent(output_root, sampling_contract)
-        if stage == 2
-        else None
+    parent = validate_stage_parent(
+        parsed_stage, parent_report, expected_parent_report_sha256
     )
+    pilot_parent: EfficacyPilotParent | None = None
+    if parsed_stage == EFFICACY_PILOT:
+        if (
+            parent_stage1_manifest is None
+            or expected_parent_stage1_manifest_sha256 is None
+        ):
+            raise ValueError("efficacy_pilot requires its exact Stage-1 parent manifest")
+        pilot_parent = load_efficacy_pilot_parent(
+            parent_stage1_manifest, expected_parent_stage1_manifest_sha256
+        )
+        expected_rows = derive_efficacy_pilot_rows(pilot_parent)
+        if [canonical_json_bytes(row) for row in normalized_rows] != [
+            canonical_json_bytes(row) for row in expected_rows
+        ]:
+            raise ValueError("efficacy_pilot rows differ from the frozen parent prefixes")
+        if pilot_parent.manifest.get("sampling_population_ids_sha256") != (
+            sampling_contract.first_2048_ids_sha256
+        ):
+            raise ValueError("pilot parent sampling population differs from root contract")
+        parent_stage_record: dict[str, object] | None = {
+            "path": str(pilot_parent.manifest_path),
+            "sha256": pilot_parent.manifest_sha256,
+            "sample_manifest_path": str(pilot_parent.sample_path),
+            "sample_manifest_sha256": pilot_parent.sample_sha256,
+            "candidate_ids_sha256": pilot_parent.manifest["candidate_ids_sha256"],
+            "held_out_ids_sha256": pilot_parent.manifest["held_out_ids_sha256"],
+            "all_ids_sha256": pilot_parent.manifest["all_ids_sha256"],
+        }
+    else:
+        if (
+            parent_stage1_manifest is not None
+            or expected_parent_stage1_manifest_sha256 is not None
+        ):
+            raise ValueError(f"stage {parsed_stage} does not accept a pilot parent manifest")
+        parent_stage_record = (
+            _validate_stage1_manifest_parent(output_root, sampling_contract)
+            if parsed_stage == 2
+            else None
+        )
     candidate_ids = [str(value) for value in stable_ids[:expected_candidates]]
     held_out_ids = [str(value) for value in stable_ids[expected_candidates:]]
     all_ids = candidate_ids + held_out_ids
@@ -1232,16 +1501,17 @@ def write_stage_artifacts(
             "stage2_held_out": held_out_ids,
             "stage2_all": all_ids,
         },
-    }[stage]
+        EFFICACY_PILOT: {},
+    }[parsed_stage]
     for hash_name, ids in hash_checks.items():
         expected_hash = sampling_contract.stage_hashes.get(hash_name)
         if expected_hash is not None and sha256_id_lines(ids) != expected_hash:
             raise ValueError(f"{hash_name} ordered-ID hash mismatch")
 
-    stage_dir = Path(output_root) / f"stage_{stage}"
+    stage_dir = Path(output_root) / stage_directory_name(parsed_stage)
     stage_dir.mkdir(parents=True, exist_ok=True)
     sample_payload = b"".join(canonical_json_bytes(row) for row in normalized_rows)
-    if stage == 2:
+    if parsed_stage == 2:
         target_source_rows = [
             row
             for row in normalized_rows
@@ -1269,7 +1539,7 @@ def write_stage_artifacts(
     manifest: dict[str, object] = {
         "schema_version": 1,
         "artifact_type": "opd_proxy_stage",
-        "stage": stage,
+        "stage": parsed_stage,
         "candidate_count": expected_candidates,
         "held_out_count": expected_held_out,
         "selected_size": layout.selected_size,
@@ -1295,9 +1565,34 @@ def write_stage_artifacts(
         "proxy_capture_parquet": proxy_path.name,
         "proxy_capture_parquet_sha256": hashlib.sha256(proxy_payload).hexdigest(),
         "parent_report": parent,
-        "parent_stage_manifest": parent_stage_manifest,
+        "parent_stage_manifest": parent_stage_record,
         "provenance": dict(provenance),
     }
+    if parsed_stage == EFFICACY_PILOT:
+        assert pilot_parent is not None
+        parent_links = [
+            {
+                "manifest_index": row["manifest_index"],
+                "parent_manifest_index": row["parent_manifest_index"],
+                "parent_row_sha256": row["parent_row_sha256"],
+                "stable_id": row["stable_id"],
+            }
+            for row in normalized_rows
+        ]
+        manifest.update(
+            {
+                "algorithm_contract": capture_algorithm_contract(parsed_stage),
+                "algorithm_contract_sha256": capture_algorithm_contract_sha256(
+                    parsed_stage
+                ),
+                "parent_row_links_sha256": hashlib.sha256(
+                    canonical_json_bytes(parent_links)
+                ).hexdigest(),
+                "pilot_candidate_prefix_ids_sha256": sha256_id_lines(candidate_ids),
+                "pilot_held_out_prefix_ids_sha256": sha256_id_lines(held_out_ids),
+                "pilot_all_ids_sha256": sha256_id_lines(all_ids),
+            }
+        )
     manifest_path = stage_dir / "manifest.json"
     _write_or_validate_bytes(manifest_path, canonical_json_bytes(manifest))
     return manifest
@@ -1509,19 +1804,22 @@ def _small_model_context(path: Path) -> int:
 
 def prepare_stage(
     *,
-    stage: int,
+    stage: str | int,
     output_root: Path,
     repository_root: Path | None = None,
     expected_source_commit: str | None = None,
     reference_repo: Path | None = None,
     disposable_preflight: bool = False,
     parent_report: Path | None = None,
+    parent_stage1_manifest: Path | None = None,
+    expected_parent_stage1_manifest_sha256: str | None = None,
 ) -> dict[str, object]:
     repository = (
         Path(repository_root).resolve(strict=True)
         if repository_root is not None
         else Path(__file__).resolve().parents[1]
     )
+    parsed_stage = parse_stage_kind(stage)
     publication = validate_publication_provenance(
         output_root=output_root,
         repository_root=repository,
@@ -1529,14 +1827,14 @@ def prepare_stage(
         reference_repo=reference_repo,
         disposable_preflight=disposable_preflight,
     )
-    if stage == 2:
+    if parsed_stage == 2:
         if parent_report is None:
             raise ValueError("stage 2 requires --parent-report")
         parent_sha256 = sha256_file(parent_report)
     else:
         parent_sha256 = None
     # Parent validation is deliberately before tokenization or row derivation.
-    validate_stage_parent(stage, parent_report, parent_sha256)
+    validate_stage_parent(parsed_stage, parent_report, parent_sha256)
 
     root_manifest_path = Path(output_root) / "root_manifest.json"
     root_manifest = _read_json_object(root_manifest_path, "root manifest")
@@ -1549,13 +1847,73 @@ def prepare_stage(
     ):
         raise ValueError("root manifest decontamination hash mismatch")
     current_snapshot = _source_snapshot(repository)
+    sampling = _sampling_contract_from_json(sampling_path)
+    if parsed_stage == EFFICACY_PILOT:
+        if (
+            parent_stage1_manifest is None
+            or expected_parent_stage1_manifest_sha256 is None
+        ):
+            raise ValueError(
+                "efficacy_pilot requires --parent-stage1-manifest and its exact hash"
+            )
+        if (
+            not disposable_preflight
+            and expected_parent_stage1_manifest_sha256
+            != FROZEN_STAGE1_MANIFEST_SHA256
+        ):
+            raise ValueError("canonical efficacy_pilot requires the frozen Stage-1 hash")
+        pilot_parent = load_efficacy_pilot_parent(
+            parent_stage1_manifest, expected_parent_stage1_manifest_sha256
+        )
+        if not disposable_preflight:
+            expected_parent_path = (
+                Path(output_root) / "stage_1/manifest.json"
+            ).resolve(strict=True)
+            if pilot_parent.manifest_path != expected_parent_path:
+                raise ValueError(
+                    "canonical efficacy_pilot parent must be output_root/stage_1/manifest.json"
+                )
+        parent_provenance = pilot_parent.manifest.get("provenance")
+        if not isinstance(parent_provenance, Mapping):
+            raise ValueError("pilot parent provenance is malformed")
+        stored_root_sha = parent_provenance.get("root_manifest_sha256")
+        if not disposable_preflight and stored_root_sha != sha256_file(root_manifest_path):
+            raise ValueError("pilot parent root-manifest hash mismatch")
+        rows = derive_efficacy_pilot_rows(pilot_parent)
+        provenance = {
+            "publication": publication,
+            "root_manifest_path": str(root_manifest_path.resolve()),
+            "root_manifest_sha256": sha256_file(root_manifest_path),
+            "root_manifest": root_manifest,
+            "tokenizer_compatibility": parent_provenance.get(
+                "tokenizer_compatibility"
+            ),
+            "source_snapshot": current_snapshot,
+            "runtime": build_runtime_metadata("verl_capture"),
+            "membership_parent_source": parent_provenance.get("publication"),
+        }
+        return write_stage_artifacts(
+            output_root=output_root,
+            stage=parsed_stage,
+            rows=rows,
+            sampling_contract=sampling,
+            provenance=provenance,
+            parent_stage1_manifest=pilot_parent.manifest_path,
+            expected_parent_stage1_manifest_sha256=(
+                pilot_parent.manifest_sha256
+            ),
+        )
+    if (
+        parent_stage1_manifest is not None
+        or expected_parent_stage1_manifest_sha256 is not None
+    ):
+        raise ValueError(f"stage {parsed_stage} does not accept a pilot parent manifest")
     root_snapshot = root_manifest.get("source_snapshot")
     if not isinstance(root_snapshot, Mapping) or root_snapshot.get(
         "manifest_sha256"
     ) != current_snapshot.get("manifest_sha256"):
         raise ValueError("root manifest source snapshot mismatch")
-    sampling = _sampling_contract_from_json(sampling_path)
-    if stage == 2:
+    if parsed_stage == 2:
         _validate_stage1_manifest_parent(output_root, sampling)
     paths = _default_data_paths(repository)
     prepared_rows, prepared_metadata = load_prepared_pool(
@@ -1587,7 +1945,7 @@ def prepare_stage(
             if line.strip():
                 rejected_ids.add(str(json.loads(line)["stable_id"]))
     rows = build_stage_rows(
-        stage=stage,
+        stage=parsed_stage,
         eligible_rows=eligible_rows,
         source_rows=source_rows,
         sampling_contract=sampling,
@@ -1607,7 +1965,7 @@ def prepare_stage(
     }
     return write_stage_artifacts(
         output_root=output_root,
-        stage=stage,
+        stage=parsed_stage,
         rows=rows,
         sampling_contract=sampling,
         provenance=provenance,
@@ -1628,8 +1986,10 @@ def _build_parser() -> argparse.ArgumentParser:
         child.add_argument("--reference-repo", type=Path)
         child.add_argument("--disposable-preflight", action="store_true")
     stage_parser = subparsers.choices["prepare-stage"]
-    stage_parser.add_argument("--stage", type=int, choices=(0, 1, 2), required=True)
+    stage_parser.add_argument("--stage", type=parse_stage_kind, required=True)
     stage_parser.add_argument("--parent-report", type=Path)
+    stage_parser.add_argument("--parent-stage1-manifest", type=Path)
+    stage_parser.add_argument("--expected-parent-stage1-manifest-sha256")
     return parser
 
 
@@ -1647,6 +2007,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = prepare_stage(
             stage=args.stage,
             parent_report=args.parent_report,
+            parent_stage1_manifest=args.parent_stage1_manifest,
+            expected_parent_stage1_manifest_sha256=(
+                args.expected_parent_stage1_manifest_sha256
+            ),
             **common,
         )
     print(json.dumps(result, ensure_ascii=True, sort_keys=True))
@@ -1657,6 +2021,8 @@ __all__ = [
     "BENCHMARK_CONTRACT",
     "DecontaminationAudit",
     "DecontaminationHit",
+    "EfficacyPilotParent",
+    "FROZEN_STAGE1_MANIFEST_SHA256",
     "OPD_SUFFIX",
     "SamplingContract",
     "StageLayout",
@@ -1665,6 +2031,8 @@ __all__ = [
     "build_raw_opd_prompt",
     "build_sampling_contract",
     "build_stage_rows",
+    "derive_efficacy_pilot_rows",
+    "load_efficacy_pilot_parent",
     "main",
     "normalize_question",
     "preflight_stage_rows",

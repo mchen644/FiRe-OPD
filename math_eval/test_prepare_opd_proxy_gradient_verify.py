@@ -10,9 +10,17 @@ import numpy as np
 import pyarrow.parquet as pq
 import pytest
 
-from math_eval.opd_proxy_gradient_stage_profiles import EFFICACY_PILOT
-from math_eval.opd_proxy_gradient_verify_artifacts import sha256_file, sha256_id_lines
+from math_eval.opd_proxy_gradient_stage_profiles import (
+    EFFICACY_PILOT,
+    capture_algorithm_contract_sha256,
+)
+from math_eval.opd_proxy_gradient_verify_artifacts import (
+    canonical_json_bytes,
+    sha256_file,
+    sha256_id_lines,
+)
 from math_eval.prepare_opd_proxy_gradient_verify import (
+    FROZEN_STAGE1_MANIFEST_SHA256,
     OPD_SUFFIX,
     SamplingContract,
     build_decontamination_audit,
@@ -20,6 +28,8 @@ from math_eval.prepare_opd_proxy_gradient_verify import (
     build_raw_opd_prompt,
     build_sampling_contract,
     build_stage_rows,
+    derive_efficacy_pilot_rows,
+    load_efficacy_pilot_parent,
     normalize_question,
     preflight_stage_rows,
     publish_root_contract,
@@ -742,6 +752,153 @@ def test_stage_artifacts_write_manifest_and_target_proxy_capture_parquets(
             sampling_contract=contract,
             provenance={"canonical": False, "mode": "disposable_preflight"},
         )
+
+
+def _write_synthetic_stage1_parent(output_root: Path) -> tuple[Path, SamplingContract]:
+    eligible, source = _eligible_and_source_rows()
+    contract = _stage_contract()
+    rows = build_stage_rows(
+        stage=1,
+        eligible_rows=eligible,
+        source_rows=source,
+        sampling_contract=contract,
+        tokenizer_4b=_FakeQwenTokenizer(),
+        tokenizer_0_6b=_FakeQwenTokenizer(),
+    )
+    write_stage_artifacts(
+        output_root=output_root,
+        stage=1,
+        rows=rows,
+        sampling_contract=contract,
+        provenance={"canonical": False, "mode": "disposable_preflight"},
+    )
+    return output_root / "stage_1/manifest.json", contract
+
+
+def _file_hashes(root: Path) -> dict[str, str]:
+    return {
+        str(path.relative_to(root)): sha256_file(path)
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def test_frozen_stage1_manifest_digest_is_the_approved_parent():
+    assert FROZEN_STAGE1_MANIFEST_SHA256 == (
+        "6d698d75995c777d6faaf1abd385a758977ca0350ce862284f1e9d8751eddd83"
+    )
+
+
+def test_pilot_derives_exact_stage1_prefixes_without_mutating_parent(tmp_path: Path):
+    parent_path, _ = _write_synthetic_stage1_parent(tmp_path)
+    parent_root = parent_path.parent
+    before = _file_hashes(parent_root)
+    parent = load_efficacy_pilot_parent(parent_path, sha256_file(parent_path))
+    rows = derive_efficacy_pilot_rows(parent)
+
+    assert [row["stable_id"] for row in rows[:250]] == [
+        f"q{index:04d}" for index in range(250)
+    ]
+    assert [row["stable_id"] for row in rows[250:]] == [
+        f"q{index:04d}" for index in range(768, 852)
+    ]
+    assert [row["manifest_index"] for row in rows] == list(range(334))
+    assert [row["parent_manifest_index"] for row in rows[:250]] == list(range(250))
+    assert [row["parent_manifest_index"] for row in rows[250:]] == list(
+        range(768, 852)
+    )
+    assert all(len(str(row["parent_row_sha256"])) == 64 for row in rows)
+    assert _file_hashes(parent_root) == before
+
+
+def test_pilot_parent_rejects_wrong_hash_noncanonical_bytes_and_path_escape(
+    tmp_path: Path,
+):
+    parent_path, _ = _write_synthetic_stage1_parent(tmp_path)
+    with pytest.raises(ValueError, match="parent Stage-1 manifest hash"):
+        load_efficacy_pilot_parent(parent_path, "0" * 64)
+
+    manifest = json.loads(parent_path.read_text(encoding="utf-8"))
+    parent_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    with pytest.raises(ValueError, match="canonical"):
+        load_efficacy_pilot_parent(parent_path, sha256_file(parent_path))
+
+    parent_path.write_bytes(canonical_json_bytes(manifest))
+    manifest["sample_manifest"] = "../outside.jsonl"
+    parent_path.write_bytes(canonical_json_bytes(manifest))
+    with pytest.raises(ValueError, match="beneath.*Stage-1"):
+        load_efficacy_pilot_parent(parent_path, sha256_file(parent_path))
+
+
+def test_pilot_parent_rejects_reordered_rows_even_with_updated_sample_hash(
+    tmp_path: Path,
+):
+    parent_path, _ = _write_synthetic_stage1_parent(tmp_path)
+    manifest = json.loads(parent_path.read_text(encoding="utf-8"))
+    sample_path = parent_path.parent / str(manifest["sample_manifest"])
+    rows = [json.loads(line) for line in sample_path.read_text(encoding="utf-8").splitlines()]
+    rows[0], rows[1] = rows[1], rows[0]
+    sample_path.write_bytes(b"".join(canonical_json_bytes(row) for row in rows))
+    manifest["sample_manifest_sha256"] = sha256_file(sample_path)
+    manifest["candidate_ids_sha256"] = sha256_id_lines(
+        [str(row["stable_id"]) for row in rows[:768]]
+    )
+    manifest["all_ids_sha256"] = sha256_id_lines(
+        [str(row["stable_id"]) for row in rows]
+    )
+    parent_path.write_bytes(canonical_json_bytes(manifest))
+
+    with pytest.raises(ValueError, match="manifest_index|capture.*order"):
+        load_efficacy_pilot_parent(parent_path, sha256_file(parent_path))
+
+
+def test_pilot_artifacts_publish_in_separate_namespace_with_parent_identity(
+    tmp_path: Path,
+):
+    parent_path, contract = _write_synthetic_stage1_parent(tmp_path)
+    parent_before = _file_hashes(parent_path.parent)
+    parent_sha = sha256_file(parent_path)
+    parent = load_efficacy_pilot_parent(parent_path, parent_sha)
+    rows = derive_efficacy_pilot_rows(parent)
+
+    manifest = write_stage_artifacts(
+        output_root=tmp_path,
+        stage=EFFICACY_PILOT,
+        rows=rows,
+        sampling_contract=contract,
+        provenance={"canonical": False, "mode": "disposable_preflight"},
+        parent_stage1_manifest=parent_path,
+        expected_parent_stage1_manifest_sha256=parent_sha,
+    )
+
+    pilot_root = tmp_path / EFFICACY_PILOT
+    assert manifest["stage"] == EFFICACY_PILOT
+    assert manifest["candidate_count"] == 250
+    assert manifest["held_out_count"] == 84
+    assert manifest["target_capture_count"] == 334
+    assert manifest["proxy_capture_count"] == 250
+    assert manifest["parent_stage_manifest"]["sha256"] == parent_sha
+    assert manifest["algorithm_contract_sha256"] == (
+        capture_algorithm_contract_sha256(EFFICACY_PILOT)
+    )
+    assert manifest["candidate_ids_sha256"] == sha256_id_lines(
+        [f"q{index:04d}" for index in range(250)]
+    )
+    assert manifest["held_out_ids_sha256"] == sha256_id_lines(
+        [f"q{index:04d}" for index in range(768, 852)]
+    )
+    target = pq.read_table(pilot_root / "capture_target.parquet").to_pylist()
+    proxy = pq.read_table(pilot_root / "capture_proxy.parquet").to_pylist()
+    assert len(target) == 334
+    assert len(proxy) == 250
+    assert [row["opd_verify_stable_id"] for row in target[:250]] == [
+        f"q{index:04d}" for index in range(250)
+    ]
+    assert [row["opd_verify_stable_id"] for row in target[250:]] == [
+        f"q{index:04d}" for index in range(768, 852)
+    ]
+    assert _file_hashes(parent_path.parent) == parent_before
+    assert not (parent_path.parent / EFFICACY_PILOT).exists()
 
 
 def test_stage_artifacts_reject_a_wrong_frozen_stage_hash(tmp_path: Path):
