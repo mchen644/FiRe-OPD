@@ -346,6 +346,9 @@ class SystemRuntime:
     def monotonic(self) -> float:
         return time.monotonic()
 
+    def sleep(self, seconds: float) -> None:
+        time.sleep(seconds)
+
 
 def _visible_tokens(env: Mapping[str, str], expected_gpus: int) -> tuple[str, ...]:
     visible = env.get("CUDA_VISIBLE_DEVICES", "")
@@ -1327,6 +1330,38 @@ def _unit_environment(
     return env
 
 
+def _wait_for_gpu_idle(
+    tokens: Sequence[str],
+    *,
+    runtime,
+    allowed_pids: set[int] | frozenset[int] = frozenset(),
+    timeout_seconds: float = 120.0,
+    poll_seconds: float = 1.0,
+) -> None:
+    if timeout_seconds <= 0 or poll_seconds <= 0:
+        raise ValueError("GPU drain timeout and poll interval must be positive")
+    unique_tokens = tuple(dict.fromkeys(tokens))
+    if not unique_tokens:
+        return
+    deadline = runtime.monotonic() + timeout_seconds
+    while True:
+        occupied = {
+            token: sorted(set(runtime.gpu_processes(token)) - set(allowed_pids))
+            for token in unique_tokens
+        }
+        occupied = {token: pids for token, pids in occupied.items() if pids}
+        if not occupied:
+            return
+        if runtime.monotonic() >= deadline:
+            raise RuntimeError(
+                f"launcher-owned GPU processes did not drain before timeout: {occupied}"
+            )
+        if hasattr(runtime, "sleep"):
+            runtime.sleep(poll_seconds)
+        else:
+            time.sleep(poll_seconds)
+
+
 def _finalize_process_group(process, runtime) -> None:
     if hasattr(runtime, "finalize_owned"):
         runtime.finalize_owned(process)
@@ -1445,6 +1480,11 @@ def _exercise_replay_interruption(
     owned_pids.discard(process.pid)
     _finalize_process_group(process, active_runtime)
     _close_process_log(process)
+    _wait_for_gpu_idle(
+        tokens,
+        runtime=active_runtime,
+        allowed_pids=owned_pids,
+    )
     if returncode == 0:
         raise RuntimeError("resume exercise unexpectedly completed the replay shard")
     if (command.output_root / "COMPLETE.json").exists():
@@ -1529,9 +1569,19 @@ def execute_stage_commands(
                 _close_process_log(process)
                 if returncode != 0:
                     _terminate_processes([process], active_runtime)
+                    _wait_for_gpu_idle(
+                        tokens,
+                        runtime=active_runtime,
+                        allowed_pids=owned_pids,
+                    )
                     raise RuntimeError(
                         f"work unit {command.name} failed with exit code {returncode}"
                     )
+                _wait_for_gpu_idle(
+                    tokens,
+                    runtime=active_runtime,
+                    allowed_pids=owned_pids,
+                )
                 duration = active_runtime.monotonic() - start
                 _validate_live_source_snapshot(stage_root, command)
                 _publish_unit_completion(stage_root, command, duration=duration)
@@ -1602,6 +1652,11 @@ def execute_stage_commands(
                         raise RuntimeError(
                             f"work unit {item.name} failed with exit code {returncode}"
                         )
+                    _wait_for_gpu_idle(
+                        _resolve_tokens(item, allocated),
+                        runtime=active_runtime,
+                        allowed_pids=owned_pids,
+                    )
                     _validate_live_source_snapshot(stage_root, item)
                     _publish_unit_completion(
                         stage_root,
@@ -1612,6 +1667,15 @@ def execute_stage_commands(
             except BaseException:
                 _terminate_processes(
                     [process for _, process, _ in processes], active_runtime
+                )
+                _wait_for_gpu_idle(
+                    tuple(
+                        token
+                        for item, _, _ in processes
+                        for token in _resolve_tokens(item, allocated)
+                    ),
+                    runtime=active_runtime,
+                    allowed_pids=owned_pids,
                 )
                 raise
         for command in commands:

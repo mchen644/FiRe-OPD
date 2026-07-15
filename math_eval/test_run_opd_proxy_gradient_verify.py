@@ -11,6 +11,7 @@ from math_eval.run_opd_proxy_gradient_verify import (
     VERL_PYTHON,
     StageCommand,
     _unit_environment,
+    _wait_for_gpu_idle,
     build_capture_hydra_overrides,
     build_experiment_source_snapshot,
     build_source_snapshot,
@@ -206,6 +207,35 @@ def test_child_environment_removes_conflicting_rocm_visibility_aliases(tmp_path)
     assert env["CUDA_VISIBLE_DEVICES"] == "0,1,2,3"
     assert "ROCR_VISIBLE_DEVICES" not in env
     assert "HIP_VISIBLE_DEVICES" not in env
+
+
+def test_gpu_cleanup_wait_is_condition_based_and_bounded():
+    class Runtime:
+        def __init__(self, responses):
+            self.responses = list(responses)
+            self.clock = 0.0
+            self.sleeps = 0
+
+        def gpu_processes(self, token):
+            assert token == "0"
+            if len(self.responses) > 1:
+                return self.responses.pop(0)
+            return self.responses[0]
+
+        def monotonic(self):
+            return self.clock
+
+        def sleep(self, seconds):
+            self.sleeps += 1
+            self.clock += seconds
+
+    draining = Runtime([{1257647}, {1257647}, set()])
+    _wait_for_gpu_idle(("0",), runtime=draining, timeout_seconds=5)
+    assert draining.sleeps == 2
+
+    stuck = Runtime([{1257647}])
+    with pytest.raises(RuntimeError, match="did not drain"):
+        _wait_for_gpu_idle(("0",), runtime=stuck, timeout_seconds=2)
 
 
 def test_runtime_requires_four_unique_allocated_tokens():
@@ -677,6 +707,34 @@ def test_seed42_failure_prevents_seed43_and_cleanup_is_owned_only(tmp_path):
         "capture_target_seed_42"
     ]
     assert all(process.pid != 999 for process in runtime.processes)
+
+
+def test_executor_waits_for_detached_gpu_child_to_drain(tmp_path):
+    class DrainingRuntime(_FakeRuntime):
+        def __init__(self):
+            super().__init__()
+            self.post_exit_queries = 0
+
+        def gpu_processes(self, token):
+            if self.processes and self.processes[-1]._done:
+                self.post_exit_queries += 1
+                if self.post_exit_queries <= 2:
+                    return {90_001}
+            return set()
+
+        def sleep(self, seconds):
+            self.clock += seconds
+
+    runtime = DrainingRuntime()
+    command = _command(tmp_path, "draining", gpu_tokens=("slot:0",))
+    execute_stage_commands(
+        (command,),
+        stage_directory=tmp_path,
+        env=_runtime_env(),
+        runtime=runtime,
+    )
+    assert runtime.post_exit_queries == 3
+    assert command.completion_paths[0].is_file()
 
 
 def test_parallel_failure_terminates_only_sibling_processes(tmp_path):
