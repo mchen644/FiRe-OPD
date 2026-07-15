@@ -10,6 +10,7 @@ import numpy as np
 import pyarrow.parquet as pq
 import pytest
 
+from math_eval.opd_proxy_gradient_stage_profiles import EFFICACY_PILOT
 from math_eval.opd_proxy_gradient_verify_artifacts import sha256_file, sha256_id_lines
 from math_eval.prepare_opd_proxy_gradient_verify import (
     OPD_SUFFIX,
@@ -175,8 +176,41 @@ def test_stage_layouts_are_derived_without_stage1_constant_leakage():
         153,
         15,
     )
+    pilot = stage_layout(EFFICACY_PILOT)
+    assert len(pilot.candidate_clean_positions) == 250
+    assert len(pilot.held_out_clean_positions) == 84
+    assert pilot.candidate_clean_positions == tuple(range(250))
+    assert pilot.held_out_clean_positions == tuple(range(768, 852))
+    assert (
+        pilot.selected_size,
+        pilot.primary_k,
+        pilot.diagnostic_k,
+        pilot.null_draws,
+    ) == (56, 25, 3, 10_000)
+
     with pytest.raises(ValueError, match="unsupported stage"):
         stage_layout(3)
+
+
+def test_root_stage_builder_rejects_efficacy_pilot_parent_bypass():
+    contract = SamplingContract(
+        first_2048_ids=tuple(f"q{index}" for index in range(2048)),
+        first_2048_ids_sha256="a" * 64,
+        first_2048_eligible_positions=tuple(range(2048)),
+        first_2048_permutation_positions=tuple(range(2048)),
+        scanned_permutation_stop=2048,
+        skipped_before_cutoff=(),
+        stage_hashes={},
+    )
+    with pytest.raises(ValueError, match="require the frozen Stage-1 parent"):
+        build_stage_rows(
+            stage=EFFICACY_PILOT,
+            eligible_rows=(),
+            source_rows=(),
+            sampling_contract=contract,
+            tokenizer_4b=object(),
+            tokenizer_0_6b=object(),
+        )
 
 
 class _PermutationSpy:

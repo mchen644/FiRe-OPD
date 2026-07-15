@@ -25,6 +25,12 @@ from math_eval.build_gradient_eligibility import (
     apply_eligibility_report,
     load_prepared_pool,
 )
+from math_eval.opd_proxy_gradient_stage_profiles import (
+    EFFICACY_PILOT,
+    StageKind,
+    parse_stage_kind,
+    stage_profile,
+)
 from math_eval.opd_proxy_gradient_verify_artifacts import (
     atomic_write_bytes,
     build_runtime_metadata,
@@ -115,7 +121,7 @@ EXPECTED_STAGE_HASHES = {
 
 @dataclass(frozen=True)
 class StageLayout:
-    stage: int
+    stage: StageKind
     candidate_clean_positions: tuple[int, ...]
     held_out_clean_positions: tuple[int, ...]
     selected_size: int
@@ -196,24 +202,34 @@ def ten_token_gram_hashes(text: str) -> frozenset[str]:
     return frozenset(digest for digest, _ in _gram_rows(_normalized_tokens(text)))
 
 
-def stage_layout(stage: int) -> StageLayout:
-    if stage == 0:
-        return StageLayout(0, tuple(range(24)), tuple(range(768, 776)), 5, 2, 2, 100)
-    if stage == 1:
-        return StageLayout(
-            1,
-            tuple(range(768)),
-            tuple(range(768, 1024)),
-            172,
-            76,
-            7,
-            10_000,
-        )
-    if stage == 2:
+def stage_layout(stage: str | int) -> StageLayout:
+    parsed = parse_stage_kind(stage)
+    profile = stage_profile(parsed)
+    if parsed == 0:
+        candidates = tuple(range(24))
+        held_out = tuple(range(768, 776))
+    elif parsed == 1:
+        candidates = tuple(range(768))
+        held_out = tuple(range(768, 1024))
+    elif parsed == 2:
         candidates = tuple(range(768)) + tuple(range(1024, 1792))
         held_out = tuple(range(768, 1024)) + tuple(range(1792, 2048))
-        return StageLayout(2, candidates, held_out, 345, 153, 15, 10_000)
-    raise ValueError(f"unsupported stage: {stage}")
+    elif parsed == EFFICACY_PILOT:
+        candidates = tuple(range(250))
+        held_out = tuple(range(768, 852))
+    else:  # pragma: no cover - parse_stage_kind is exhaustive.
+        raise AssertionError(f"unhandled stage: {parsed}")
+    if len(candidates) != profile.candidate_count or len(held_out) != profile.held_out_count:
+        raise RuntimeError("stage profile and clean-position layout disagree")
+    return StageLayout(
+        parsed,
+        candidates,
+        held_out,
+        profile.selected_size,
+        profile.primary_k,
+        profile.diagnostic_k,
+        profile.null_draws,
+    )
 
 
 def _coerce_benchmarks(
@@ -879,7 +895,7 @@ def _source_prompt_content(source_row: Mapping[str, object], source_index: int) 
 
 def build_stage_rows(
     *,
-    stage: int,
+    stage: str | int,
     eligible_rows: Sequence[Mapping[str, object]],
     source_rows: Sequence[Mapping[str, object]],
     sampling_contract: SamplingContract,
@@ -889,6 +905,8 @@ def build_stage_rows(
     max_prompt_length: int = 2_048,
     max_sft_tokens: int = 40_960,
 ) -> list[dict[str, object]]:
+    if parse_stage_kind(stage) == EFFICACY_PILOT:
+        raise ValueError("efficacy_pilot rows require the frozen Stage-1 parent")
     if len(sampling_contract.first_2048_ids) != CLEAN_SAMPLE_SIZE:
         raise ValueError("sampling contract does not contain 2,048 IDs")
     if len(sampling_contract.first_2048_eligible_positions) != CLEAN_SAMPLE_SIZE:
