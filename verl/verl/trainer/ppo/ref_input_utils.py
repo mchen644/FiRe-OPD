@@ -18,13 +18,10 @@ Also includes critique distillation utilities for computing ref log probs with e
 
 import logging
 import os
-import json
-import requests
-import concurrent.futures
-from typing import Optional, List, Dict, Any
+from typing import Optional
 
-import torch
 import numpy as np
+import torch
 
 from verl import DataProto
 from verl.utils.model import compute_position_id_with_mask
@@ -37,6 +34,7 @@ def prepare_ref_model_inputs(
     batch: DataProto,
     ref_tokenizer,
     apply_chat_template_kwargs: Optional[dict] = None,
+    raw_prompt_key: str = "raw_prompt",
 ) -> DataProto:
     """Prepare input_ids, attention_mask, position_ids for reference model.
     
@@ -51,6 +49,7 @@ def prepare_ref_model_inputs(
             - input_ids, attention_mask, position_ids: Actor model inputs
         ref_tokenizer: The tokenizer used by the reference model (for encoding new prompts)
         apply_chat_template_kwargs (dict, optional): Additional kwargs for apply_chat_template
+        raw_prompt_key (str): non-tensor batch key containing the source messages
         
     Returns:
         DataProto: Updated batch with ref_input_ids, ref_attention_mask, ref_position_ids added
@@ -58,17 +57,17 @@ def prepare_ref_model_inputs(
     if apply_chat_template_kwargs is None:
         apply_chat_template_kwargs = {}
     
-    # Check if raw_prompt is available
-    if "raw_prompt" not in batch.non_tensor_batch:
+    if not isinstance(raw_prompt_key, str) or not raw_prompt_key:
+        raise ValueError("raw_prompt_key must be a nonempty string")
+    if raw_prompt_key not in batch.non_tensor_batch:
         raise ValueError(
-            "raw_prompt not found in batch.non_tensor_batch. "
-            "Please set data.return_raw_chat=True in config to enable re-tokenization for ref model."
+            f"{raw_prompt_key} not found in batch.non_tensor_batch. "
+            "Please set data.return_raw_chat=True and configure data.ref_raw_prompt_key correctly."
         )
     
     batch_size = len(batch)
-    raw_prompts = batch.non_tensor_batch["raw_prompt"]  # List of messages
+    raw_prompts = batch.non_tensor_batch[raw_prompt_key]  # List of messages
     responses = batch.batch["responses"]  # (batch_size, response_length)
-    response_length = responses.shape[1]
     
     # Step 1: Tokenize all prompts with ref tokenizer's chat template
     ref_prompt_ids_list = []
@@ -125,11 +124,15 @@ def prepare_ref_model_inputs(
     
     # Stack into tensors
     ref_prompt_ids_tensor = torch.stack(ref_prompt_ids_padded, dim=0)  # (batch_size, max_prompt_len)
-    ref_prompt_attention_mask_tensor = torch.stack(ref_prompt_attention_mask_padded, dim=0)  # (batch_size, max_prompt_len)
+    ref_prompt_attention_mask_tensor = torch.stack(
+        ref_prompt_attention_mask_padded, dim=0
+    )  # (batch_size, max_prompt_len)
     
     # Step 3: Concat prompt with original responses
     # responses are already right-padded from rollout
-    ref_input_ids_tensor = torch.cat([ref_prompt_ids_tensor, responses], dim=1)  # (batch_size, max_prompt_len + response_length)
+    ref_input_ids_tensor = torch.cat(
+        [ref_prompt_ids_tensor, responses], dim=1
+    )  # (batch_size, max_prompt_len + response_length)
     
     # Create attention mask for responses (1 for non-padding tokens)
     # Response attention mask should be derived from the original attention mask or response_mask

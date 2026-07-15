@@ -39,6 +39,7 @@ from verl.trainer.ppo.ray_trainer import (
     RayPPOTrainer,
     _validate_capture_batch_forbidden_keys,
 )
+from verl.trainer.ppo.ref_input_utils import prepare_ref_model_inputs
 from verl.workers.actor.dp_actor import DataParallelPPOActor
 from verl.workers.config import ActorConfig, PolicyLossConfig
 from verl.workers.fsdp_workers import (
@@ -199,6 +200,45 @@ class Recorder:
         self.call_count += 1
         self.calls.append(self.name)
         return self.result
+
+
+def test_ref_retokenization_uses_the_declared_raw_prompt_key():
+    messages = np.empty(1, dtype=object)
+    messages[0] = [{"role": "user", "content": "question"}]
+    batch = DataProto(
+        batch=TensorDict(
+            {
+                "input_ids": torch.tensor([[10, 20, 30, 0]]),
+                "responses": torch.tensor([[30, 0]]),
+                "attention_mask": torch.tensor([[1, 1, 1, 0]]),
+                "position_ids": torch.tensor([[0, 1, 2, 0]]),
+                "response_mask": torch.tensor([[1, 0]]),
+            },
+            batch_size=1,
+        ),
+        non_tensor_batch={"teacher_prompt": messages},
+    )
+
+    class Tokenizer:
+        pad_token_id = 0
+
+        def apply_chat_template(self, value, **kwargs):
+            assert value == messages[0]
+            assert kwargs["add_generation_prompt"] is True
+            return "rendered prompt"
+
+        def __call__(self, value, **kwargs):
+            assert value == "rendered prompt"
+            return {"input_ids": torch.tensor([[7, 8]])}
+
+    result = prepare_ref_model_inputs(
+        batch,
+        Tokenizer(),
+        apply_chat_template_kwargs={"enable_thinking": False},
+        raw_prompt_key="teacher_prompt",
+    )
+    assert result.batch["ref_input_ids"].tolist() == [[7, 8, 30, 0]]
+    assert result.batch["ref_attention_mask"].tolist() == [[1, 1, 1, 0]]
 
 
 def test_completed_rollout_subtree_is_reused_and_incomplete_staging_blocks(tmp_path):

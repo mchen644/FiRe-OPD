@@ -75,6 +75,7 @@ MAIN_SOURCE_FILES = (
     "verl/examples/fire_opd/run_direct_opd_proxy_gradient_fixture.sh",
     "verl/verl/trainer/ppo/opd_proxy_verify_capture.py",
     "verl/verl/trainer/ppo/core_algos.py",
+    "verl/verl/trainer/ppo/ref_input_utils.py",
     "verl/verl/trainer/ppo/rollout_corr_helper.py",
     "verl/verl/trainer/ppo/ray_trainer.py",
     "verl/verl/trainer/main_ppo.py",
