@@ -76,6 +76,14 @@ if [[ ! "${model_sha256}" =~ ^[0-9a-f]{64}$ ]]; then
   echo "expected model SHA-256 must be 64 lowercase hex characters" >&2
   exit 2
 fi
+if [[ -z "${SLURM_JOB_ID:-}" ]]; then
+  echo "direct fixture requires an active Slurm job" >&2
+  exit 2
+fi
+if [[ "$(tmux display-message -p '#S')" != "opd-CLI" ]]; then
+  echo "direct fixture must run inside the opd-CLI tmux session" >&2
+  exit 2
+fi
 if [[ -z "${CUDA_VISIBLE_DEVICES:-}" || "${CUDA_VISIBLE_DEVICES}" == *,* ]]; then
   echo "direct fixture requires exactly one process-local CUDA_VISIBLE_DEVICES token" >&2
   exit 2
