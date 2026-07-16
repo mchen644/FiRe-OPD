@@ -103,6 +103,7 @@ def test_candidate_wrapper_contains_artifact_provenance_and_gpu_gates() -> None:
         "expected_gpus=4",
         "flock -n",
         "VANILLA_SFTGRAD_PREFLIGHT_ONLY",
+        "runtime_versions",
     ]
     for value in required:
         assert value in text

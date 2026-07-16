@@ -212,6 +212,8 @@ for artifact in \
 done
 [[ -d "$STUDENT_MODEL" ]] || die "student model directory is missing: $STUDENT_MODEL"
 [[ -d "$TEACHER_MODEL" ]] || die "teacher model directory is missing: $TEACHER_MODEL"
+[[ -f "$STUDENT_MODEL/config.json" ]] || die "student model config is missing"
+[[ -f "$TEACHER_MODEL/config.json" ]] || die "teacher model config is missing"
 [[ ! -e "$LOG_FILE" ]] || die "training log already exists: $LOG_FILE"
 
 export PYTHONPATH="${REPO_DIR}/verl:${REPO_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
@@ -222,6 +224,22 @@ code_head="$(git rev-parse HEAD)"
 code_tree="$(git rev-parse 'HEAD^{tree}')"
 code_status_sha256="$(printf '%s' "$code_status" | sha256sum | awk '{print $1}')"
 code_diff_sha256="$(git diff --binary HEAD | sha256sum | awk '{print $1}')"
+student_model_config_sha256="$(sha256sum -- "$STUDENT_MODEL/config.json" | awk '{print $1}')"
+teacher_model_config_sha256="$(sha256sum -- "$TEACHER_MODEL/config.json" | awk '{print $1}')"
+runtime_versions="$($PYTHON_BIN - <<'PY'
+import importlib.metadata
+import json
+import platform
+
+packages = {}
+for name in ("flash-attn", "ray", "torch", "transformers", "verl", "vllm"):
+    try:
+        packages[name] = importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        packages[name] = None
+print(json.dumps({"packages": packages, "python": platform.python_version()}, sort_keys=True))
+PY
+)"
 require_sha256 "$SOURCE_DATA" "$SOURCE_SHA256"
 require_sha256 "$FROZEN_PREFIX" "$FROZEN_PREFIX_SHA256"
 require_sha256 "$OLD_PARQUET" "$OLD_PARQUET_SHA256"
@@ -590,6 +608,9 @@ printf 'code_head=%s\n' "$code_head"
 printf 'code_tree=%s\n' "$code_tree"
 printf 'code_status_sha256=%s\n' "$code_status_sha256"
 printf 'code_diff_sha256=%s\n' "$code_diff_sha256"
+printf 'student_model_config_sha256=%s\n' "$student_model_config_sha256"
+printf 'teacher_model_config_sha256=%s\n' "$teacher_model_config_sha256"
+printf 'runtime_versions=%s\n' "$runtime_versions"
 printf 'base_launcher_sha256=%s\n' "$(sha256sum -- "$BASE_LAUNCHER" | awk '{print $1}')"
 printf 'candidate_launcher_sha256=%s\n' "$(sha256sum -- "${BASH_SOURCE[0]}" | awk '{print $1}')"
 printf '%s\n' "$candidate_contract"
@@ -624,6 +645,11 @@ printf 'artifact_contract=%s\n' "$artifact_contract_json"
 printf 'validator_report=%s\n' "$validation_report"
 printf 'code_head=%s\n' "$code_head"
 printf 'code_tree=%s\n' "$code_tree"
+printf 'code_status_sha256=%s\n' "$code_status_sha256"
+printf 'code_diff_sha256=%s\n' "$code_diff_sha256"
+printf 'student_model_config_sha256=%s\n' "$student_model_config_sha256"
+printf 'teacher_model_config_sha256=%s\n' "$teacher_model_config_sha256"
+printf 'runtime_versions=%s\n' "$runtime_versions"
 printf 'base_launcher_sha256=%s\n' "$(sha256sum -- "$BASE_LAUNCHER" | awk '{print $1}')"
 printf 'candidate_launcher_sha256=%s\n' "$(sha256sum -- "${BASH_SOURCE[0]}" | awk '{print $1}')"
 printf '%s\n' "$candidate_contract"
