@@ -149,8 +149,33 @@ def validate_training_artifact(
     expected_source_rows: int,
     expected_eligible_rows: int,
     max_prompt_tokens: int,
+    expected_selection_profile: str | None = None,
+    frozen_prefix_selected_ids_path: Path | None = None,
+    expected_frozen_prefix_sha256: str | None = None,
+    expected_frozen_prefix_rows: int | None = None,
 ) -> dict[str, object]:
     """Validate exact training data provenance before a training launch."""
+    profile_values = (
+        expected_selection_profile,
+        frozen_prefix_selected_ids_path,
+        expected_frozen_prefix_sha256,
+        expected_frozen_prefix_rows,
+    )
+    profile_enabled = all(value is not None for value in profile_values)
+    if any(value is not None for value in profile_values) and not profile_enabled:
+        raise ValueError(
+            "selection profile and frozen prefix arguments must be provided together"
+        )
+    if profile_enabled:
+        if not isinstance(expected_selection_profile, str) or not expected_selection_profile:
+            raise ValueError("expected selection profile must be a nonempty string")
+        if (
+            isinstance(expected_frozen_prefix_rows, bool)
+            or not isinstance(expected_frozen_prefix_rows, int)
+            or expected_frozen_prefix_rows <= 0
+        ):
+            raise ValueError("expected frozen prefix rows must be positive")
+
     artifact_paths = {
         "selected parquet": selected_parquet,
         "source parquet": source_parquet,
@@ -158,6 +183,8 @@ def validate_training_artifact(
         "selected IDs": selected_ids_path,
         "diagnostics": diagnostics_path,
     }
+    if profile_enabled:
+        artifact_paths["frozen prefix selected IDs"] = frozen_prefix_selected_ids_path
     for label, path in artifact_paths.items():
         if not path.is_file():
             raise ValueError(f"{label} is not a regular file: {path}")
@@ -230,6 +257,46 @@ def validate_training_artifact(
         raise ValueError(
             f"selected ID row count mismatch: expected {expected_rows}, got {len(id_rows)}"
         )
+
+    prefix_rows: list[dict] | None = None
+    prefix_path: Path | None = None
+    if profile_enabled:
+        prefix_path = Path(frozen_prefix_selected_ids_path).resolve()
+        actual_prefix_sha256 = sha256_file(prefix_path)
+        if actual_prefix_sha256 != expected_frozen_prefix_sha256:
+            raise ValueError(
+                "frozen prefix SHA-256 mismatch: "
+                f"expected {expected_frozen_prefix_sha256}, "
+                f"got {actual_prefix_sha256}"
+            )
+        prefix_rows = _load_selected_ids(prefix_path)
+        if len(prefix_rows) != expected_frozen_prefix_rows:
+            raise ValueError(
+                "frozen prefix row count mismatch: "
+                f"expected {expected_frozen_prefix_rows}, got {len(prefix_rows)}"
+            )
+        if id_rows[:expected_frozen_prefix_rows] != prefix_rows:
+            raise ValueError("selected IDs do not preserve the exact prefix")
+
+        selection = manifest.get("selection")
+        if not isinstance(selection, dict):
+            raise ValueError("manifest selection profile contract is missing")
+        if selection.get("profile") != expected_selection_profile:
+            raise ValueError(
+                "manifest selection profile mismatch: "
+                f"expected {expected_selection_profile!r}, "
+                f"got {selection.get('profile')!r}"
+            )
+        if selection.get("target_size") != expected_rows:
+            raise ValueError("manifest selection profile target_size mismatch")
+        expected_prefix_contract = {
+            "path": str(prefix_path),
+            "row_count": expected_frozen_prefix_rows,
+            "sha256": expected_frozen_prefix_sha256,
+            "selected_id_sequence_sha256": _id_sequence_sha256(prefix_rows),
+        }
+        if selection.get("frozen_prefix") != expected_prefix_contract:
+            raise ValueError("manifest frozen prefix contract mismatch")
 
     ids = []
     source_indices = []
@@ -343,7 +410,7 @@ def validate_training_artifact(
             f"{prompts_over_limit} prompt(s) exceed {max_prompt_tokens} tokens"
         )
 
-    return {
+    report: dict[str, object] = {
         "selected_parquet": str(selected_parquet.resolve()),
         "selected_sha256": selected_sha256,
         "selected_rows": selected.num_rows,
@@ -369,6 +436,16 @@ def validate_training_artifact(
         "prompt_token_limit": max_prompt_tokens,
         "prompts_over_limit": 0,
     }
+    if profile_enabled:
+        report.update(
+            {
+                "selection_profile": expected_selection_profile,
+                "frozen_prefix_rows": expected_frozen_prefix_rows,
+                "frozen_prefix_path": str(prefix_path),
+                "frozen_prefix_sha256": expected_frozen_prefix_sha256,
+            }
+        )
+    return report
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -388,6 +465,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-source-rows", type=int, required=True)
     parser.add_argument("--expected-eligible-rows", type=int, required=True)
     parser.add_argument("--max-prompt-tokens", type=int, required=True)
+    parser.add_argument("--expected-selection-profile")
+    parser.add_argument("--frozen-prefix-selected-ids", type=Path)
+    parser.add_argument("--expected-frozen-prefix-sha256")
+    parser.add_argument("--expected-frozen-prefix-rows", type=int)
     parser.add_argument("--checkpoint-dir", type=Path, required=True)
     return parser
 
@@ -418,6 +499,10 @@ def main() -> None:
         expected_source_rows=args.expected_source_rows,
         expected_eligible_rows=args.expected_eligible_rows,
         max_prompt_tokens=args.max_prompt_tokens,
+        expected_selection_profile=args.expected_selection_profile,
+        frozen_prefix_selected_ids_path=args.frozen_prefix_selected_ids,
+        expected_frozen_prefix_sha256=args.expected_frozen_prefix_sha256,
+        expected_frozen_prefix_rows=args.expected_frozen_prefix_rows,
     )
     ensure_empty_checkpoint_dir(args.checkpoint_dir)
     print(json.dumps(report, sort_keys=True))

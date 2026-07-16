@@ -155,6 +155,8 @@ def test_validate_training_artifact_accepts_exact_source_subset(tmp_path: Path):
     assert report["selected_ids_sha256"] == _sha256(ids)
     assert report["diagnostics"] == str(diagnostics.resolve())
     assert report["diagnostics_sha256"] == _sha256(diagnostics)
+    assert "selection_profile" not in report
+    assert not any(key.startswith("frozen_prefix") for key in report)
     assert tokenizer.calls == [
         {
             "tokenize": True,
@@ -183,6 +185,109 @@ def _validate_fixture(paths, manifest, tokenizer, **overrides):
     return validation.validate_training_artifact(
         selected, source, manifest_path, ids, diagnostics, tokenizer, **arguments
     )
+
+
+def _vanilla_profile_fixture(tmp_path: Path):
+    source, selected, ids, diagnostics, manifest_path, manifest = _artifacts(
+        tmp_path, [_row(0), _row(1), _row(2)], [2, 0]
+    )
+    prefix_path = tmp_path / "prefix.jsonl"
+    prefix_path.write_text(
+        ids.read_text(encoding="utf-8").splitlines()[0] + "\n",
+        encoding="utf-8",
+    )
+    prefix_sha = _sha256(prefix_path)
+    prefix_rows = [json.loads(prefix_path.read_text(encoding="utf-8"))]
+    manifest["selection"] = {
+        "method": "balanced_round_robin",
+        "seed": 42,
+        "target_size": 2,
+        "profile": "vanilla_51200",
+        "frozen_prefix": {
+            "path": str(prefix_path.resolve()),
+            "row_count": 1,
+            "sha256": prefix_sha,
+            "selected_id_sequence_sha256": validation._id_sequence_sha256(
+                prefix_rows
+            ),
+        },
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    paths = (source, selected, ids, diagnostics, manifest_path)
+    profile_arguments = {
+        "expected_selection_profile": "vanilla_51200",
+        "frozen_prefix_selected_ids_path": prefix_path,
+        "expected_frozen_prefix_sha256": prefix_sha,
+        "expected_frozen_prefix_rows": 1,
+    }
+    return paths, manifest, prefix_path, profile_arguments
+
+
+def test_validator_accepts_vanilla_profile_and_rechecks_exact_prefix(
+    tmp_path: Path,
+) -> None:
+    paths, manifest, prefix_path, profile_arguments = _vanilla_profile_fixture(
+        tmp_path
+    )
+
+    report = _validate_fixture(
+        paths,
+        manifest,
+        FakeTokenizer(),
+        **profile_arguments,
+    )
+
+    assert report["selection_profile"] == "vanilla_51200"
+    assert report["frozen_prefix_rows"] == 1
+    assert report["frozen_prefix_path"] == str(prefix_path.resolve())
+    assert report["frozen_prefix_sha256"] == _sha256(prefix_path)
+
+
+def test_validator_rejects_frozen_prefix_file_hash_mismatch(tmp_path: Path) -> None:
+    paths, manifest, _, arguments = _vanilla_profile_fixture(tmp_path)
+    arguments["expected_frozen_prefix_sha256"] = "0" * 64
+
+    with pytest.raises(ValueError, match="prefix SHA-256"):
+        _validate_fixture(paths, manifest, FakeTokenizer(), **arguments)
+
+
+def test_validator_rejects_selected_ids_that_do_not_start_with_prefix(
+    tmp_path: Path,
+) -> None:
+    paths, manifest, _, arguments = _vanilla_profile_fixture(tmp_path)
+    source, selected, ids, diagnostics, manifest_path = paths
+    rows = [
+        json.loads(line)
+        for line in ids.read_text(encoding="utf-8").splitlines()
+    ]
+    rows.reverse()
+    ids.write_text(
+        "".join(
+            json.dumps(row, separators=(",", ":")) + "\n" for row in rows
+        ),
+        encoding="utf-8",
+    )
+    manifest["selected_ids_sha256"] = _sha256(ids)
+    manifest["selected_id_sequence_sha256"] = validation._id_sequence_sha256(rows)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="exact prefix"):
+        _validate_fixture(
+            (source, selected, ids, diagnostics, manifest_path),
+            manifest,
+            FakeTokenizer(),
+            **arguments,
+        )
+
+
+def test_validator_rejects_selection_profile_mismatch(tmp_path: Path) -> None:
+    paths, manifest, _, arguments = _vanilla_profile_fixture(tmp_path)
+    manifest_path = paths[-1]
+    manifest["selection"]["profile"] = "coreset_12800"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="selection profile"):
+        _validate_fixture(paths, manifest, FakeTokenizer(), **arguments)
 
 
 def test_validator_rejects_pinned_selected_hash_mismatch(tmp_path: Path):
