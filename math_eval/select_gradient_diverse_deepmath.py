@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -44,6 +45,16 @@ PRIMARY_RATIO = 0.10
 PRIMARY_SEED = 42
 SELECTION_SEED = 42
 TARGET_SIZE = 12_800
+CORESET_12800_PROFILE_NAME = "coreset_12800"
+VANILLA_51200_PROFILE_NAME = "vanilla_51200"
+VANILLA_TARGET_SIZE = 51_200
+FROZEN_PREFIX_SIZE = 12_800
+FROZEN_PREFIX_SELECTED_IDS_SHA256 = (
+    "a78c04cff10c148f45bf9c828e07cc9cf01398b48efeb707253273af359a037e"
+)
+FROZEN_PREFIX_LOGICAL_SHA256 = (
+    "e59e9fd7270f5b0a533bd5e4374733a4f68edbbae1edb1ffea4bf21cbb91ecaf"
+)
 SOURCE_ROW_COUNT = 57_046
 ELIGIBLE_ROW_COUNT = 57_045
 EXPECTED_EXCLUDED_IDS = ("deepmath-level6-038794",)
@@ -52,10 +63,44 @@ DATASET_REVISION = "5cf055d1fe3d7a2eb19719ac020211469736ae44"
 MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
 MODEL_REVISION = "7ae557604adf67be50417f59c2c2f167def9a775"
 GRADIENT_MANIFEST_NAME = "gradient.manifest.json"
+SELECTION_SOURCE_FILES = (
+    "math_eval/deepmath_gradient_diversity.py",
+    "math_eval/select_gradient_diverse_deepmath.py",
+)
 
 _CHUNK_PATTERN = re.compile(
     r"^([A-Za-z0-9][A-Za-z0-9_-]*)\.(0|[1-9][0-9]*)\.(txt|safetensors)$"
 )
+
+
+@dataclass(frozen=True)
+class SelectionProfile:
+    name: str
+    target_size: int
+    frozen_prefix_size: int
+
+
+CORESET_12800_PROFILE = SelectionProfile(
+    name=CORESET_12800_PROFILE_NAME,
+    target_size=TARGET_SIZE,
+    frozen_prefix_size=0,
+)
+VANILLA_51200_PROFILE = SelectionProfile(
+    name=VANILLA_51200_PROFILE_NAME,
+    target_size=VANILLA_TARGET_SIZE,
+    frozen_prefix_size=FROZEN_PREFIX_SIZE,
+)
+_SELECTION_PROFILES = {
+    profile.name: profile
+    for profile in (CORESET_12800_PROFILE, VANILLA_51200_PROFILE)
+}
+
+
+def selection_profile(name: str) -> SelectionProfile:
+    try:
+        return _SELECTION_PROFILES[name]
+    except (KeyError, TypeError) as error:
+        raise ValueError(f"unsupported selection profile: {name!r}") from error
 
 
 def _reject_duplicate_json_pairs(pairs):
@@ -340,6 +385,36 @@ def _git_output(repository: Path, *arguments: str) -> str:
     except (OSError, subprocess.CalledProcessError) as error:
         raise ValueError(f"invalid reference repository {repository}: {error}") from error
     return completed.stdout.strip()
+
+
+def build_selector_source_provenance(
+    repository: Path, source_files: Sequence[str] = SELECTION_SOURCE_FILES
+) -> dict[str, object]:
+    root = Path(repository).resolve()
+    if not root.is_dir():
+        raise ValueError(f"selector repository does not exist: {root}")
+    status = _git_output(
+        root, "status", "--porcelain=v1", "--untracked-files=all"
+    )
+    if status:
+        raise ValueError("selector repository must be clean")
+    head = _git_output(root, "rev-parse", "HEAD")
+    tree = _git_output(root, "rev-parse", "HEAD^{tree}")
+    files: dict[str, str] = {}
+    for relative in source_files:
+        if not isinstance(relative, str) or not relative:
+            raise ValueError("selector source paths must be nonempty strings")
+        path = (root / relative).resolve()
+        if root not in path.parents or not path.is_file():
+            raise ValueError(f"selector source file is missing: {relative}")
+        _git_output(root, "ls-files", "--error-unmatch", relative)
+        files[relative] = sha256_file(path)
+    return {
+        "repository": str(root),
+        "head": head,
+        "tree": tree,
+        "files": files,
+    }
 
 
 def _import_exact_class(module_path: Path, class_name: str, module_tag: str):
@@ -857,6 +932,134 @@ def _selected_id_sequence_sha256(rows: Sequence[Mapping]) -> str:
     return digest.hexdigest()
 
 
+def load_frozen_selection_prefix(
+    path: Path, *, expected_sha256: str, expected_rows: int
+) -> tuple[list[dict], dict[str, object]]:
+    prefix_path = Path(path).resolve()
+    if not prefix_path.is_file():
+        raise ValueError(f"frozen selected-ID prefix is missing: {prefix_path}")
+    if (
+        isinstance(expected_rows, bool)
+        or not isinstance(expected_rows, int)
+        or expected_rows <= 0
+    ):
+        raise ValueError("expected frozen prefix rows must be a positive integer")
+    actual_sha256 = sha256_file(prefix_path)
+    if actual_sha256 != expected_sha256:
+        raise ValueError(
+            "frozen selected-ID prefix SHA-256 mismatch: "
+            f"expected {expected_sha256}, got {actual_sha256}"
+        )
+    raw_lines = prefix_path.read_bytes().splitlines(keepends=True)
+    if len(raw_lines) != expected_rows or any(
+        not line.endswith(b"\n") for line in raw_lines
+    ):
+        raise ValueError("frozen selected-ID prefix row count/newline mismatch")
+
+    required = {
+        "eligible_position",
+        "id",
+        "original_dataset_index",
+        "source_row_index",
+    }
+    rows: list[dict] = []
+    for line_number, raw_line in enumerate(raw_lines, start=1):
+        try:
+            text = raw_line[:-1].decode("utf-8")
+        except UnicodeError as error:
+            raise ValueError(
+                f"frozen prefix row {line_number} is not UTF-8"
+            ) from error
+        row = _strict_json_loads(text, f"frozen prefix row {line_number}")
+        if not isinstance(row, dict) or set(row) != required:
+            raise ValueError(
+                f"frozen prefix row {line_number} has invalid fields"
+            )
+        if not isinstance(row["id"], str) or not row["id"]:
+            raise ValueError(f"frozen prefix row {line_number} has invalid ID")
+        for field in (
+            "eligible_position",
+            "original_dataset_index",
+            "source_row_index",
+        ):
+            value = row[field]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(
+                    f"frozen prefix row {line_number} has invalid {field}"
+                )
+        canonical = (
+            json.dumps(
+                row,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        if raw_line != canonical:
+            raise ValueError(
+                f"frozen prefix row {line_number} is not canonical"
+            )
+        rows.append(row)
+
+    for field in ("id", "eligible_position", "source_row_index"):
+        values = [row[field] for row in rows]
+        if len(set(values)) != expected_rows:
+            raise ValueError(
+                f"frozen selected-ID prefix contains duplicate {field} values"
+            )
+    return rows, {
+        "path": str(prefix_path),
+        "row_count": expected_rows,
+        "sha256": actual_sha256,
+        "selected_id_sequence_sha256": _selected_id_sequence_sha256(rows),
+    }
+
+
+def validate_frozen_selection_prefix(
+    selected_rows: Sequence[Mapping], frozen_rows: Sequence[Mapping]
+) -> None:
+    prefix_size = len(frozen_rows)
+    if len(selected_rows) < prefix_size or [
+        dict(row) for row in selected_rows[:prefix_size]
+    ] != [dict(row) for row in frozen_rows]:
+        raise ValueError("new selection does not preserve the exact prefix")
+
+
+def build_selection_contract(
+    profile: SelectionProfile,
+    *,
+    prefix_provenance: Mapping[str, object] | None,
+    source_provenance: Mapping[str, object] | None,
+) -> dict[str, object]:
+    if profile not in (CORESET_12800_PROFILE, VANILLA_51200_PROFILE):
+        raise ValueError(f"unsupported selection profile contract: {profile!r}")
+    contract: dict[str, object] = {
+        "method": "balanced_round_robin",
+        "seed": SELECTION_SEED,
+        "target_size": profile.target_size,
+    }
+    if profile == CORESET_12800_PROFILE:
+        if prefix_provenance is not None or source_provenance is not None:
+            raise ValueError("old selection profile forbids new provenance fields")
+        return {"selection": contract}
+    if prefix_provenance is None or source_provenance is None:
+        raise ValueError(
+            "vanilla_51200 requires prefix and source provenance"
+        )
+    contract.update(
+        {
+            "profile": profile.name,
+            "frozen_prefix": dict(prefix_provenance),
+        }
+    )
+    return {
+        "selection": contract,
+        "selection_source": dict(source_provenance),
+    }
+
+
 def _validate_selection_output_isolation(
     outputs: Sequence[Path], inputs: Sequence[Path], gradient_dir: Path
 ) -> None:
@@ -934,21 +1137,26 @@ def run_selection(
     expected_source_count: int = SOURCE_ROW_COUNT,
     expected_eligible_count: int = ELIGIBLE_ROW_COUNT,
     target_size: int = TARGET_SIZE,
+    selection_profile_name: str = CORESET_12800_PROFILE_NAME,
+    frozen_prefix_selected_ids_path: Path | None = None,
 ) -> dict:
     """Run the pinned four-clustering selection and publish its exact artifacts."""
+    profile = selection_profile(selection_profile_name)
     if expected_source_count != SOURCE_ROW_COUNT:
         raise ValueError(f"expected_source_count must be pinned to {SOURCE_ROW_COUNT}")
     if expected_eligible_count != ELIGIBLE_ROW_COUNT:
         raise ValueError(f"expected_eligible_count must be pinned to {ELIGIBLE_ROW_COUNT}")
-    if target_size != TARGET_SIZE:
-        raise ValueError(f"target_size must be pinned to {TARGET_SIZE}")
+    if target_size != profile.target_size:
+        raise ValueError(
+            f"target_size must be pinned to {profile.target_size} "
+            f"for profile {profile.name}"
+        )
+    if profile == CORESET_12800_PROFILE and frozen_prefix_selected_ids_path is not None:
+        raise ValueError("coreset_12800 forbids a frozen selected-ID prefix")
+    if profile == VANILLA_51200_PROFILE and frozen_prefix_selected_ids_path is None:
+        raise ValueError("vanilla_51200 requires a frozen selected-ID prefix")
     if device != "cuda:0":
         raise ValueError("selection device must be explicit cuda:0")
-    if torch.cuda.device_count() != 1:
-        raise RuntimeError(
-            "selection requires exactly one visible CUDA device; "
-            f"found {torch.cuda.device_count()}"
-        )
 
     source_parquet = Path(source_parquet).resolve()
     prepared_jsonl = Path(prepared_jsonl).resolve()
@@ -956,6 +1164,30 @@ def run_selection(
     eligibility_report_path = Path(eligibility_report_path).resolve()
     gradient_dir = Path(gradient_dir).resolve()
     reference_repo = Path(reference_repo).resolve()
+    frozen_prefix_path = (
+        Path(frozen_prefix_selected_ids_path).resolve()
+        if frozen_prefix_selected_ids_path is not None
+        else None
+    )
+    frozen_prefix_rows: list[dict] = []
+    prefix_provenance: dict[str, object] | None = None
+    if frozen_prefix_path is not None:
+        frozen_prefix_rows, prefix_provenance = load_frozen_selection_prefix(
+            frozen_prefix_path,
+            expected_sha256=FROZEN_PREFIX_SELECTED_IDS_SHA256,
+            expected_rows=FROZEN_PREFIX_SIZE,
+        )
+        if (
+            prefix_provenance["selected_id_sequence_sha256"]
+            != FROZEN_PREFIX_LOGICAL_SHA256
+        ):
+            raise ValueError("frozen selected-ID prefix logical SHA-256 mismatch")
+    if torch.cuda.device_count() != 1:
+        raise RuntimeError(
+            "selection requires exactly one visible CUDA device; "
+            f"found {torch.cuda.device_count()}"
+        )
+
     output_paths = [
         Path(output_parquet),
         Path(selected_ids_path),
@@ -963,15 +1195,18 @@ def run_selection(
         Path(manifest_path),
     ]
     gradient_manifest_path = gradient_dir / GRADIENT_MANIFEST_NAME
+    input_paths = [
+        source_parquet,
+        prepared_jsonl,
+        prepared_manifest_path,
+        eligibility_report_path,
+        gradient_manifest_path,
+    ]
+    if frozen_prefix_path is not None:
+        input_paths.append(frozen_prefix_path)
     _validate_selection_output_isolation(
         output_paths,
-        [
-            source_parquet,
-            prepared_jsonl,
-            prepared_manifest_path,
-            eligibility_report_path,
-            gradient_manifest_path,
-        ],
+        input_paths,
         gradient_dir,
     )
 
@@ -1091,7 +1326,19 @@ def run_selection(
         {row["id"] for row in selected_rows}
     ) != target_size:
         raise RuntimeError("primary selection is not the exact unique target size")
+    if frozen_prefix_rows:
+        validate_frozen_selection_prefix(selected_rows, frozen_prefix_rows)
 
+    source_provenance = (
+        build_selector_source_provenance(Path(__file__).resolve().parents[1])
+        if profile == VANILLA_51200_PROFILE
+        else None
+    )
+    selection_contract = build_selection_contract(
+        profile,
+        prefix_provenance=prefix_provenance,
+        source_provenance=source_provenance,
+    )
     base_manifest = {
         "manifest_version": 1,
         "source_parquet": str(source_parquet),
@@ -1124,11 +1371,7 @@ def run_selection(
             "primary_ratio": PRIMARY_RATIO,
             "primary_seed": PRIMARY_SEED,
         },
-        "selection": {
-            "method": "balanced_round_robin",
-            "seed": SELECTION_SEED,
-            "target_size": target_size,
-        },
+        **selection_contract,
         "selected_id_sequence_sha256": _selected_id_sequence_sha256(selected_rows),
         "diagnostic_results": diagnostics,
     }
@@ -1146,7 +1389,7 @@ def run_selection(
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Select the pinned gradient-diverse DeepMath 12,800-row coreset"
+        description="Select a pinned gradient-diverse DeepMath profile"
     )
     parser.add_argument("--source-parquet", type=Path, required=True)
     parser.add_argument("--prepared-jsonl", type=Path, required=True)
@@ -1164,6 +1407,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--expected-eligible-count", type=int, default=ELIGIBLE_ROW_COUNT
     )
     parser.add_argument("--target-size", type=int, default=TARGET_SIZE)
+    parser.add_argument(
+        "--selection-profile",
+        choices=tuple(_SELECTION_PROFILES),
+        default=CORESET_12800_PROFILE_NAME,
+    )
+    parser.add_argument("--frozen-prefix-selected-ids", type=Path)
     return parser
 
 
@@ -1184,6 +1433,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         expected_source_count=args.expected_source_count,
         expected_eligible_count=args.expected_eligible_count,
         target_size=args.target_size,
+        selection_profile_name=args.selection_profile,
+        frozen_prefix_selected_ids_path=args.frozen_prefix_selected_ids,
     )
     print(json.dumps(manifest, ensure_ascii=False, sort_keys=True))
     return 0

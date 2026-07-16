@@ -2,6 +2,7 @@ import hashlib
 import json
 import multiprocessing
 from pathlib import Path
+import subprocess
 
 import numpy as np
 import pyarrow as pa
@@ -12,7 +13,9 @@ from safetensors.torch import save_file
 
 from math_eval import select_gradient_diverse_deepmath as selection
 from math_eval.select_gradient_diverse_deepmath import (
+    CORESET_12800_PROFILE,
     PROJECTION_DIM,
+    VANILLA_51200_PROFILE,
     apply_production_eligibility_report,
     build_selection_gradient_provenance,
     cluster_official,
@@ -23,8 +26,250 @@ from math_eval.select_gradient_diverse_deepmath import (
     load_validated_gradient_manifest,
     main,
     publish_selection_artifacts,
+    selection_profile,
     write_selected_parquet,
 )
+
+
+def test_selection_profiles_pin_old_and_vanilla_target_sizes() -> None:
+    old = selection_profile("coreset_12800")
+    vanilla = selection_profile("vanilla_51200")
+
+    assert old == CORESET_12800_PROFILE
+    assert old.target_size == 12_800
+    assert old.frozen_prefix_size == 0
+    assert vanilla == VANILLA_51200_PROFILE
+    assert vanilla.target_size == 51_200
+    assert vanilla.frozen_prefix_size == 12_800
+
+
+def test_selection_profile_rejects_unknown_name() -> None:
+    with pytest.raises(ValueError, match="unsupported selection profile"):
+        selection_profile("almost_vanilla")
+
+
+def test_selection_contract_preserves_old_shape_and_binds_new_prefix() -> None:
+    old = selection.build_selection_contract(
+        CORESET_12800_PROFILE,
+        prefix_provenance=None,
+        source_provenance=None,
+    )
+    assert old == {
+        "selection": {
+            "method": "balanced_round_robin",
+            "seed": 42,
+            "target_size": 12_800,
+        }
+    }
+
+    prefix = {
+        "path": "/frozen/selected_ids.jsonl",
+        "row_count": 12_800,
+        "sha256": selection.FROZEN_PREFIX_SELECTED_IDS_SHA256,
+        "selected_id_sequence_sha256": selection.FROZEN_PREFIX_LOGICAL_SHA256,
+    }
+    source = {"head": "a" * 40, "tree": "b" * 40, "files": {}}
+    new = selection.build_selection_contract(
+        VANILLA_51200_PROFILE,
+        prefix_provenance=prefix,
+        source_provenance=source,
+    )
+    assert new["selection"]["profile"] == "vanilla_51200"
+    assert new["selection"]["frozen_prefix"] == prefix
+    assert new["selection"]["target_size"] == 51_200
+    assert new["selection_source"] == source
+
+
+def _selection_kwargs(tmp_path: Path) -> dict[str, object]:
+    return {
+        "source_parquet": tmp_path / "source.parquet",
+        "prepared_jsonl": tmp_path / "prepared.jsonl",
+        "prepared_manifest_path": tmp_path / "prepared.manifest.json",
+        "eligibility_report_path": tmp_path / "eligibility.json",
+        "gradient_dir": tmp_path / "gradients",
+        "reference_repo": tmp_path / "reference",
+        "device": "cuda:0",
+        "output_parquet": tmp_path / "selected.parquet",
+        "selected_ids_path": tmp_path / "selected_ids.jsonl",
+        "diagnostics_path": tmp_path / "diagnostics.json",
+        "manifest_path": tmp_path / "manifest.json",
+    }
+
+
+def test_run_selection_requires_profile_target_and_prefix_before_cuda(
+    tmp_path: Path,
+) -> None:
+    arguments = _selection_kwargs(tmp_path)
+    with pytest.raises(ValueError, match="target_size.*51200"):
+        selection.run_selection(
+            **arguments,
+            target_size=12_800,
+            selection_profile_name="vanilla_51200",
+            frozen_prefix_selected_ids_path=tmp_path / "prefix.jsonl",
+        )
+    with pytest.raises(ValueError, match="requires.*prefix"):
+        selection.run_selection(
+            **arguments,
+            target_size=51_200,
+            selection_profile_name="vanilla_51200",
+        )
+    with pytest.raises(ValueError, match="forbids.*prefix"):
+        selection.run_selection(
+            **arguments,
+            target_size=12_800,
+            selection_profile_name="coreset_12800",
+            frozen_prefix_selected_ids_path=tmp_path / "prefix.jsonl",
+        )
+
+
+def test_selector_cli_parses_vanilla_profile_and_prefix(tmp_path: Path) -> None:
+    parser = selection._build_parser()
+    values = [
+        "--source-parquet",
+        str(tmp_path / "source.parquet"),
+        "--prepared-jsonl",
+        str(tmp_path / "prepared.jsonl"),
+        "--prepared-manifest",
+        str(tmp_path / "prepared.manifest.json"),
+        "--eligibility-report",
+        str(tmp_path / "eligibility.json"),
+        "--gradient-dir",
+        str(tmp_path / "gradients"),
+        "--reference-repo",
+        str(tmp_path / "reference"),
+        "--device",
+        "cuda:0",
+        "--output-parquet",
+        str(tmp_path / "selected.parquet"),
+        "--selected-ids",
+        str(tmp_path / "selected_ids.jsonl"),
+        "--diagnostics",
+        str(tmp_path / "diagnostics.json"),
+        "--manifest",
+        str(tmp_path / "manifest.json"),
+        "--target-size",
+        "51200",
+        "--selection-profile",
+        "vanilla_51200",
+        "--frozen-prefix-selected-ids",
+        str(tmp_path / "prefix.jsonl"),
+    ]
+
+    args = parser.parse_args(values)
+
+    assert args.selection_profile == "vanilla_51200"
+    assert args.frozen_prefix_selected_ids == tmp_path / "prefix.jsonl"
+    assert args.target_size == 51_200
+
+
+def _write_prefix(path: Path, rows: list[dict]) -> None:
+    path.write_text(
+        "".join(
+            json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
+            for row in rows
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_frozen_selection_prefix_is_strict_and_exact(tmp_path: Path) -> None:
+    rows = [
+        {
+            "eligible_position": 2,
+            "id": "deepmath-level6-000002",
+            "original_dataset_index": 12,
+            "source_row_index": 2,
+        },
+        {
+            "eligible_position": 0,
+            "id": "deepmath-level6-000000",
+            "original_dataset_index": 10,
+            "source_row_index": 0,
+        },
+    ]
+    path = tmp_path / "selected_ids.jsonl"
+    _write_prefix(path, rows)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    loaded, provenance = selection.load_frozen_selection_prefix(
+        path, expected_sha256=digest, expected_rows=2
+    )
+    selection.validate_frozen_selection_prefix(
+        rows + [{"id": "later"}], loaded
+    )
+
+    assert loaded == rows
+    assert provenance == {
+        "path": str(path.resolve()),
+        "row_count": 2,
+        "sha256": digest,
+        "selected_id_sequence_sha256": selection._selected_id_sequence_sha256(
+            rows
+        ),
+    }
+
+
+def test_frozen_selection_prefix_rejects_hash_and_sequence_mismatch(
+    tmp_path: Path,
+) -> None:
+    row = {
+        "eligible_position": 0,
+        "id": "deepmath-level6-000000",
+        "original_dataset_index": 10,
+        "source_row_index": 0,
+    }
+    path = tmp_path / "selected_ids.jsonl"
+    _write_prefix(path, [row])
+
+    with pytest.raises(ValueError, match="SHA-256"):
+        selection.load_frozen_selection_prefix(
+            path, expected_sha256="0" * 64, expected_rows=1
+        )
+    with pytest.raises(ValueError, match="exact prefix"):
+        selection.validate_frozen_selection_prefix(
+            [{**row, "source_row_index": 1}], [row]
+        )
+
+
+def test_selector_source_provenance_requires_clean_commit(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q", repository], check=True)
+    subprocess.run(
+        ["git", "-C", repository, "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", repository, "config", "user.name", "Test"],
+        check=True,
+    )
+    source = repository / "selector.py"
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", repository, "add", "selector.py"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", repository, "commit", "-qm", "fixture"], check=True
+    )
+
+    result = selection.build_selector_source_provenance(
+        repository, ("selector.py",)
+    )
+    assert result["head"] == subprocess.run(
+        ["git", "-C", repository, "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert result["files"]["selector.py"] == hashlib.sha256(
+        source.read_bytes()
+    ).hexdigest()
+
+    source.write_text("VALUE = 2\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="clean"):
+        selection.build_selector_source_provenance(
+            repository, ("selector.py",)
+        )
 
 
 def _ids(*indices: int) -> list[str]:
