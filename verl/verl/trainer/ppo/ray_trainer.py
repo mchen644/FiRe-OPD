@@ -52,7 +52,15 @@ from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, Ra
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
-from verl.trainer.ppo.adaptive_concise_opd import AdaptiveConciseProbePlan
+from verl.trainer.ppo.adaptive_concise_opd import (
+    AdaptiveConciseProbePlan,
+    AdaptiveConciseRoutingResult,
+    finalize_adaptive_concise_routing,
+    plan_adaptive_concise_probes,
+    summarize_adaptive_concise_routing,
+    truncate_to_adaptive_concise_prefix,
+    update_adaptive_concise_cumulative_counts,
+)
 from verl.trainer.ppo.candidate_selection import select_short_correct_candidates
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
@@ -441,6 +449,125 @@ def _remap_reward_to_supervised_prefix(
     rows = torch.arange(reward_tensor.shape[0], device=reward_tensor.device)
     remapped[rows, supervised_lengths - 1] = reward_tensor.sum(dim=-1)
     return remapped
+
+
+def _validate_adaptive_question_batch(batch: DataProto, *, expected_questions: int) -> None:
+    if len(batch) != expected_questions:
+        raise ValueError(
+            f"adaptive concise OPD requires exactly {expected_questions} primary questions, got {len(batch)}"
+        )
+    extra_infos = batch.non_tensor_batch.get("extra_info")
+    if not isinstance(extra_infos, np.ndarray) or extra_infos.ndim != 1 or len(extra_infos) != len(batch):
+        raise ValueError("adaptive concise OPD requires aligned extra_info question identities")
+    identities = []
+    for extra_info in extra_infos.tolist():
+        if not isinstance(extra_info, dict) or "index" not in extra_info:
+            raise ValueError("adaptive concise OPD requires extra_info.index for every question")
+        identities.append(extra_info["index"])
+    try:
+        distinct_count = len(set(identities))
+    except TypeError as exc:
+        raise ValueError("adaptive concise question identities must be hashable") from exc
+    if distinct_count != expected_questions:
+        raise ValueError("adaptive concise OPD requires distinct question identities")
+
+
+def _apply_adaptive_concise_opd(
+    *,
+    batch: DataProto,
+    normal_reward: torch.Tensor,
+    actor_rollout_wg,
+    reward_fn,
+    tokenizer,
+    adaptive_config,
+    max_prompt_length: int,
+    truncation: str,
+    apply_chat_template_kwargs: dict | None,
+    timing_raw: dict,
+) -> tuple[DataProto, torch.Tensor, AdaptiveConciseRoutingResult, dict[str, float]]:
+    """Run adaptive diagnostics and return a routed normal-only training batch."""
+
+    if not adaptive_config or not adaptive_config.get("enabled", False):
+        raise ValueError("adaptive concise OPD helper requires enabled configuration")
+    expected_questions = int(adaptive_config.get("expected_questions_per_step", 1024))
+    _validate_adaptive_question_batch(batch, expected_questions=expected_questions)
+    if "response_mask" not in batch.batch.keys():
+        raise ValueError("adaptive concise OPD requires normal response_mask")
+    if normal_reward.shape != batch.batch["response_mask"].shape:
+        raise ValueError("normal reward must align with the normal response mask")
+
+    threshold = float(adaptive_config.get("correct_reward_threshold", 0.5))
+    cap_ratio = float(adaptive_config.get("concise_cap_ratio", 0.5))
+    plan = plan_adaptive_concise_probes(
+        normal_reward=normal_reward,
+        normal_response_mask=batch.batch["response_mask"],
+        correct_reward_threshold=threshold,
+        concise_cap_ratio=cap_ratio,
+    )
+
+    if plan.probe_indices.numel():
+        diagnostic_prompts = _build_adaptive_concise_generation_batch(
+            batch=batch,
+            plan=plan,
+            tokenizer=tokenizer,
+            max_prompt_length=max_prompt_length,
+            truncation=truncation,
+            temperature=float(adaptive_config.get("temperature", 1.0)),
+            top_p=float(adaptive_config.get("top_p", 1.0)),
+            apply_chat_template_kwargs=apply_chat_template_kwargs,
+        )
+        with marked_timer("concise_probe", timing_raw, color="magenta"):
+            diagnostic_batch = actor_rollout_wg.generate_sequences(diagnostic_prompts)
+            diagnostic_batch.meta_info.pop("timing", None)
+        if "response_mask" not in diagnostic_batch.batch.keys():
+            diagnostic_batch.batch["response_mask"] = compute_response_mask(diagnostic_batch)
+        with marked_timer("concise_reward", timing_raw, color="yellow"):
+            concise_reward, _ = compute_reward(diagnostic_batch, reward_fn)
+        concise_texts = tokenizer.batch_decode(
+            diagnostic_batch.batch["responses"], skip_special_tokens=True
+        )
+        concise_original_indices = diagnostic_batch.non_tensor_batch.get(
+            "adaptive_concise_original_row"
+        )
+        if concise_original_indices is None:
+            raise ValueError("adaptive concise diagnostic output lost original-row mapping")
+        concise_response_mask = diagnostic_batch.batch["response_mask"]
+    else:
+        normal_device = batch.batch["response_mask"].device
+        concise_reward = torch.zeros((0, 0), device=normal_device)
+        concise_response_mask = torch.zeros(
+            (0, 0), device=normal_device, dtype=batch.batch["response_mask"].dtype
+        )
+        concise_original_indices = np.array([], dtype=np.int64)
+        concise_texts = []
+        timing_raw["concise_probe"] = 0.0
+        timing_raw["concise_reward"] = 0.0
+
+    result = finalize_adaptive_concise_routing(
+        plan=plan,
+        concise_reward=concise_reward,
+        concise_response_mask=concise_response_mask,
+        concise_original_indices=concise_original_indices,
+        concise_texts=concise_texts,
+        correct_reward_threshold=threshold,
+    )
+    _apply_adaptive_concise_teacher_prompts(
+        batch=batch,
+        prompt_styles=result.prompt_styles,
+        teacher_prompt_key=str(adaptive_config.get("teacher_prompt_key", "teacher_prompt")),
+    )
+    remapped_reward = _remap_reward_to_supervised_prefix(
+        reward_tensor=normal_reward,
+        supervised_lengths=result.supervised_lengths,
+    )
+    routed_batch = truncate_to_adaptive_concise_prefix(
+        batch=batch,
+        supervised_lengths=result.supervised_lengths,
+    )
+    if remapped_reward.shape[-1] != routed_batch.batch["responses"].shape[-1]:
+        raise ValueError("remapped reward width does not match routed normal response width")
+    metrics = summarize_adaptive_concise_routing(result)
+    return routed_batch, remapped_reward, result, metrics
 
 
 def _build_online_tale_budget_generation_batch(
@@ -2225,10 +2352,12 @@ class RayPPOTrainer:
         )
         next_step_profile = False
 
+        adaptive_concise_cumulative: dict[str, int] = {}
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics = {}
                 timing_raw = {}
+                adaptive_routing_result: AdaptiveConciseRoutingResult | None = None
 
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
@@ -2321,6 +2450,41 @@ class RayPPOTrainer:
                             )
                         else:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+
+                    adaptive_config = self.config.algorithm.get("adaptive_concise_opd", None)
+                    if adaptive_config and adaptive_config.get("enabled", False):
+                        if self.config.reward_model.launch_reward_fn_async and reward_tensor is None:
+                            reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                        timing_raw["normal_rollout"] = timing_raw["gen"]
+                        timing_raw["normal_reward"] = timing_raw["reward"]
+                        batch, reward_tensor, adaptive_routing_result, adaptive_metrics = (
+                            _apply_adaptive_concise_opd(
+                                batch=batch,
+                                normal_reward=reward_tensor,
+                                actor_rollout_wg=self.actor_rollout_wg,
+                                reward_fn=self.reward_fn,
+                                tokenizer=self.tokenizer,
+                                adaptive_config=adaptive_config,
+                                max_prompt_length=self.config.data.max_prompt_length,
+                                truncation=self.config.data.get("truncation", "error"),
+                                apply_chat_template_kwargs=self.config.data.get(
+                                    "apply_chat_template_kwargs", {}
+                                ),
+                                timing_raw=timing_raw,
+                            )
+                        )
+                        metrics.update(adaptive_metrics)
+                        batch.batch["adaptive_concise_normal_reward"] = reward_tensor
+                        if self.config.trainer.balance_batch:
+                            self._balance_batch(
+                                batch,
+                                metrics=metrics,
+                                logging_prefix="adaptive_concise_seqlen",
+                            )
+                        reward_tensor = batch.batch.pop("adaptive_concise_normal_reward")
+                        batch.meta_info["global_token_num"] = torch.sum(
+                            batch.batch["attention_mask"], dim=-1
+                        ).tolist()
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
@@ -2596,6 +2760,14 @@ class RayPPOTrainer:
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+                        if adaptive_routing_result is not None:
+                            adaptive_concise_cumulative, cumulative_metrics = (
+                                update_adaptive_concise_cumulative_counts(
+                                    adaptive_concise_cumulative,
+                                    adaptive_routing_result,
+                                )
+                            )
+                            metrics.update(cumulative_metrics)
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
