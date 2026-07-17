@@ -1,7 +1,7 @@
 # Vanilla OPD SFT-Gradient 51,200 AIME Evaluation Design
 
 **Date:** 2026-07-17
-**Status:** Approved in conversation; pending written-spec review
+**Status:** Approved for execution
 **Scope:** Independent step-50 evaluation on AIME 2024 and AIME 2025 only
 
 ## Objective
