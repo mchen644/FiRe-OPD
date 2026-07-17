@@ -50,6 +50,7 @@ from math_eval.prismatic_lite_pilot_generation import (
     NearDuplicateIndex,
     candidate_id,
     difficulty_weighted_fewshots,
+    is_multiple_choice_problem,
     majority_group,
     normalized_tokens,
     parse_generated_problems,
@@ -64,6 +65,7 @@ from math_eval.prismatic_lite_pilot_generation import (
 
 CANONICAL_REPOSITORY = Path("/home/mchen/FiRe-OPD")
 QWEN_MODEL_PATH = CANONICAL_REPOSITORY / "models/Qwen3-30B-A3B-Instruct-2507"
+QWEN_MODEL_REVISION = "0d7cf23991f47feeb3a57ecb4c9cee8ea4a17bfe"
 REFERENCE_REPO = Path("/home/mchen/prismatic-synthesis-reference")
 REFERENCE_COMMIT = "d9484cd3b5991030b901ac4a3a9e2472dbfac2ad"
 PILOT_DATA_ROOT = CANONICAL_REPOSITORY / "data/prismatic_lite/qwen3_2k_pilot"
@@ -222,6 +224,23 @@ def require_promising_calibration(paths: PilotPaths) -> dict[str, object]:
     return report
 
 
+def _verify_qwen_model_revision(path: Path) -> None:
+    metadata = sorted(Path(path).glob(".cache/huggingface/download/*.metadata"))
+    if not metadata:
+        raise ValueError("Qwen3 model has no Hugging Face revision metadata")
+    revisions: set[str] = set()
+    for metadata_path in metadata:
+        lines = metadata_path.read_text(encoding="utf-8").splitlines()
+        if not lines:
+            raise ValueError(f"empty Qwen3 metadata file: {metadata_path}")
+        revisions.add(lines[0])
+    if revisions != {QWEN_MODEL_REVISION}:
+        raise ValueError(
+            f"Qwen3 model revision mismatch: expected {QWEN_MODEL_REVISION}, "
+            f"got {sorted(revisions)}"
+        )
+
+
 def hash_directory(path: Path) -> list[dict[str, object]]:
     root = Path(path).resolve()
     if not root.is_dir():
@@ -243,6 +262,58 @@ def hash_directory(path: Path) -> list[dict[str, object]]:
     return records
 
 
+def _preflight_qwen_prompts(
+    eligible_rows: Sequence[Mapping[str, object]],
+    calibration_sample: Sequence[Mapping[str, object]],
+    model_path: Path,
+) -> dict[str, object]:
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        str(model_path), local_files_only=True
+    )
+
+    def count(messages: Sequence[Mapping[str, str]]) -> int:
+        tokens = tokenizer.apply_chat_template(
+            list(messages),
+            tokenize=True,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        if not isinstance(tokens, list) or not tokens:
+            raise ValueError("Qwen3 tokenizer returned invalid prompt token IDs")
+        return len(tokens)
+
+    row_by_id = {str(row["id"]): row for row in eligible_rows}
+    fewshots = difficulty_weighted_fewshots(
+        eligible_rows, requests=PROBLEM_REQUEST_CAP, width=5, seed=42
+    )
+    problem_max = 0
+    for parent_ids in fewshots:
+        messages = [
+            {
+                "role": "user",
+                "content": problem_prompt([row_by_id[value] for value in parent_ids]),
+            }
+        ]
+        problem_max = max(problem_max, count(messages))
+    calibration_max = max(
+        count(solution_messages(str(row["prompt"]))) for row in calibration_sample
+    )
+    if problem_max + PROBLEM_MAX_TOKENS > MAX_MODEL_LEN:
+        raise ValueError("candidate problem prompt contract exceeds Qwen3 context")
+    if calibration_max + SOLUTION_MAX_TOKENS > MAX_MODEL_LEN:
+        raise ValueError("calibration solution prompt contract exceeds Qwen3 context")
+    return {
+        "candidate_problem_request_count": PROBLEM_REQUEST_CAP,
+        "candidate_problem_max_prompt_tokens": problem_max,
+        "candidate_problem_max_total_tokens": problem_max + PROBLEM_MAX_TOKENS,
+        "calibration_question_count": len(calibration_sample),
+        "calibration_max_prompt_tokens": calibration_max,
+        "calibration_max_total_tokens": calibration_max + SOLUTION_MAX_TOKENS,
+    }
+
+
 def build_pilot_manifest(
     *,
     source_jsonl: Path,
@@ -255,6 +326,8 @@ def build_pilot_manifest(
     reference_commit: str,
     reference_tree: str,
     benchmark_paths: Sequence[Path] = (),
+    environment: Mapping[str, object] | None = None,
+    prompt_preflight: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     return {
         "manifest_version": 1,
@@ -272,6 +345,7 @@ def build_pilot_manifest(
         },
         "qwen3": {
             "path": str(Path(model_path).resolve()),
+            "revision": QWEN_MODEL_REVISION,
             "files": [dict(record) for record in model_files],
             "tensor_parallel_size": TENSOR_PARALLEL_SIZE,
             "dtype": "bfloat16",
@@ -286,6 +360,8 @@ def build_pilot_manifest(
             "commit": reference_commit,
             "tree": reference_tree,
         },
+        "environment": dict(environment or {}),
+        "prompt_preflight": dict(prompt_preflight or {}),
         "sampling": {
             "calibration_solutions": {
                 "n": 3,
@@ -385,9 +461,14 @@ def generate_calibration_records(
             "output_tokens": [
                 int(results[offset + index]["output_tokens"]) for index in range(3)
             ],
+            "finish_reasons": [
+                results[offset + index].get("finish_reason") for index in range(3)
+            ],
             "prompt_tokens": int(results[offset]["prompt_tokens"]),
             "majority_indices": majority,
             "qualified": len(majority) >= 2,
+            "model_path": str(QWEN_MODEL_PATH),
+            "model_revision": QWEN_MODEL_REVISION,
             "sampling": {
                 "temperature": 0.75,
                 "top_p": 0.95,
@@ -421,7 +502,8 @@ def generate_problem_records(
     seen: set[tuple[str, ...]] = set()
     request_index = 0
     while request_index < request_cap and len(problems) < target_count:
-        end = min(request_index + batch_size, request_cap)
+        remaining_slots = target_count - len(problems)
+        end = min(request_index + batch_size, request_index + remaining_slots, request_cap)
         request_indices = list(range(request_index, end))
         messages = [
             [
@@ -453,6 +535,8 @@ def generate_problem_records(
                 reason = "target_already_reached"
             elif len(parsed) != 1 or not normalized_tokens(parsed[0]):
                 reason = "invalid_problem_boundary"
+            elif is_multiple_choice_problem(parsed[0]):
+                reason = "multiple_choice_problem"
             elif normalized_tokens(parsed[0]) in seen:
                 reason = "normalized_exact_duplicate_generation"
             else:
@@ -468,6 +552,10 @@ def generate_problem_records(
                         "generation_seed": seed,
                         "output_tokens": int(result["output_tokens"]),
                         "prompt_tokens": int(result["prompt_tokens"]),
+                        "finish_reason": result.get("finish_reason"),
+                        "model_path": str(QWEN_MODEL_PATH),
+                        "model_revision": QWEN_MODEL_REVISION,
+                        "source_pool_sha256": SOURCE_JSONL_SHA256,
                         "sampling": {
                             "temperature": 1.0,
                             "top_p": 0.95,
@@ -482,6 +570,9 @@ def generate_problem_records(
                     "parent_ids": fewshots[index],
                     "generation_seed": seed,
                     "response": raw,
+                    "finish_reason": result.get("finish_reason"),
+                    "model_path": str(QWEN_MODEL_PATH),
+                    "model_revision": QWEN_MODEL_REVISION,
                     "parsed_problem_count": len(parsed),
                     "accepted_candidate_id": accepted_id,
                     "rejection_reason": reason,
@@ -627,6 +718,7 @@ class QwenVllmBackend:
         model_path = Path(model_path).resolve()
         if model_path != QWEN_MODEL_PATH.resolve():
             raise ValueError(f"Qwen3 model path mismatch: {model_path}")
+        _verify_qwen_model_revision(model_path)
         if torch.cuda.device_count() != TENSOR_PARALLEL_SIZE:
             raise RuntimeError(
                 f"Qwen3 generation requires exactly {TENSOR_PARALLEL_SIZE} visible GPUs"
@@ -675,6 +767,17 @@ class QwenVllmBackend:
         if len(messages) != len(seeds):
             raise ValueError("message and seed counts differ")
         prompt_token_ids = [self._tokenize(value) for value in messages]
+        overlong = [
+            (index, len(tokens))
+            for index, tokens in enumerate(prompt_token_ids)
+            if len(tokens) + max_tokens > MAX_MODEL_LEN
+        ]
+        if overlong:
+            index, token_count = overlong[0]
+            raise ValueError(
+                f"Qwen3 request {index} prompt {token_count} plus max response "
+                f"{max_tokens} exceeds {MAX_MODEL_LEN}"
+            )
         parameters = [
             self._sampling_params_class(
                 n=1,
@@ -686,7 +789,7 @@ class QwenVllmBackend:
             for seed in seeds
         ]
         outputs = self._llm.generate(
-            prompt_token_ids,
+            prompt_token_ids=prompt_token_ids,
             sampling_params=parameters,
             use_tqdm=True,
         )
@@ -737,6 +840,40 @@ class QwenVllmBackend:
                 torch.cuda.empty_cache()
             except Exception:
                 pass
+
+
+def _python_environment(python: Path, packages: Sequence[str]) -> dict[str, object]:
+    script = """
+import importlib.metadata
+import json
+import platform
+import sys
+packages = json.loads(sys.argv[1])
+versions = {}
+for package in packages:
+    try:
+        versions[package] = importlib.metadata.version(package)
+    except importlib.metadata.PackageNotFoundError:
+        versions[package] = None
+print(json.dumps({
+    "executable": sys.executable,
+    "python": platform.python_version(),
+    "packages": versions,
+}, sort_keys=True))
+"""
+    try:
+        result = subprocess.run(
+            [str(python), "-c", script, json.dumps(list(packages))],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        value = json.loads(result.stdout)
+    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot capture Python environment {python}: {error}") from error
+    if not isinstance(value, dict):
+        raise ValueError(f"invalid Python environment record from {python}")
+    return value
 
 
 def _git(repository: Path, *arguments: str) -> str:
@@ -845,11 +982,72 @@ def _load_root_manifest(root: Path) -> dict[str, object]:
         or value.get("training_allowed") is not False
     ):
         raise ValueError("pilot manifest contract is invalid")
+    code = value.get("code")
+    reference = value.get("reference")
+    qwen = value.get("qwen3")
+    if not isinstance(code, dict) or not isinstance(reference, dict) or not isinstance(qwen, dict):
+        raise ValueError("pilot manifest identity records are invalid")
+    current_code = _clean_git_identity(Path(__file__).resolve().parents[1])
+    if current_code != (code.get("commit"), code.get("tree")):
+        raise ValueError("executable code identity differs from pilot manifest")
+    current_reference = _clean_git_identity(REFERENCE_REPO)
+    if current_reference != (reference.get("commit"), reference.get("tree")):
+        raise ValueError("reference repository identity differs from pilot manifest")
+    if qwen.get("path") != str(QWEN_MODEL_PATH.resolve()) or qwen.get("revision") != QWEN_MODEL_REVISION:
+        raise ValueError("Qwen3 model identity differs from pilot manifest")
+    _verify_qwen_model_revision(QWEN_MODEL_PATH)
+    environments = value.get("environment")
+    if not isinstance(environments, dict):
+        raise ValueError("pilot manifest environment records are invalid")
+    role = "qwen_generation" if "envs/verl/" in str(Path(sys.executable).resolve()) else "proxy_analysis"
+    expected_environment = environments.get(role)
+    if not isinstance(expected_environment, dict) or not isinstance(
+        expected_environment.get("packages"), dict
+    ):
+        raise ValueError(f"pilot manifest lacks {role} environment identity")
+    actual_environment = _python_environment(
+        Path(sys.executable), tuple(expected_environment["packages"])
+    )
+    if actual_environment != expected_environment:
+        raise ValueError(f"{role} environment differs from pilot manifest")
     return value
 
 
 def _extra_path(root: Path, relative: str) -> Path:
     return Path(root) / relative
+
+
+def _available_runtime_summary(root: Path) -> dict[str, object]:
+    qwen_phases = (
+        "generate-calibration-solutions",
+        "generate-problems",
+        "generate-candidate-solutions",
+    )
+    phase_seconds: dict[str, float] = {}
+    for phase in qwen_phases:
+        marker = _phase_marker(root, phase)
+        if not marker.is_file():
+            continue
+        value = strict_json_file(marker, f"phase {phase}")
+        elapsed = value.get("elapsed_seconds") if isinstance(value, dict) else None
+        if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool) and math.isfinite(float(elapsed)):
+            phase_seconds[phase] = float(elapsed)
+    qwen_seconds = sum(phase_seconds.values())
+    calibration_gpu_hours = 0.0
+    calibration_report = PilotPaths.from_root(root).calibration_report
+    if calibration_report.is_file():
+        value = strict_json_file(calibration_report, "calibration report")
+        runtime = value.get("runtime") if isinstance(value, dict) else None
+        total = runtime.get("total_gpu_hours") if isinstance(runtime, dict) else None
+        if isinstance(total, (int, float)) and not isinstance(total, bool):
+            calibration_gpu_hours = float(total)
+    return {
+        "qwen_phase_elapsed_seconds": phase_seconds,
+        "qwen_gpu_hours": qwen_seconds * TENSOR_PARALLEL_SIZE / 3_600,
+        "calibration_gpu_hours": calibration_gpu_hours,
+        "observed_total_gpu_hours": qwen_seconds * TENSOR_PARALLEL_SIZE / 3_600
+        + calibration_gpu_hours,
+    }
 
 
 def _publish_no_go(
@@ -866,6 +1064,7 @@ def _publish_no_go(
         "decision": "no_go",
         "stop_stage": stop_stage,
         "reason": reason,
+        "runtime": _available_runtime_summary(paths.root),
         "training_performed": False,
         **dict(report),
     }
@@ -897,6 +1096,7 @@ def run_prepare(config: PilotConfig) -> dict[str, object]:
         "original gradient manifest",
     )
     eligible, _ = _load_eligible_rows(config)
+    sample = stratified_calibration_sample(eligible, size=CALIBRATION_COUNT, seed=42)
     gradient_manifest = strict_json_file(
         config.original_gradient_manifest, "original gradient manifest"
     )
@@ -923,7 +1123,19 @@ def run_prepare(config: PilotConfig) -> dict[str, object]:
         raise ValueError(
             f"reference commit mismatch: expected {REFERENCE_COMMIT}, got {reference_commit}"
         )
+    _verify_qwen_model_revision(config.model_path)
     model_files = hash_directory(config.model_path)
+    prompt_preflight = _preflight_qwen_prompts(eligible, sample, config.model_path)
+    environment = {
+        "proxy_analysis": _python_environment(
+            Path(sys.executable),
+            ("torch", "transformers", "trl", "traker", "fast-jl", "safetensors"),
+        ),
+        "qwen_generation": _python_environment(
+            Path("/home/mchen/miniconda3/envs/verl/bin/python"),
+            ("torch", "transformers", "vllm", "tokenizers", "safetensors"),
+        ),
+    }
     manifest = build_pilot_manifest(
         source_jsonl=config.source_jsonl,
         eligibility_report=config.eligibility_report,
@@ -935,9 +1147,10 @@ def run_prepare(config: PilotConfig) -> dict[str, object]:
         reference_commit=reference_commit,
         reference_tree=reference_tree,
         benchmark_paths=config.benchmark_paths,
+        environment=environment,
+        prompt_preflight=prompt_preflight,
     )
     paths = PilotPaths.from_root(root)
-    sample = stratified_calibration_sample(eligible, size=CALIBRATION_COUNT, seed=42)
     sample_records = [
         {
             "id": row["id"],
@@ -948,6 +1161,8 @@ def run_prepare(config: PilotConfig) -> dict[str, object]:
             "original_gradient_index": row["original_gradient_index"],
             "topic": row["topic"],
             "difficulty": row["difficulty"],
+            "source_pool_sha256": SOURCE_JSONL_SHA256,
+            "eligibility_sha256": ELIGIBILITY_SHA256,
         }
         for row in sample
     ]
@@ -962,6 +1177,7 @@ def run_prepare(config: PilotConfig) -> dict[str, object]:
             "calibration_count": CALIBRATION_COUNT,
             "eligible_count": len(eligible),
             "gradient_coverage": coverage,
+            "prompt_preflight": prompt_preflight,
         },
     )
     return {
@@ -1160,6 +1376,53 @@ def _load_cluster_state(path: Path, *, expected_k: int, expected_seed: int) -> d
     return values
 
 
+def _load_gradient_runtime_ledgers(
+    directory: Path, *, prefix: str, expected_samples: int
+) -> dict[str, object]:
+    from math_eval.collect_prismatic_pilot_gradients import shard_completion_path
+
+    manifest_path = Path(directory) / "gradient.manifest.json"
+    manifest_sha = sha256_file(manifest_path)
+    ledgers: list[dict[str, object]] = []
+    artifacts: list[dict[str, object]] = []
+    for shard_index in range(4):
+        path = shard_completion_path(directory, prefix, shard_index, 4)
+        value = strict_json_file(path, "gradient shard completion")
+        if not isinstance(value, dict):
+            raise ValueError(f"invalid gradient shard completion: {path}")
+        if (
+            value.get("status") != "complete"
+            or value.get("shard_index") != shard_index
+            or value.get("num_shards") != 4
+            or value.get("gradient_manifest_sha256") != manifest_sha
+        ):
+            raise ValueError(f"gradient shard completion identity mismatch: {path}")
+        elapsed = value.get("elapsed_seconds")
+        samples = value.get("sample_count")
+        if (
+            isinstance(elapsed, bool)
+            or not isinstance(elapsed, (int, float))
+            or not math.isfinite(float(elapsed))
+            or elapsed < 0
+            or isinstance(samples, bool)
+            or not isinstance(samples, int)
+            or samples <= 0
+        ):
+            raise ValueError(f"gradient shard completion metrics are invalid: {path}")
+        ledgers.append(value)
+        artifacts.append(artifact_record(path))
+    if sum(int(value["sample_count"]) for value in ledgers) != expected_samples:
+        raise ValueError("gradient shard completion sample counts do not match input")
+    elapsed_sum = sum(float(value["elapsed_seconds"]) for value in ledgers)
+    return {
+        "shards": ledgers,
+        "artifacts": artifacts,
+        "summed_gpu_seconds": elapsed_sum,
+        "gpu_hours": elapsed_sum / 3_600,
+        "sample_count": expected_samples,
+    }
+
+
 def _load_pilot_gradients(directory: Path, rows: Sequence[Mapping[str, object]]):
     from math_eval.select_gradient_diverse_deepmath import load_projected_gradients
 
@@ -1174,6 +1437,7 @@ def _load_pilot_gradients(directory: Path, rows: Sequence[Mapping[str, object]])
 
 
 def run_analyze_calibration(config: PilotConfig, *, device: str = "cuda:0") -> dict[str, object]:
+    analysis_started = time.monotonic()
     if device != "cuda:0":
         raise ValueError("calibration analysis requires process-local cuda:0")
     require_phase(config.data_root, "generate-calibration-solutions")
@@ -1273,6 +1537,12 @@ def run_analyze_calibration(config: PilotConfig, *, device: str = "cuda:0") -> d
         "seeds": metrics_by_seed,
     }
     decision = calibration_decision(decision_input)
+    gradient_runtime = _load_gradient_runtime_ledgers(
+        paths.calibration_gradients,
+        prefix="calibration",
+        expected_samples=len(gradient_input),
+    )
+    analysis_elapsed = time.monotonic() - analysis_started
     report = {
         "pilot": "prismatic_lite_qwen3_2k",
         **decision_input,
@@ -1280,6 +1550,13 @@ def run_analyze_calibration(config: PilotConfig, *, device: str = "cuda:0") -> d
         "cluster_states": {
             "42": artifact_record(paths.cluster_seed42),
             "43": artifact_record(paths.cluster_seed43),
+        },
+        "runtime": {
+            "projected_gradients": gradient_runtime,
+            "analysis_gpu_seconds": analysis_elapsed,
+            "analysis_gpu_hours": analysis_elapsed / 3_600,
+            "total_gpu_hours": gradient_runtime["gpu_hours"]
+            + analysis_elapsed / 3_600,
         },
         "training_performed": False,
     }
@@ -1440,12 +1717,18 @@ def generate_candidate_solution_records(
             "output_tokens": [
                 int(flat_results[offset + index]["output_tokens"]) for index in range(3)
             ],
+            "finish_reasons": [
+                flat_results[offset + index].get("finish_reason") for index in range(3)
+            ],
             "prompt_tokens": prompt_counts[0],
             "majority_indices": majority,
             "duplicate_neighbor_id": neighbor_id,
             "duplicate_jaccard": score,
             "benchmark_matches": matches,
             "semantic_judgment": None,
+            "model_path": str(QWEN_MODEL_PATH),
+            "model_revision": QWEN_MODEL_REVISION,
+            "parent_request_index": candidate["request_index"],
             "sampling": {
                 "temperature": 0.75,
                 "top_p": 0.95,
@@ -1487,8 +1770,11 @@ def generate_candidate_solution_records(
                     "neighbor_id": neighbor_id,
                     "generation_seed": seed,
                     "response": response,
+                    "model_path": str(QWEN_MODEL_PATH),
+                    "model_revision": QWEN_MODEL_REVISION,
                     "output_tokens": int(result["output_tokens"]),
                     "prompt_tokens": int(result["prompt_tokens"]),
+                    "finish_reason": result.get("finish_reason"),
                 }
             )
     return records, reviews
@@ -1636,6 +1922,7 @@ def _write_report_markdown(path: Path, report: Mapping[str, object]) -> None:
 
 
 def run_analyze_selection(config: PilotConfig, *, device: str = "cuda:0") -> dict[str, object]:
+    analysis_started = time.monotonic()
     if device != "cuda:0":
         raise ValueError("selection analysis requires process-local cuda:0")
     require_phase(config.data_root, "quality-review")
@@ -1776,11 +2063,47 @@ def run_analyze_selection(config: PilotConfig, *, device: str = "cuda:0") -> dic
         "benchmark_contamination_count": contamination_count,
     }
     decision = final_pilot_decision(decision_metrics)
+    calibration_report = strict_json_file(
+        paths.calibration_report, "calibration report"
+    )
+    if not isinstance(calibration_report, dict):
+        raise ValueError("calibration report is invalid")
+    generation_markers = {
+        "calibration_solutions": require_phase(
+            config.data_root, "generate-calibration-solutions"
+        ),
+        "candidate_problems": require_phase(config.data_root, "generate-problems"),
+        "candidate_solutions": require_phase(
+            config.data_root, "generate-candidate-solutions"
+        ),
+    }
+    qwen_seconds = sum(
+        float(marker["elapsed_seconds"]) for marker in generation_markers.values()
+    )
+    if not math.isfinite(qwen_seconds) or qwen_seconds <= 0:
+        raise ValueError("Qwen3 generation runtime ledger is invalid")
+    candidate_gradient_runtime = _load_gradient_runtime_ledgers(
+        paths.candidate_gradients,
+        prefix="candidates",
+        expected_samples=len(gradient_rows),
+    )
+    selection_elapsed = time.monotonic() - analysis_started
+    calibration_runtime = calibration_report.get("runtime")
+    if not isinstance(calibration_runtime, dict) or not isinstance(
+        calibration_runtime.get("total_gpu_hours"), (int, float)
+    ):
+        raise ValueError("calibration runtime ledger is invalid")
+    total_gpu_hours = (
+        qwen_seconds * TENSOR_PARALLEL_SIZE / 3_600
+        + float(calibration_runtime["total_gpu_hours"])
+        + float(candidate_gradient_runtime["gpu_hours"])
+        + selection_elapsed / 3_600
+    )
     report = {
         "pilot": "prismatic_lite_qwen3_2k",
         **decision_metrics,
         **decision,
-        "calibration": strict_json_file(paths.calibration_report, "calibration report"),
+        "calibration": calibration_report,
         "g_vendi": g_vendi,
         "sensitivity": sensitivity,
         "candidate_count": len(candidates),
@@ -1788,6 +2111,20 @@ def run_analyze_selection(config: PilotConfig, *, device: str = "cuda:0") -> dic
         "sparse_rejected_count": len(rejected_records) - len(quality_rejected),
         "accepted_artifact": artifact_record(paths.accepted),
         "rejected_artifact": artifact_record(paths.rejected),
+        "runtime": {
+            "generation_phase_markers": generation_markers,
+            "qwen_tp4_elapsed_seconds": qwen_seconds,
+            "qwen_gpu_hours": qwen_seconds * TENSOR_PARALLEL_SIZE / 3_600,
+            "candidate_projected_gradients": candidate_gradient_runtime,
+            "selection_analysis_gpu_seconds": selection_elapsed,
+            "selection_analysis_gpu_hours": selection_elapsed / 3_600,
+            "calibration_gpu_hours": calibration_runtime["total_gpu_hours"],
+            "total_gpu_hours": total_gpu_hours,
+            "candidate_problem_requests_per_second": len(candidates)
+            / float(generation_markers["candidate_problems"]["elapsed_seconds"]),
+            "candidate_solution_trajectories_per_second": (len(candidates) * 3)
+            / float(generation_markers["candidate_solutions"]["elapsed_seconds"]),
+        },
         "training_performed": False,
         "original_rows_deleted_or_modified": False,
     }
@@ -1814,12 +2151,34 @@ def run_analyze_selection(config: PilotConfig, *, device: str = "cuda:0") -> dic
 
 
 def run_validate(config: PilotConfig) -> dict[str, object]:
-    _load_root_manifest(config.data_root)
+    manifest = _load_root_manifest(config.data_root)
     paths = PilotPaths.from_root(config.data_root)
+    _require_file_hash(config.source_jsonl, SOURCE_JSONL_SHA256, "prepared source")
+    _require_file_hash(
+        config.source_manifest, SOURCE_MANIFEST_SHA256, "prepared manifest"
+    )
+    _require_file_hash(
+        config.eligibility_report, ELIGIBILITY_SHA256, "eligibility report"
+    )
+    _require_file_hash(
+        config.original_gradient_manifest,
+        ORIGINAL_GRADIENT_MANIFEST_SHA256,
+        "original gradient manifest",
+    )
+    if hash_directory(config.model_path) != manifest["qwen3"]["files"]:
+        raise ValueError("Qwen3 model directory changed during pilot")
+    phase_directory = Path(config.data_root) / "phases"
+    if not phase_directory.is_dir():
+        raise ValueError("pilot phase marker directory is missing")
+    for marker in sorted(phase_directory.glob("*.json")):
+        require_phase(config.data_root, marker.stem)
     if paths.stage_complete.is_file():
         stage = strict_json_file(paths.stage_complete, "stage completion")
         if not isinstance(stage, dict) or stage.get("status") != "complete":
             raise ValueError("invalid stage completion marker")
+        _validate_bound_artifacts(stage)
+        if stage.get("training_performed") is not False:
+            raise ValueError("stage completion training contract is invalid")
         return {
             "status": "validated",
             "decision": stage.get("decision"),
@@ -1839,15 +2198,6 @@ def run_validate(config: PilotConfig) -> dict[str, object]:
         raise ValueError("selection artifacts do not partition 2,000 candidates")
     if len({str(row["id"]) for row in accepted + rejected}) != CANDIDATE_COUNT:
         raise ValueError("selection artifacts have duplicate or overlapping IDs")
-    _require_file_hash(config.source_jsonl, SOURCE_JSONL_SHA256, "prepared source")
-    _require_file_hash(
-        config.original_gradient_manifest,
-        ORIGINAL_GRADIENT_MANIFEST_SHA256,
-        "original gradient manifest",
-    )
-    manifest = _load_root_manifest(config.data_root)
-    if hash_directory(config.model_path) != manifest["qwen3"]["files"]:
-        raise ValueError("Qwen3 model directory changed during pilot")
     publish_phase(
         config.data_root,
         "validate",

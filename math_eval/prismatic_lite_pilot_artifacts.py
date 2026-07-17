@@ -5,7 +5,6 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
-import math
 import os
 import tempfile
 from collections.abc import Iterable, Mapping, Sequence

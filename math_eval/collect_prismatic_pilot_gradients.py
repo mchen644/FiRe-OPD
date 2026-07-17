@@ -5,9 +5,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
 import re
 import sys
+import time
+from datetime import datetime, timezone
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -19,7 +20,6 @@ if __package__ in (None, ""):
 
 from math_eval.collect_prismatic_gradients import (
     ASSISTANT_RESPONSE_MARKER,
-    FAST_JL_VERSION,
     GRADIENT_MANIFEST_NAME,
     MAX_CONTEXT_TOKENS,
     MODEL_NAME,
@@ -32,7 +32,6 @@ from math_eval.collect_prismatic_gradients import (
     PROJECT_INTERVAL,
     REFERENCE_COMMIT,
     SAVE_INTERVAL,
-    TRAKER_VERSION,
     _exclusive_shard_lock,
     _installed_package_versions,
     _installed_trl_version,
@@ -51,11 +50,16 @@ from math_eval.collect_prismatic_gradients import (
 )
 from math_eval.deepmath_gradient_diversity import official_shard_bounds
 from math_eval.prismatic_lite_pilot_artifacts import (
+    atomic_publish_json,
     sha256_file,
     strict_json_file,
     strict_jsonl,
 )
 
+
+ORIGINAL_FROZEN_GRADIENT_DIR = Path(
+    "/home/mchen/FiRe-OPD/data/gradient_diversity/gradients/qwen2.5-0.5b-instruct"
+).resolve()
 
 PILOT_INPUT_FIELDS = (
     "id",
@@ -210,6 +214,17 @@ def build_pilot_gradient_manifest(
     }
 
 
+def shard_completion_path(
+    output_dir: Path, prefix: str, shard_index: int, num_shards: int
+) -> Path:
+    prefix = _validate_gradient_prefix(prefix)
+    if num_shards <= 0 or not 0 <= shard_index < num_shards:
+        raise ValueError("invalid completion-ledger shard identity")
+    return Path(output_dir) / (
+        f".{prefix}.shard-{shard_index:05d}-of-{num_shards:05d}.completion.json"
+    )
+
+
 def _all_shard_bounds(total: int, num_shards: int) -> list[tuple[int, int]]:
     bounds = [
         official_shard_bounds(total, num_shards, index) for index in range(num_shards)
@@ -232,8 +247,13 @@ def assert_fresh_shard(
     if shard_index < 0 or shard_index >= num_shards:
         raise ValueError("shard_index must be in [0, num_shards)")
     shard_start, shard_end = bounds[shard_index]
-    pattern = re.compile(_CHUNK_PATTERN_TEMPLATE.format(prefix=re.escape(prefix)))
     directory = Path(output_dir)
+    completion = shard_completion_path(directory, prefix, shard_index, num_shards)
+    if completion.exists() or completion.is_symlink():
+        raise ValueError(
+            f"resume is forbidden; archive prior shard completion before relaunch: {completion.name}"
+        )
+    pattern = re.compile(_CHUNK_PATTERN_TEMPLATE.format(prefix=re.escape(prefix)))
     if not directory.is_dir():
         raise ValueError(f"gradient output directory does not exist: {directory}")
     for path in sorted(directory.iterdir()):
@@ -255,6 +275,15 @@ def _validate_output_isolation(
     output_dir: Path, input_jsonl: Path, pilot_manifest: Path, reference_repo: Path
 ) -> Path:
     output = Path(output_dir).resolve()
+    if (
+        output == ORIGINAL_FROZEN_GRADIENT_DIR
+        or ORIGINAL_FROZEN_GRADIENT_DIR in output.parents
+        or output in ORIGINAL_FROZEN_GRADIENT_DIR.parents
+    ):
+        raise ValueError(
+            "gradient output overlaps the frozen original gradient directory: "
+            f"{ORIGINAL_FROZEN_GRADIENT_DIR}"
+        )
     for value, description in (
         (Path(input_jsonl).resolve(), "input JSONL"),
         (Path(pilot_manifest).resolve(), "pilot manifest"),
@@ -307,6 +336,8 @@ def run_collection(
     device: str,
     validate_after_collection: bool = True,
 ) -> dict[str, object]:
+    started_monotonic = time.monotonic()
+    started_utc = datetime.now(timezone.utc).isoformat()
     if model_name != MODEL_NAME or model_revision != MODEL_REVISION:
         raise ValueError("pilot gradient collector model pin mismatch")
     if device != "cuda:0":
@@ -347,6 +378,24 @@ def run_collection(
             shard_index=shard_index,
         )
         if shard_start == shard_end:
+            if validate_after_collection:
+                atomic_publish_json(
+                    shard_completion_path(output, prefix, shard_index, num_shards),
+                    {
+                        "status": "empty",
+                        "shard_index": shard_index,
+                        "num_shards": num_shards,
+                        "shard_start": shard_start,
+                        "shard_end": shard_end,
+                        "sample_count": 0,
+                        "started_at_utc": started_utc,
+                        "finished_at_utc": datetime.now(timezone.utc).isoformat(),
+                        "elapsed_seconds": time.monotonic() - started_monotonic,
+                        "gradient_manifest_sha256": sha256_file(
+                            output / GRADIENT_MANIFEST_NAME
+                        ),
+                    },
+                )
             return {
                 "status": "empty",
                 "shard_start": shard_start,
@@ -383,6 +432,23 @@ def run_collection(
                 raise RuntimeError(
                     f"collector returned incomplete shard: expected {shard_end}, got {completed}"
                 )
+            atomic_publish_json(
+                shard_completion_path(output, prefix, shard_index, num_shards),
+                {
+                    "status": "complete",
+                    "shard_index": shard_index,
+                    "num_shards": num_shards,
+                    "shard_start": shard_start,
+                    "shard_end": shard_end,
+                    "sample_count": shard_end - shard_start,
+                    "started_at_utc": started_utc,
+                    "finished_at_utc": datetime.now(timezone.utc).isoformat(),
+                    "elapsed_seconds": time.monotonic() - started_monotonic,
+                    "gradient_manifest_sha256": sha256_file(
+                        output / GRADIENT_MANIFEST_NAME
+                    ),
+                },
+            )
     return {
         "status": "collected",
         "shard_start": shard_start,

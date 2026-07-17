@@ -8,6 +8,7 @@ from math_eval.prismatic_lite_pilot_generation import (
     NearDuplicateIndex,
     candidate_id,
     difficulty_weighted_fewshots,
+    is_multiple_choice_problem,
     majority_group,
     normalized_tokens,
     parse_generated_problems,
@@ -106,6 +107,12 @@ Prove that 1+1=2.
     assert parse_generated_problems("unstructured answer") == []
 
 
+def test_multiple_choice_detector_requires_at_least_two_explicit_options() -> None:
+    assert is_multiple_choice_problem("Which? (A) one (B) two (C) three") is True
+    assert is_multiple_choice_problem("Let (A) be a point in a triangle.") is False
+    assert is_multiple_choice_problem("Find A and B.") is False
+
+
 def test_solution_messages_disable_implicit_answer_context() -> None:
     messages = solution_messages("Compute 2+2.")
 
@@ -135,6 +142,13 @@ def test_majority_group_requires_two_mathematically_equivalent_boxed_answers() -
     ]
 
     assert majority_group(responses) == (0, 1)
+    assert majority_group(
+        [
+            r"Earlier \\boxed{7}, final \\boxed{1}",
+            r"Earlier \\boxed{8}, final \\boxed{1}",
+            r"\\boxed{2}",
+        ]
+    ) == (0, 1)
     assert majority_group(
         [r"\\boxed{1}", r"\\boxed{2}", r"\\boxed{3}"]
     ) == ()

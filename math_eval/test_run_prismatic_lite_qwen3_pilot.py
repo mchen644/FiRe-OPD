@@ -171,6 +171,10 @@ def test_calibration_generation_uses_exact_three_independent_solutions(
 
     assert len(records) == 2
     assert all(record["majority_indices"] == [0, 1] for record in records)
+    assert all(
+        record["model_revision"] == "0d7cf23991f47feeb3a57ecb4c9cee8ea4a17bfe"
+        for record in records
+    )
     assert len(gradient_rows) == 4
     assert backend.calls[0]["temperature"] == 0.75
     assert backend.calls[0]["top_p"] == 0.95
@@ -219,6 +223,10 @@ def test_problem_generation_stops_at_exact_target_without_hidden_retry(
     )
 
     assert len(problems) == 4
+    assert all(
+        row["model_revision"] == "0d7cf23991f47feeb3a57ecb4c9cee8ea4a17bfe"
+        for row in problems
+    )
     assert [row["prompt"] for row in problems] == [
         "Novel A",
         "Novel B",
@@ -232,7 +240,7 @@ def test_problem_generation_stops_at_exact_target_without_hidden_retry(
 
 
 def test_problem_generation_cap_is_a_declared_stop(pilot_module) -> None:
-    backend = _FakeBackend([["bad", "still bad"]])
+    backend = _FakeBackend([["bad"], ["still bad"]])
 
     with pytest.raises(pilot_module.PilotStopped, match="before 2 requests"):
         pilot_module.generate_problem_records(
@@ -323,6 +331,7 @@ def test_prepare_manifest_binds_every_frozen_input_hash(tmp_path: Path, pilot_mo
     assert value["eligibility"]["sha256"] == sha256_file(eligibility)
     assert value["original_gradients"]["manifest_sha256"] == sha256_file(gradients)
     assert value["qwen3"]["files"][0]["path"] == "config.json"
+    assert value["qwen3"]["revision"] == "0d7cf23991f47feeb3a57ecb4c9cee8ea4a17bfe"
     assert value["decisions"]["calibration"]["minimum_qualified"] == 192
     assert value["decisions"]["final"]["minimum_accepted"] == 400
 

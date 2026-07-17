@@ -134,6 +134,15 @@ def problem_prompt(examples: Sequence[Mapping[str, object]]) -> str:
     )
 
 
+_MULTIPLE_CHOICE_OPTION = re.compile(r"(?<!\w)(?:\([A-E]\)|[A-E]\))(?=\s)")
+
+
+def is_multiple_choice_problem(problem: str) -> bool:
+    if not isinstance(problem, str):
+        raise ValueError("problem must be a string")
+    return len(_MULTIPLE_CHOICE_OPTION.findall(problem)) >= 2
+
+
 def solution_messages(problem: str) -> list[dict[str, str]]:
     if not isinstance(problem, str) or not problem.strip():
         raise ValueError("problem must be nonempty")
@@ -174,10 +183,39 @@ def candidate_id(request_index: int, ordinal: int, problem: str) -> str:
     return f"prismatic-qwen3-2k-r{request_index:06d}-p{ordinal:02d}-{digest}"
 
 
+def _last_boxed_expression(response: str) -> str | None:
+    search_end = len(response)
+    while search_end > 0:
+        marker = response.rfind("\\boxed", 0, search_end)
+        if marker < 0:
+            return None
+        cursor = marker + len("\\boxed")
+        while cursor < len(response) and response[cursor].isspace():
+            cursor += 1
+        if cursor < len(response) and response[cursor] == "{":
+            depth = 0
+            for end in range(cursor, len(response)):
+                character = response[end]
+                escaped = end > 0 and response[end - 1] == "\\"
+                if character == "{" and not escaped:
+                    depth += 1
+                elif character == "}" and not escaped:
+                    depth -= 1
+                    if depth == 0:
+                        return response[marker : end + 1]
+                    if depth < 0:
+                        break
+        search_end = marker
+    return None
+
+
 def _parsed_boxed_answer(response: str):
-    if not isinstance(response, str) or "\\boxed" not in response:
+    if not isinstance(response, str):
         return None
-    parsed = parse_math_answer(response)
+    final_box = _last_boxed_expression(response)
+    if final_box is None:
+        return None
+    parsed = parse_math_answer(final_box)
     return parsed if parsed else None
 
 

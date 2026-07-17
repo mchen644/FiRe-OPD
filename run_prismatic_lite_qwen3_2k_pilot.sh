@@ -11,6 +11,7 @@ MASTER_LOCK="${PRODUCTION_ROOT}/logs/prismatic_lite/.qwen3_2k_pilot.launch.lock"
 GVENDI_PYTHON="/home/mchen/miniconda3/envs/gvendi-opd/bin/python"
 VERL_PYTHON="/home/mchen/miniconda3/envs/verl/bin/python"
 QWEN_MODEL="/home/mchen/FiRe-OPD/models/Qwen3-30B-A3B-Instruct-2507"
+QWEN_MODEL_REVISION="0d7cf23991f47feeb3a57ecb4c9cee8ea4a17bfe"
 REFERENCE_REPO="/home/mchen/prismatic-synthesis-reference"
 EXPECTED_TMUX_SESSION="opd-CLI"
 REFERENCE_COMMIT="d9484cd3b5991030b901ac4a3a9e2472dbfac2ad"
@@ -92,13 +93,19 @@ import hashlib
 import json
 import sys
 from pathlib import Path
-from math_eval.run_prismatic_lite_qwen3_pilot import hash_directory
+from math_eval.run_prismatic_lite_qwen3_pilot import (
+    QWEN_MODEL_REVISION,
+    _verify_qwen_model_revision,
+    hash_directory,
+)
 
 root = Path(sys.argv[1])
+_verify_qwen_model_revision(root)
 records = hash_directory(root)
 payload = json.dumps(records, sort_keys=True, separators=(",", ":")).encode()
 print(json.dumps({
     "model_file_count": len(records),
+    "model_revision": QWEN_MODEL_REVISION,
     "model_total_bytes": sum(int(row["size"]) for row in records),
     "model_tree_sha256": hashlib.sha256(payload).hexdigest(),
 }, sort_keys=True))
@@ -154,6 +161,7 @@ print_provenance() {
   printf 'eligibility_sha256=%s\n' "$ELIGIBILITY_SHA256"
   printf 'original_gradient_manifest_sha256=%s\n' \
     "$ORIGINAL_GRADIENT_MANIFEST_SHA256"
+  printf 'qwen_model_revision=%s\n' "$QWEN_MODEL_REVISION"
   printf 'required_tmux_session=%s\n' "$EXPECTED_TMUX_SESSION"
   printf 'data_root=%s\n' "$DATA_ROOT"
   printf 'log_root=%s\n' "$LOG_ROOT"
@@ -198,7 +206,7 @@ PY
 }
 
 require_no_stale_processes() {
-  local pattern='python.*(vllm|collect_prismatic_pilot_gradients|run_prismatic_lite_qwen3_pilot)'
+  local pattern='[p]ython.*([v]llm|[c]ollect_prismatic_pilot_gradients|[r]un_prismatic_lite_qwen3_pilot)'
   local stale
   stale="$(pgrep -u "$(id -u)" -f "$pattern" || true)"
   [[ -z "$stale" ]] || die "stale pilot/model processes found: $stale"

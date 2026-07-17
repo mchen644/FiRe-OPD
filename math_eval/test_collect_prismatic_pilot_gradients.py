@@ -106,6 +106,27 @@ def test_build_manifest_preserves_frozen_projection_contract(tmp_path: Path) -> 
     assert result["resume_allowed"] is False
 
 
+def test_output_isolation_explicitly_rejects_frozen_original_gradient_directory(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="frozen original gradient directory"):
+        pilot._validate_output_isolation(
+            pilot.ORIGINAL_FROZEN_GRADIENT_DIR,
+            tmp_path / "input.jsonl",
+            tmp_path / "manifest.json",
+            tmp_path / "reference",
+        )
+
+
+def test_shard_completion_path_is_hidden_from_official_chunk_discovery(
+    tmp_path: Path,
+) -> None:
+    path = pilot.shard_completion_path(tmp_path, "pilot", 2, 4)
+
+    assert path == tmp_path / ".pilot.shard-00002-of-00004.completion.json"
+    assert not path.name.startswith("pilot.")
+
+
 def test_assert_fresh_shard_rejects_any_prior_owned_chunk(tmp_path: Path) -> None:
     tmp_path.mkdir(exist_ok=True)
     pilot.assert_fresh_shard(tmp_path, "pilot", total=12, num_shards=4, shard_index=1)
