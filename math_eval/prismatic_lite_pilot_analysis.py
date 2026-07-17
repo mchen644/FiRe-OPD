@@ -118,36 +118,51 @@ def paired_calibration_metrics(
     }
 
 
-def _pairing_groups(metadata: Sequence[Mapping[str, object]]) -> list[np.ndarray]:
-    provisional: dict[tuple[object, ...], list[int]] = defaultdict(list)
-    exact_counts: dict[tuple[object, object], int] = defaultdict(int)
-    for row in metadata:
-        exact_counts[(row.get("topic"), row.get("difficulty"))] += 1
+def pairing_group_indices(
+    metadata: Sequence[Mapping[str, object]],
+) -> list[tuple[int, ...]]:
+    """Partition rows for the frozen exact-stratum/topic-fallback null.
+
+    If any exact difficulty stratum in a topic has fewer than two rows, the
+    entire topic is collapsed into one topic-only stratum.  This yields a true
+    partition rather than overlapping permutation pools.
+    """
+    topics: dict[str, dict[object, list[int]]] = defaultdict(lambda: defaultdict(list))
     for index, row in enumerate(metadata):
         topic = row.get("topic")
         difficulty = row.get("difficulty")
         if not isinstance(topic, str) or not topic:
             raise ValueError(f"metadata row {index} has invalid topic")
-        if exact_counts[(topic, difficulty)] >= 2:
-            key = ("exact", topic, difficulty)
-        else:
-            key = ("topic", topic)
-        provisional[key].append(index)
+        if isinstance(difficulty, bool) or not isinstance(difficulty, (int, float)):
+            raise ValueError(f"metadata row {index} has invalid difficulty")
+        topics[topic][difficulty].append(index)
 
-    groups = [indices for _, indices in sorted(provisional.items()) if len(indices) >= 2]
-    singletons = [
-        indices[0] for _, indices in sorted(provisional.items()) if len(indices) == 1
-    ]
-    if singletons:
-        if len(singletons) == 1:
-            # A one-element fallback group is still a valid fixed permutation.
-            groups.append(singletons)
+    groups: list[tuple[int, ...]] = []
+    for topic in sorted(topics):
+        difficulty_groups = topics[topic]
+        if any(len(indices) < 2 for indices in difficulty_groups.values()):
+            groups.append(
+                tuple(
+                    sorted(
+                        index
+                        for indices in difficulty_groups.values()
+                        for index in indices
+                    )
+                )
+            )
         else:
-            groups.append(singletons)
+            groups.extend(
+                tuple(difficulty_groups[difficulty])
+                for difficulty in sorted(difficulty_groups, key=lambda value: float(value))
+            )
     flattened = sorted(index for group in groups for index in group)
     if flattened != list(range(len(metadata))):
         raise RuntimeError("stratified permutation groups do not partition rows")
-    return [np.asarray(group, dtype=np.int64) for group in groups]
+    return groups
+
+
+def _pairing_groups(metadata: Sequence[Mapping[str, object]]) -> list[np.ndarray]:
+    return [np.asarray(group, dtype=np.int64) for group in pairing_group_indices(metadata)]
 
 
 def stratified_pairing_null(
@@ -175,10 +190,11 @@ def stratified_pairing_null(
         raise ValueError("draws must be a positive integer")
 
     groups = _pairing_groups(metadata)
-    generator = np.random.Generator(np.random.PCG64(seed))
+    children = np.random.SeedSequence(seed).spawn(draws)
     cosine_medians: list[float] = []
     agreements: list[float] = []
-    for _ in range(draws):
+    for child in children:
+        generator = np.random.Generator(np.random.PCG64(child))
         permutation = np.arange(size, dtype=np.int64)
         for group in groups:
             permutation[group] = generator.permutation(group)
@@ -304,6 +320,100 @@ def selection_null(
         null_values.append(
             gradient_vendi(np.concatenate((original, quality[indices]), axis=0))
         )
+    percentile = (1 + sum(value <= observed for value in null_values)) / (draws + 1)
+    return {
+        "draws": draws,
+        "seed": seed,
+        "observed_g_vendi": observed,
+        "null_g_vendi": null_values,
+        "null_median": float(np.median(null_values)),
+        "percentile": float(percentile),
+    }
+
+
+def selection_null_torch(
+    original_vectors: object,
+    quality_vectors: object,
+    *,
+    accepted_indices: Sequence[int],
+    draws: int,
+    seed: int,
+    device: str,
+    batch_size: int = 4,
+) -> dict[str, object]:
+    """Compute the exact feature-space G-Vendi null in bounded GPU batches."""
+    import torch
+
+    if device not in {"cpu", "cuda:0"}:
+        raise ValueError("selection null device must be cpu or process-local cuda:0")
+    if device == "cuda:0" and torch.cuda.device_count() != 1:
+        raise RuntimeError("CUDA selection null requires exactly one visible GPU")
+    if isinstance(draws, bool) or not isinstance(draws, int) or draws <= 0:
+        raise ValueError("draws must be a positive integer")
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
+        raise ValueError("batch_size must be a positive integer")
+
+    def normalized(value: object, description: str) -> "torch.Tensor":
+        tensor = torch.as_tensor(value, dtype=torch.float32, device="cpu")
+        if tensor.ndim != 2 or tensor.shape[0] == 0 or tensor.shape[1] == 0:
+            raise ValueError(f"{description} must be a nonempty rank-2 matrix")
+        if not bool(torch.isfinite(tensor).all()):
+            raise ValueError(f"{description} contains non-finite values")
+        norms = torch.linalg.vector_norm(tensor, dim=1)
+        if bool((norms <= 0).any()):
+            raise ValueError(f"{description} contains zero row norms")
+        return (tensor / norms[:, None]).to(device)
+
+    original = normalized(original_vectors, "original vectors")
+    quality = normalized(quality_vectors, "quality vectors")
+    if original.shape[1] != quality.shape[1]:
+        raise ValueError("original and quality vectors have different dimensions")
+    accepted = np.asarray(accepted_indices, dtype=np.int64)
+    if accepted.ndim != 1 or accepted.size == 0:
+        raise ValueError("accepted_indices must be nonempty")
+    if len(set(accepted.tolist())) != accepted.size or bool((accepted < 0).any()) or bool(
+        (accepted >= quality.shape[0]).any()
+    ):
+        raise ValueError("accepted_indices are invalid")
+
+    base_covariance = original.T @ original
+
+    def vendi_from_covariances(covariances: "torch.Tensor") -> "torch.Tensor":
+        eigenvalues = torch.linalg.eigvalsh(covariances).clamp_min_(0)
+        totals = eigenvalues.sum(dim=-1, keepdim=True)
+        if not bool(torch.isfinite(totals).all()) or bool((totals <= 0).any()):
+            raise ValueError("G-Vendi spectrum has invalid trace")
+        probabilities = eigenvalues / totals
+        terms = torch.where(
+            probabilities > 1e-15,
+            probabilities * torch.log(probabilities),
+            torch.zeros_like(probabilities),
+        )
+        return torch.exp(-terms.sum(dim=-1))
+
+    accepted_tensor = torch.as_tensor(accepted, dtype=torch.int64, device=device)
+    observed_covariance = base_covariance + quality.index_select(0, accepted_tensor).T @ quality.index_select(0, accepted_tensor)
+    observed = float(vendi_from_covariances(observed_covariance[None])[0].cpu())
+
+    generator = np.random.Generator(np.random.PCG64(seed))
+    random_indices = np.stack(
+        [
+            generator.choice(quality.shape[0], size=accepted.size, replace=False)
+            for _ in range(draws)
+        ],
+        axis=0,
+    )
+    null_values: list[float] = []
+    for start in range(0, draws, batch_size):
+        indices = torch.as_tensor(
+            random_indices[start : start + batch_size],
+            dtype=torch.int64,
+            device=device,
+        )
+        selected = quality[indices]
+        updates = torch.einsum("bnd,bne->bde", selected, selected)
+        values = vendi_from_covariances(base_covariance[None] + updates)
+        null_values.extend(float(value) for value in values.cpu().tolist())
     percentile = (1 + sum(value <= observed for value in null_values)) / (draws + 1)
     return {
         "draws": draws,

@@ -10,8 +10,10 @@ from math_eval.prismatic_lite_pilot_analysis import (
     final_pilot_decision,
     gradient_vendi,
     paired_calibration_metrics,
+    pairing_group_indices,
     question_gradient,
     selection_null,
+    selection_null_torch,
     smallest_cluster_ids,
     stratified_pairing_null,
 )
@@ -121,6 +123,19 @@ def test_stratified_pairing_null_is_repeatable_and_preserves_strata() -> None:
     assert all(0.0 <= value <= 1.0 for value in first["sparse_dense_agreements"])
 
 
+def test_pairing_groups_collapse_an_entire_topic_when_any_exact_stratum_is_small() -> None:
+    metadata = [
+        {"topic": "A", "difficulty": 6.0},
+        {"topic": "A", "difficulty": 6.0},
+        {"topic": "A", "difficulty": 7.0},
+        {"topic": "A", "difficulty": 8.0},
+        {"topic": "B", "difficulty": 6.0},
+        {"topic": "B", "difficulty": 6.0},
+    ]
+
+    assert pairing_group_indices(metadata) == [(0, 1, 2, 3), (4, 5)]
+
+
 def _passing_calibration() -> dict:
     return {
         "qualified_count": 192,
@@ -211,6 +226,32 @@ def test_selection_null_is_deterministic_and_counts_observed_percentile() -> Non
     assert first == repeated
     assert first["observed_g_vendi"] > 1.0
     assert 0.0 < first["percentile"] <= 1.0
+
+
+def test_batched_torch_selection_null_matches_scalar_contract_on_cpu() -> None:
+    original = np.array([[1.0, 0.0], [1.0, 0.0]])
+    quality = np.array([[0.0, 1.0], [1.0, 0.0], [1.0, 0.0]])
+
+    scalar = selection_null(
+        original, quality, accepted_indices=(0,), draws=20, seed=42
+    )
+    batched = selection_null_torch(
+        original,
+        quality,
+        accepted_indices=(0,),
+        draws=20,
+        seed=42,
+        device="cpu",
+        batch_size=3,
+    )
+
+    assert batched["percentile"] == scalar["percentile"]
+    assert batched["observed_g_vendi"] == pytest.approx(
+        scalar["observed_g_vendi"], rel=1e-5
+    )
+    np.testing.assert_allclose(
+        batched["null_g_vendi"], scalar["null_g_vendi"], rtol=1e-5
+    )
 
 
 def test_final_pilot_decision_has_exact_inclusive_boundaries() -> None:
