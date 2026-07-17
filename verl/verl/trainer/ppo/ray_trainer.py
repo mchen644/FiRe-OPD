@@ -52,6 +52,7 @@ from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, Ra
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
+from verl.trainer.ppo.adaptive_concise_opd import AdaptiveConciseProbePlan
 from verl.trainer.ppo.candidate_selection import select_short_correct_candidates
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
@@ -280,6 +281,166 @@ def _extract_single_user_question(messages) -> str:
     if message.get("role") != "user":
         raise ValueError(f"Expected raw prompt role 'user', got {message.get('role')!r}")
     return str(message.get("content", ""))
+
+
+def _build_adaptive_concise_generation_batch(
+    *,
+    batch: DataProto,
+    plan: AdaptiveConciseProbePlan,
+    tokenizer,
+    max_prompt_length: int,
+    truncation: str,
+    temperature: float,
+    top_p: float,
+    apply_chat_template_kwargs: dict | None,
+) -> DataProto:
+    """Build reward-ready concise prompts for exactly the planned normal rows."""
+
+    if apply_chat_template_kwargs is None:
+        apply_chat_template_kwargs = {}
+    if "raw_prompt" not in batch.non_tensor_batch:
+        raise ValueError("adaptive concise probes require data.return_raw_chat=True")
+    probe_indices = plan.probe_indices.detach().cpu().numpy().astype(np.int64, copy=False)
+    caps = plan.max_tokens.detach().cpu().tolist()
+    if len(probe_indices) == 0 or len(probe_indices) != len(caps):
+        raise ValueError("adaptive concise generation requires a nonempty aligned probe plan")
+    if len(np.unique(probe_indices)) != len(probe_indices):
+        raise ValueError("adaptive concise probe indices must be unique")
+
+    selected = batch[probe_indices]
+    questions = [
+        _extract_single_user_question(messages)
+        for messages in selected.non_tensor_batch["raw_prompt"]
+    ]
+    concise_messages = [
+        build_concise_teacher_messages(question=question) for question in questions
+    ]
+    prompt_texts = [
+        tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=False,
+            **apply_chat_template_kwargs,
+        )
+        for messages in concise_messages
+    ]
+    pad_token_id = (
+        tokenizer.pad_token_id
+        if tokenizer.pad_token_id is not None
+        else tokenizer.eos_token_id
+    )
+    input_id_rows = []
+    attention_mask_rows = []
+    for prompt_text in prompt_texts:
+        model_inputs = tokenizer(
+            prompt_text, return_tensors="pt", add_special_tokens=False
+        )
+        if model_inputs["input_ids"].shape[-1] > max_prompt_length:
+            raise ValueError("adaptive concise prompt is longer than max_prompt_length")
+        input_ids, attention_mask = postprocess_data(
+            input_ids=model_inputs["input_ids"],
+            attention_mask=model_inputs["attention_mask"],
+            max_length=max_prompt_length,
+            pad_token_id=pad_token_id,
+            left_pad=True,
+            truncation=truncation,
+        )
+        input_id_rows.append(input_ids[0])
+        attention_mask_rows.append(attention_mask[0])
+
+    input_ids = torch.stack(input_id_rows, dim=0)
+    attention_mask = torch.stack(attention_mask_rows, dim=0)
+    position_ids = compute_position_id_with_mask(attention_mask)
+    non_tensors = {
+        key: value.copy() for key, value in selected.non_tensor_batch.items()
+    }
+    non_tensors["adaptive_concise_original_row"] = probe_indices.copy()
+    non_tensors["adaptive_concise_prompt"] = _object_array(concise_messages)
+    return DataProto.from_dict(
+        tensors={
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+        },
+        non_tensors=non_tensors,
+        meta_info={
+            "do_sample": True,
+            "response_length": int(max(caps)),
+            "temperature": float(temperature),
+            "top_p": float(top_p),
+            "eos_token_id": tokenizer.eos_token_id,
+            "pad_token_id": pad_token_id,
+            "generation_kwargs": {
+                "max_tokens_by_row": [int(value) for value in caps],
+                "disable_rollout_log_probs": True,
+                "temperature": float(temperature),
+                "top_p": float(top_p),
+            },
+        },
+    )
+
+
+def _apply_adaptive_concise_teacher_prompts(
+    *,
+    batch: DataProto,
+    prompt_styles: np.ndarray,
+    teacher_prompt_key: str,
+) -> None:
+    """Attach normal or concise teacher messages without changing student inputs."""
+
+    if "raw_prompt" not in batch.non_tensor_batch:
+        raise ValueError("adaptive concise teacher routing requires raw_prompt")
+    if (
+        not isinstance(prompt_styles, np.ndarray)
+        or prompt_styles.ndim != 1
+        or len(prompt_styles) != len(batch)
+        or any(str(style) not in {"normal", "concise"} for style in prompt_styles.tolist())
+    ):
+        raise ValueError("adaptive concise prompt styles must align and be normal or concise")
+    if not isinstance(teacher_prompt_key, str) or not teacher_prompt_key:
+        raise ValueError("adaptive concise teacher_prompt_key must be nonempty")
+
+    teacher_prompts = []
+    for raw_messages, style in zip(
+        batch.non_tensor_batch["raw_prompt"], prompt_styles.tolist(), strict=True
+    ):
+        raw_message_list = [dict(message) for message in _messages_to_list(raw_messages)]
+        if style == "normal":
+            teacher_prompts.append(deepcopy(raw_message_list))
+        else:
+            question = _extract_single_user_question(raw_message_list)
+            teacher_prompts.append(build_concise_teacher_messages(question=question))
+    batch.non_tensor_batch[teacher_prompt_key] = _object_array(teacher_prompts)
+
+
+def _remap_reward_to_supervised_prefix(
+    *, reward_tensor: torch.Tensor, supervised_lengths: torch.Tensor
+) -> torch.Tensor:
+    """Preserve sequence rewards at each retained normal prefix endpoint."""
+
+    if reward_tensor.dim() != 2:
+        raise ValueError("reward_tensor must be 2D")
+    if not torch.isfinite(reward_tensor).all():
+        raise ValueError("reward_tensor must be finite")
+    if supervised_lengths.dim() != 1 or supervised_lengths.shape[0] != reward_tensor.shape[0]:
+        raise ValueError("supervised_lengths must have shape [batch]")
+    supervised_lengths = supervised_lengths.to(
+        device=reward_tensor.device, dtype=torch.long
+    )
+    if torch.any(supervised_lengths <= 0):
+        raise ValueError("supervised_lengths must be positive")
+    if torch.any(supervised_lengths > reward_tensor.shape[-1]):
+        raise ValueError("supervised_lengths cannot exceed reward width")
+
+    output_width = int(supervised_lengths.max().item())
+    remapped = torch.zeros(
+        (reward_tensor.shape[0], output_width),
+        dtype=reward_tensor.dtype,
+        device=reward_tensor.device,
+    )
+    rows = torch.arange(reward_tensor.shape[0], device=reward_tensor.device)
+    remapped[rows, supervised_lengths - 1] = reward_tensor.sum(dim=-1)
+    return remapped
 
 
 def _build_online_tale_budget_generation_batch(
