@@ -54,7 +54,7 @@ Run only inside the active `opd-CLI` Slurm allocation, without nested `srun`. Im
 1. the allocation to be active with enough remaining wall time;
 2. allocation-owned logical devices `0,1,2,3` to be idle;
 3. no stale candidate evaluation or merge process;
-4. a clean active worktree at the frozen source commit;
+4. a clean active worktree whose executable source tree is identical to frozen commit `94b4f85acb9aa38fff2001c4dd102a55e5daa894`; committed evaluation design/plan documents may be descendants of that commit;
 5. the merged target to be absent or complete, never partial;
 6. the candidate output, mistakes, and log targets to be absent, preventing silent overwrite or resume.
 
