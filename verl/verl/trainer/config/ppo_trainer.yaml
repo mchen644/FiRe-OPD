@@ -242,6 +242,31 @@ algorithm:
     # Teacher/ref prompt style: auto maps legacy use_budget_teacher_prompt to budget or normal; concise uses no numeric budget
     teacher_prompt_style: auto
 
+  # Adaptive concise-probe response-token-neutral OPD
+  adaptive_concise_opd:
+
+    # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+    _target_: verl.trainer.config.AdaptiveConciseOpdConfig
+
+    # Disabled unless launched through the pinned adaptive experiment contract
+    enabled: False
+
+    # Sequence reward threshold above which a normal or concise rollout is correct
+    correct_reward_threshold: 0.5
+
+    # Per-row concise max tokens = floor(ratio * normal valid response length)
+    concise_cap_ratio: 0.5
+
+    # Non-tensor batch key consumed by reference-model re-tokenization
+    teacher_prompt_key: teacher_prompt
+
+    # Concise diagnostic sampling parameters
+    temperature: 1.0
+    top_p: 1.0
+
+    # Required distinct primary questions and final actor rows per step
+    expected_questions_per_step: 1024
+
   # Training-time current-batch Rethinking OPD diagnostics
   rethinking_opd_probe:
 

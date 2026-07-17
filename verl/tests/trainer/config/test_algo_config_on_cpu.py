@@ -229,6 +229,40 @@ class TestAlgoConfig(unittest.TestCase):
         assert probe.csv_path == "/tmp/rethinking_probe.csv"
         assert probe.log_prefix == "rethinking_opd"
 
+    def test_yaml_accepts_adaptive_concise_opd_overrides(self):
+        import os
+
+        from hydra import compose, initialize_config_dir
+        from hydra.core.global_hydra import GlobalHydra
+
+        GlobalHydra.instance().clear()
+        try:
+            config_dir = os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "..", "..", "..", "verl", "trainer", "config")
+            )
+            with initialize_config_dir(config_dir=config_dir, version_base=None):
+                config = omega_conf_to_dataclass(
+                    compose(
+                        config_name="ppo_trainer",
+                        overrides=[
+                            "algorithm.adaptive_concise_opd.enabled=True",
+                            "algorithm.adaptive_concise_opd.correct_reward_threshold=0.5",
+                            "algorithm.adaptive_concise_opd.concise_cap_ratio=0.5",
+                            "algorithm.adaptive_concise_opd.teacher_prompt_key=teacher_prompt",
+                            "algorithm.adaptive_concise_opd.expected_questions_per_step=1024",
+                        ],
+                    ).algorithm
+                )
+        finally:
+            GlobalHydra.instance().clear()
+
+        adaptive = config.adaptive_concise_opd
+        assert adaptive.enabled is True
+        assert adaptive.correct_reward_threshold == 0.5
+        assert adaptive.concise_cap_ratio == 0.5
+        assert adaptive.teacher_prompt_key == "teacher_prompt"
+        assert adaptive.expected_questions_per_step == 1024
+
     def test_yaml_accepts_difficulty_aware_opd_overrides(self):
         config = None
 

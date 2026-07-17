@@ -18,6 +18,7 @@ from typing import Any, Optional
 from verl.base_config import BaseConfig
 
 __all__ = [
+    "AdaptiveConciseOpdConfig",
     "AlgoConfig",
     "CandidateSelectionConfig",
     "DifficultyAwareOpdConfig",
@@ -375,6 +376,19 @@ class TaleBudgetConfig(BaseConfig):
 
 
 @dataclass
+class AdaptiveConciseOpdConfig(BaseConfig):
+    """Adaptive concise-probe response-token-neutral OPD configuration."""
+
+    enabled: bool = False
+    correct_reward_threshold: float = 0.5
+    concise_cap_ratio: float = 0.5
+    teacher_prompt_key: str = "teacher_prompt"
+    temperature: float = 1.0
+    top_p: float = 1.0
+    expected_questions_per_step: int = 1024
+
+
+@dataclass
 class RethinkingOpdProbeConfig(BaseConfig):
     """Training-time current-batch Rethinking OPD diagnostics."""
 
@@ -472,6 +486,7 @@ class AlgoConfig(BaseConfig):
     pf_ppo: dict[str, Any] = field(default_factory=dict)
     filter_groups: Optional[FilterGroupsConfig] = None
     candidate_selection: Optional[CandidateSelectionConfig] = field(default_factory=CandidateSelectionConfig)
+    adaptive_concise_opd: AdaptiveConciseOpdConfig = field(default_factory=AdaptiveConciseOpdConfig)
     tale_budget: TaleBudgetConfig = field(default_factory=TaleBudgetConfig)
     rethinking_opd_probe: RethinkingOpdProbeConfig = field(default_factory=RethinkingOpdProbeConfig)
     difficulty_aware_opd: DifficultyAwareOpdConfig = field(default_factory=DifficultyAwareOpdConfig)
