@@ -108,6 +108,43 @@ class NativeNExpansion:
     token_ids: list[list[int]]
 
 
+def _build_per_request_sampling_params(
+    base_sampling_params: SamplingParams,
+    *,
+    max_tokens_by_row: list[int],
+    expected_rows: int,
+    max_response_length: int,
+    disable_rollout_log_probs: bool,
+) -> list[SamplingParams]:
+    """Clone one SamplingParams per request with a validated response cap."""
+
+    if isinstance(expected_rows, bool) or not isinstance(expected_rows, int) or expected_rows < 0:
+        raise ValueError("expected_rows must be a nonnegative integer")
+    if (
+        isinstance(max_response_length, bool)
+        or not isinstance(max_response_length, int)
+        or max_response_length <= 0
+    ):
+        raise ValueError("max_response_length must be a positive integer")
+    if not isinstance(disable_rollout_log_probs, bool):
+        raise ValueError("disable_rollout_log_probs must be boolean")
+    if not isinstance(max_tokens_by_row, list) or len(max_tokens_by_row) != expected_rows:
+        raise ValueError("max_tokens_by_row row count must match the prompt batch")
+    if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in max_tokens_by_row):
+        raise ValueError("max_tokens_by_row values must be positive integers")
+    if any(value > max_response_length for value in max_tokens_by_row):
+        raise ValueError("max_tokens_by_row cannot exceed the configured response length")
+
+    sampling_params: list[SamplingParams] = []
+    for max_tokens in max_tokens_by_row:
+        row_params = copy.deepcopy(base_sampling_params)
+        row_params.max_tokens = max_tokens
+        if disable_rollout_log_probs:
+            row_params.logprobs = None
+        sampling_params.append(row_params)
+    return sampling_params
+
+
 def _expand_native_n_outputs(
     *, stable_ids: np.ndarray, request_outputs: list[object], native_n: int
 ) -> NativeNExpansion:
@@ -366,8 +403,17 @@ class vLLMRollout(BaseRollout):
             responses:     |<- LLM generation ->|<- tool_calls ->|<- LLM generation ->|<- padding ->|
             response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
         """
+        max_tokens_by_row = kwargs.pop("max_tokens_by_row", None)
+        disable_rollout_log_probs = kwargs.pop("disable_rollout_log_probs", False)
         native_n = kwargs.pop("opd_proxy_verify_native_n", None)
         native_capture = native_n is not None
+        if max_tokens_by_row is not None:
+            if native_capture:
+                raise ValueError("per-request max tokens are incompatible with native-N capture")
+            if not isinstance(max_tokens_by_row, list):
+                raise ValueError("max_tokens_by_row must be a list")
+        elif disable_rollout_log_probs:
+            raise ValueError("disable_rollout_log_probs requires max_tokens_by_row")
         native_stable_ids: np.ndarray | None = None
         if native_capture:
             if prompts.meta_info.get("opd_proxy_verify_capture_enabled") is not True:
@@ -488,9 +534,20 @@ class vLLMRollout(BaseRollout):
 
         # users can customize different sampling_params at different run
         rollout_slots: torch.Tensor | None = None
+        output_response_length = self.config.response_length
+        collect_rollout_log_probs = self.config.calculate_log_probs and not disable_rollout_log_probs
         with self.update_sampling_params(**kwargs):
-            generation_sampling_params = self.sampling_params
-            if native_capture:
+            generation_sampling_params: SamplingParams | list[SamplingParams] = self.sampling_params
+            if max_tokens_by_row is not None:
+                generation_sampling_params = _build_per_request_sampling_params(
+                    self.sampling_params,
+                    max_tokens_by_row=max_tokens_by_row,
+                    expected_rows=batch_size,
+                    max_response_length=self.config.response_length,
+                    disable_rollout_log_probs=disable_rollout_log_probs,
+                )
+                output_response_length = max(max_tokens_by_row)
+            elif native_capture:
                 generation_sampling_params = copy.deepcopy(self.sampling_params)
                 generation_sampling_params.n = native_n
             outputs = self.inference_engine.generate(
@@ -522,7 +579,7 @@ class vLLMRollout(BaseRollout):
                     response_ids = output.outputs[sample_id].token_ids
                     if not native_capture:
                         response.append(response_ids)
-                    if self.config.calculate_log_probs:
+                    if collect_rollout_log_probs:
                         curr_log_prob = []
                         for i, logprob in enumerate(output.outputs[sample_id].logprobs):
                             curr_log_prob.append(logprob[response_ids[i]].logprob)
@@ -548,11 +605,11 @@ class vLLMRollout(BaseRollout):
             response = pad_2d_list_to_length(
                 response,
                 self.pad_token_id,
-                max_length=self.config.response_length,
+                max_length=output_response_length,
             ).to(idx.device)
-            if self.config.calculate_log_probs:
+            if collect_rollout_log_probs:
                 rollout_log_probs = pad_2d_list_to_length(
-                    rollout_log_probs, -1, max_length=self.config.response_length
+                    rollout_log_probs, -1, max_length=output_response_length
                 ).to(idx.device)
                 rollout_log_probs = rollout_log_probs.to(torch.float32)
 
@@ -586,7 +643,7 @@ class vLLMRollout(BaseRollout):
             },
             batch_size=batch_size,
         )
-        if self.config.calculate_log_probs:
+        if collect_rollout_log_probs:
             # we will recompute old log prob with actor
             batch["rollout_log_probs"] = rollout_log_probs
         if rollout_slots is not None:
