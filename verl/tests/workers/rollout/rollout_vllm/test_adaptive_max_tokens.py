@@ -1,11 +1,13 @@
 import inspect
 
 import pytest
+import torch
 from vllm import SamplingParams
 
 from verl.workers.rollout.vllm_rollout import vllm_rollout_spmd
 from verl.workers.rollout.vllm_rollout.vllm_rollout_spmd import (
     _build_per_request_sampling_params,
+    _build_response_attention_mask,
 )
 
 
@@ -59,6 +61,32 @@ def test_build_per_request_sampling_params_rejects_invalid_caps(
             max_response_length=max_response_length,
             disable_rollout_log_probs=True,
         )
+
+
+def test_response_attention_mask_excludes_non_eos_padding_after_shorter_per_request_caps() -> None:
+    pad_token_id = 151643
+    eos_token_id = 151645
+    responses = torch.tensor(
+        [
+            [10, pad_token_id, pad_token_id, pad_token_id],
+            [20, 21, 22, 23],
+            [30, eos_token_id, pad_token_id, pad_token_id],
+        ]
+    )
+
+    mask = _build_response_attention_mask(
+        responses,
+        eos_token_id=eos_token_id,
+        generated_lengths=[1, 4, 2],
+        dtype=torch.long,
+    )
+
+    assert mask.tolist() == [
+        [1, 0, 0, 0],
+        [1, 1, 1, 1],
+        [1, 1, 0, 0],
+    ]
+    assert mask.sum(dim=-1).tolist() == [1, 4, 2]
 
 
 def test_vllm_generate_path_consumes_adaptive_kwargs_before_sampling_update() -> None:

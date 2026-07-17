@@ -145,6 +145,36 @@ def _build_per_request_sampling_params(
     return sampling_params
 
 
+def _build_response_attention_mask(
+    responses: torch.Tensor,
+    *,
+    eos_token_id: int,
+    generated_lengths: list[int],
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Mask EOS tails and explicit per-request padding from generated token lists."""
+
+    if responses.dim() != 2:
+        raise ValueError("responses must be a 2D tensor")
+    if not isinstance(generated_lengths, list) or len(generated_lengths) != responses.shape[0]:
+        raise ValueError("generated_lengths row count must match responses")
+    if any(
+        isinstance(length, bool)
+        or not isinstance(length, int)
+        or length < 0
+        or length > responses.shape[1]
+        for length in generated_lengths
+    ):
+        raise ValueError("generated_lengths must be integers within the padded response width")
+    eos_mask = get_response_mask(
+        response_id=responses, eos_token=eos_token_id, dtype=dtype
+    )
+    lengths = torch.tensor(generated_lengths, device=responses.device, dtype=torch.long)
+    positions = torch.arange(responses.shape[1], device=responses.device).unsqueeze(0)
+    length_mask = positions < lengths.unsqueeze(1)
+    return eos_mask * length_mask.to(dtype=dtype)
+
+
 def _expand_native_n_outputs(
     *, stable_ids: np.ndarray, request_outputs: list[object], native_n: int
 ) -> NativeNExpansion:
@@ -602,6 +632,7 @@ class vLLMRollout(BaseRollout):
                 )
                 batch_size *= native_n
 
+            generated_response_lengths = [len(response_ids) for response_ids in response]
             response = pad_2d_list_to_length(
                 response,
                 self.pad_token_id,
@@ -627,8 +658,11 @@ class vLLMRollout(BaseRollout):
         # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
         response_position_ids = position_ids[..., -1:] + delta_position_id
         position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
-        response_attention_mask = get_response_mask(
-            response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype
+        response_attention_mask = _build_response_attention_mask(
+            response,
+            eos_token_id=eos_token_id,
+            generated_lengths=generated_response_lengths,
+            dtype=attention_mask.dtype,
         )
         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
 
