@@ -219,7 +219,7 @@ for row in rows:
         assert len(row[key]) == 32
 ```
 
-Also require all response lengths to be integers in `[0, 16384]`, all `acc_list` entries to be booleans, and every expected input problem to occur exactly once. Expected: `JSONL_COMPLETENESS_GATE=PASS`.
+Also require all response lengths to be integers in `[0, 16385]`, all `acc_list` entries to be booleans, and every expected input problem to occur exactly once. The evaluator measures decoded text by retokenizing it, and the frozen historical Vanilla outputs establish that a 16,384-token generation can retokenize to 16,385 tokens. Expected: `JSONL_COMPLETENESS_GATE=PASS`.
 
 - [ ] **Step 2: Recompute metrics from JSONL rather than trusting logs**
 

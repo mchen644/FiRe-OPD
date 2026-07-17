@@ -146,7 +146,7 @@ Require 40 unique rows, 1,280 total samples, final metrics, no fatal markers, an
 
 - [ ] **Step 1: Revalidate every JSONL row and recompute metrics**
 
-For each dataset, require the frozen problem count, unique problem coverage, 32 samples per row, baseline prompt metadata, boolean correctness values, and response lengths in `[0, 16384]`. Recompute Accuracy, pass@32, and mean length and match the logs.
+For each dataset, require the frozen problem count, unique problem coverage, 32 samples per row, baseline prompt metadata, boolean correctness values, and retokenized response lengths in `[0, 16385]`. The frozen historical evaluator outputs establish the one-token retokenization allowance above the 16,384 generation cap. Recompute Accuracy, pass@32, and mean length and match the logs.
 
 - [ ] **Step 2: Compute macro metrics and available historical deltas**
 
