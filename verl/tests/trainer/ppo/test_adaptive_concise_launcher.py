@@ -170,6 +170,7 @@ def test_launcher_pins_profile_and_full_contracts(
         "algorithm.rethinking_opd_probe.enabled=False",
         "actor_rollout_ref.actor.policy_loss.length_aware_opd=False",
         "actor_rollout_ref.actor.entropy_coeff=0",
+        "actor_rollout_ref.actor.entropy_from_logits_with_chunking=True",
         "trainer.resume_mode=disable",
     ]
     for value in required:
@@ -189,6 +190,19 @@ def test_launcher_command_composes_and_passes_runtime_validation() -> None:
     contract = validate_adaptive_concise_runtime_config(config)
     assert contract["concise_cap_ratio"] == 0.5
     assert config.trainer.total_training_steps == 50
+
+
+def test_launcher_chunks_actor_entropy_without_changing_old_log_prob_micro_batch() -> None:
+    completed = _run_launcher("full")
+    assert completed.returncode == 0, completed.stderr
+    command_line = next(
+        line for line in completed.stdout.splitlines() if line.startswith("adaptive_command=")
+    )
+    argv = shlex.split(command_line.split("=", 1)[1])
+    with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+        config = compose(config_name="ppo_trainer", overrides=argv[3:])
+    assert config.actor_rollout_ref.actor.entropy_from_logits_with_chunking is True
+    assert config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu == 4
 
 
 @pytest.mark.parametrize(
