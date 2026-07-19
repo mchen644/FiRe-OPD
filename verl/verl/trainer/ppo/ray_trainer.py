@@ -69,6 +69,7 @@ from verl.trainer.ppo.adaptive_triprompt_opd import (
     plan_adaptive_triprompt_probes,
     summarize_adaptive_triprompt_routing,
     summarize_response_endpoints,
+    update_adaptive_triprompt_cumulative_counts,
     verify_primary_tensor_contract,
 )
 from verl.trainer.ppo.candidate_selection import select_short_correct_candidates
@@ -861,6 +862,20 @@ def _apply_adaptive_triprompt_opd(
     if diagnostic_batch is not None:
         del diagnostic_batch
     return batch, normal_reward, result, metrics
+
+
+def _assert_no_adaptive_triprompt_diagnostic_keys(batch: DataProto) -> None:
+    """Fail closed if diagnostic-only state leaked into the primary actor batch."""
+
+    keys = set(batch.batch.keys()) | set(batch.non_tensor_batch)
+    leaked = sorted(
+        key
+        for key in keys
+        if key in {"adaptive_triprompt_original_row", "adaptive_triprompt_prompt"}
+        or key.startswith("adaptive_triprompt_diagnostic_")
+    )
+    if leaked:
+        raise ValueError(f"adaptive tri-prompt diagnostic leakage into primary batch: {leaked}")
 
 
 def _build_online_tale_budget_generation_batch(
@@ -2646,11 +2661,13 @@ class RayPPOTrainer:
         next_step_profile = False
 
         adaptive_concise_cumulative: dict[str, int] = {}
+        adaptive_triprompt_cumulative: dict[str, int] = {}
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics = {}
                 timing_raw = {}
                 adaptive_routing_result: AdaptiveConciseRoutingResult | None = None
+                triprompt_routing_result: AdaptiveTriPromptRoutingResult | None = None
 
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
@@ -2778,6 +2795,31 @@ class RayPPOTrainer:
                         batch.meta_info["global_token_num"] = torch.sum(
                             batch.batch["attention_mask"], dim=-1
                         ).tolist()
+
+                    triprompt_config = self.config.algorithm.get("adaptive_triprompt_opd", None)
+                    if triprompt_config and triprompt_config.get("enabled", False):
+                        if self.config.reward_model.launch_reward_fn_async and reward_tensor is None:
+                            reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                        timing_raw["normal_rollout"] = timing_raw["gen"]
+                        timing_raw["normal_reward"] = timing_raw["reward"]
+                        batch, reward_tensor, triprompt_routing_result, triprompt_metrics = (
+                            _apply_adaptive_triprompt_opd(
+                                batch=batch,
+                                normal_reward=reward_tensor,
+                                actor_rollout_wg=self.actor_rollout_wg,
+                                reward_fn=self.reward_fn,
+                                tokenizer=self.tokenizer,
+                                triprompt_config=triprompt_config,
+                                max_prompt_length=self.config.data.max_prompt_length,
+                                truncation=self.config.data.get("truncation", "error"),
+                                apply_chat_template_kwargs=self.config.data.get(
+                                    "apply_chat_template_kwargs", {}
+                                ),
+                                timing_raw=timing_raw,
+                            )
+                        )
+                        metrics.update(triprompt_metrics)
+                        _assert_no_adaptive_triprompt_diagnostic_keys(batch)
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
@@ -3058,6 +3100,14 @@ class RayPPOTrainer:
                                 update_adaptive_concise_cumulative_counts(
                                     adaptive_concise_cumulative,
                                     adaptive_routing_result,
+                                )
+                            )
+                            metrics.update(cumulative_metrics)
+                        if triprompt_routing_result is not None:
+                            adaptive_triprompt_cumulative, cumulative_metrics = (
+                                update_adaptive_triprompt_cumulative_counts(
+                                    adaptive_triprompt_cumulative,
+                                    triprompt_routing_result,
                                 )
                             )
                             metrics.update(cumulative_metrics)

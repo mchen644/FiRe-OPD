@@ -1,3 +1,4 @@
+import inspect
 from dataclasses import replace
 
 import numpy as np
@@ -6,6 +7,7 @@ import torch
 
 from verl import DataProto
 from verl.trainer.config.algorithm import AdaptiveTriPromptOpdConfig
+from verl.trainer.ppo import ray_trainer
 from verl.trainer.ppo.adaptive_triprompt_opd import (
     finalize_adaptive_triprompt_routing,
     plan_adaptive_triprompt_probes,
@@ -13,6 +15,7 @@ from verl.trainer.ppo.adaptive_triprompt_opd import (
 from verl.trainer.ppo.ray_trainer import (
     _apply_adaptive_triprompt_opd,
     _apply_adaptive_triprompt_teacher_prompts,
+    _assert_no_adaptive_triprompt_diagnostic_keys,
     _build_adaptive_triprompt_generation_batch,
 )
 
@@ -360,3 +363,33 @@ def test_apply_triprompt_opd_rejects_duplicate_question_indices() -> None:
             apply_chat_template_kwargs={"enable_thinking": False},
             timing_raw={},
         )
+
+
+def test_diagnostic_leak_guard_rejects_tensor_and_non_tensor_keys() -> None:
+    tensor_leak = _normal_batch()
+    tensor_leak.batch["adaptive_triprompt_diagnostic_scores"] = torch.zeros(4, 4)
+    with pytest.raises(ValueError, match="diagnostic leakage"):
+        _assert_no_adaptive_triprompt_diagnostic_keys(tensor_leak)
+
+    non_tensor_leak = _normal_batch()
+    non_tensor_leak.non_tensor_batch["adaptive_triprompt_original_row"] = np.arange(4)
+    with pytest.raises(ValueError, match="diagnostic leakage"):
+        _assert_no_adaptive_triprompt_diagnostic_keys(non_tensor_leak)
+
+
+def test_fit_source_routes_before_post_rollout_model_forwards() -> None:
+    source = inspect.getsource(ray_trainer.RayPPOTrainer.fit)
+    triprompt_call = "_apply_adaptive_triprompt_opd("
+    leak_guard_call = "_assert_no_adaptive_triprompt_diagnostic_keys(batch)"
+    old_log_prob_call = "compute_log_prob(batch)"
+    ref_prepare_call = "prepare_ref_model_inputs("
+    actor_update_call = "update_actor(batch)"
+
+    assert triprompt_call in source
+    assert source.index(triprompt_call) < source.index(leak_guard_call)
+    assert source.index(leak_guard_call) < source.index(old_log_prob_call)
+    assert source.index(triprompt_call) < source.index(ref_prepare_call)
+    assert source.index(triprompt_call) < source.index(actor_update_call)
+    assert "adaptive_triprompt_cumulative" in source
+    assert "triprompt_routing_result" in source
+    assert "adaptive_triprompt_seqlen" not in source
