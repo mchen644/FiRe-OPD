@@ -61,6 +61,16 @@ from verl.trainer.ppo.adaptive_concise_opd import (
     truncate_to_adaptive_concise_prefix,
     update_adaptive_concise_cumulative_counts,
 )
+from verl.trainer.ppo.adaptive_triprompt_opd import (
+    AdaptiveTriPromptProbePlan,
+    AdaptiveTriPromptRoutingResult,
+    capture_primary_tensor_contract,
+    finalize_adaptive_triprompt_routing,
+    plan_adaptive_triprompt_probes,
+    summarize_adaptive_triprompt_routing,
+    summarize_response_endpoints,
+    verify_primary_tensor_contract,
+)
 from verl.trainer.ppo.candidate_selection import select_short_correct_candidates
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
@@ -568,6 +578,289 @@ def _apply_adaptive_concise_opd(
         raise ValueError("remapped reward width does not match routed normal response width")
     metrics = summarize_adaptive_concise_routing(result)
     return routed_batch, remapped_reward, result, metrics
+
+
+def _build_adaptive_triprompt_generation_batch(
+    *,
+    batch: DataProto,
+    plan: AdaptiveTriPromptProbePlan,
+    tokenizer,
+    max_prompt_length: int,
+    truncation: str,
+    max_response_length: int,
+    temperature: float,
+    top_p: float,
+    apply_chat_template_kwargs: dict | None,
+) -> DataProto:
+    """Build full-cap concise diagnostics for exactly the normal-correct rows."""
+
+    if apply_chat_template_kwargs is None:
+        apply_chat_template_kwargs = {}
+    if "raw_prompt" not in batch.non_tensor_batch:
+        raise ValueError("adaptive tri-prompt diagnostics require data.return_raw_chat=True")
+    if (
+        isinstance(max_response_length, bool)
+        or not isinstance(max_response_length, int)
+        or max_response_length <= 0
+    ):
+        raise ValueError("adaptive tri-prompt max_response_length must be positive")
+
+    probe_indices = plan.probe_indices.detach().cpu().numpy().astype(np.int64, copy=False)
+    if len(probe_indices) == 0:
+        raise ValueError("adaptive tri-prompt generation requires a nonempty probe plan")
+    if len(np.unique(probe_indices)) != len(probe_indices):
+        raise ValueError("adaptive tri-prompt probe indices must be unique")
+
+    selected = batch[probe_indices]
+    questions = [
+        _extract_single_user_question(messages)
+        for messages in selected.non_tensor_batch["raw_prompt"]
+    ]
+    concise_messages = [
+        build_concise_teacher_messages(question=question) for question in questions
+    ]
+    prompt_texts = [
+        tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=False,
+            **apply_chat_template_kwargs,
+        )
+        for messages in concise_messages
+    ]
+    pad_token_id = (
+        tokenizer.pad_token_id
+        if tokenizer.pad_token_id is not None
+        else tokenizer.eos_token_id
+    )
+    input_id_rows = []
+    attention_mask_rows = []
+    for prompt_text in prompt_texts:
+        model_inputs = tokenizer(
+            prompt_text, return_tensors="pt", add_special_tokens=False
+        )
+        if model_inputs["input_ids"].shape[-1] > max_prompt_length:
+            raise ValueError("adaptive tri-prompt concise prompt is longer than max_prompt_length")
+        input_ids, attention_mask = postprocess_data(
+            input_ids=model_inputs["input_ids"],
+            attention_mask=model_inputs["attention_mask"],
+            max_length=max_prompt_length,
+            pad_token_id=pad_token_id,
+            left_pad=True,
+            truncation=truncation,
+        )
+        input_id_rows.append(input_ids[0])
+        attention_mask_rows.append(attention_mask[0])
+
+    input_ids = torch.stack(input_id_rows, dim=0)
+    attention_mask = torch.stack(attention_mask_rows, dim=0)
+    position_ids = compute_position_id_with_mask(attention_mask)
+    non_tensors = {
+        key: value.copy() for key, value in selected.non_tensor_batch.items()
+    }
+    non_tensors["adaptive_triprompt_original_row"] = probe_indices.copy()
+    non_tensors["adaptive_triprompt_prompt"] = _object_array(concise_messages)
+    return DataProto.from_dict(
+        tensors={
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+        },
+        non_tensors=non_tensors,
+        meta_info={
+            "do_sample": True,
+            "response_length": int(max_response_length),
+            "temperature": float(temperature),
+            "top_p": float(top_p),
+            "eos_token_id": tokenizer.eos_token_id,
+            "pad_token_id": pad_token_id,
+            "generation_kwargs": {
+                "disable_rollout_log_probs": True,
+                "temperature": float(temperature),
+                "top_p": float(top_p),
+            },
+        },
+    )
+
+
+def _apply_adaptive_triprompt_teacher_prompts(
+    *,
+    batch: DataProto,
+    result: AdaptiveTriPromptRoutingResult,
+    teacher_prompt_key: str,
+) -> None:
+    """Attach normal, B=L_n budget, or concise 30B prompts by route."""
+
+    if "raw_prompt" not in batch.non_tensor_batch:
+        raise ValueError("adaptive tri-prompt routing requires raw_prompt")
+    styles = result.teacher_prompt_styles
+    if (
+        not isinstance(styles, np.ndarray)
+        or styles.ndim != 1
+        or len(styles) != len(batch)
+        or any(str(style) not in {"normal", "budget", "concise"} for style in styles.tolist())
+    ):
+        raise ValueError("adaptive tri-prompt styles must align and be normal, budget, or concise")
+    if result.budgets.dim() != 1 or result.budgets.shape[0] != len(batch):
+        raise ValueError("adaptive tri-prompt budgets must align with the primary batch")
+    if not torch.equal(result.budgets[result.sensitive], result.normal_lengths[result.sensitive]):
+        raise ValueError("adaptive tri-prompt sensitive budget must equal normal length")
+    if torch.any(result.budgets[~result.sensitive] != 0):
+        raise ValueError("adaptive tri-prompt budget is only valid on sensitive rows")
+    if not isinstance(teacher_prompt_key, str) or not teacher_prompt_key:
+        raise ValueError("adaptive tri-prompt teacher_prompt_key must be nonempty")
+
+    teacher_prompts = []
+    for row, (raw_messages, style) in enumerate(
+        zip(batch.non_tensor_batch["raw_prompt"], styles.tolist(), strict=True)
+    ):
+        raw_message_list = [dict(message) for message in _messages_to_list(raw_messages)]
+        if style == "normal":
+            teacher_prompts.append(deepcopy(raw_message_list))
+            continue
+        question = _extract_single_user_question(raw_message_list)
+        if style == "budget":
+            teacher_prompts.append(
+                build_tale_budget_teacher_messages(
+                    question=question,
+                    budget=int(result.budgets[row].item()),
+                )
+            )
+        else:
+            teacher_prompts.append(build_concise_teacher_messages(question=question))
+    batch.non_tensor_batch[teacher_prompt_key] = _object_array(teacher_prompts)
+
+
+def _apply_adaptive_triprompt_opd(
+    *,
+    batch: DataProto,
+    normal_reward: torch.Tensor,
+    actor_rollout_wg,
+    reward_fn,
+    tokenizer,
+    triprompt_config,
+    max_prompt_length: int,
+    truncation: str,
+    apply_chat_template_kwargs: dict | None,
+    timing_raw: dict,
+) -> tuple[DataProto, torch.Tensor, AdaptiveTriPromptRoutingResult, dict[str, float]]:
+    """Route 30B prompts while preserving every primary normal-response token."""
+
+    if not triprompt_config or not triprompt_config.get("enabled", False):
+        raise ValueError("adaptive tri-prompt helper requires enabled configuration")
+    expected_questions = int(triprompt_config.get("expected_questions_per_step", 1024))
+    _validate_adaptive_question_batch(batch, expected_questions=expected_questions)
+    if "response_mask" not in batch.batch.keys():
+        raise ValueError("adaptive tri-prompt OPD requires normal response_mask")
+    if normal_reward.shape != batch.batch["response_mask"].shape:
+        raise ValueError("normal reward must align with the normal response mask")
+    if float(triprompt_config.get("budget_alpha", 1.0)) != 1.0:
+        raise ValueError("adaptive tri-prompt budget_alpha must remain pinned to 1.0")
+
+    threshold = float(triprompt_config.get("correct_reward_threshold", 0.5))
+    max_response_length = int(
+        triprompt_config.get("diagnostic_max_response_length", 16384)
+    )
+    snapshot = capture_primary_tensor_contract(
+        batch=batch,
+        reward_tensor=normal_reward,
+    )
+    plan = plan_adaptive_triprompt_probes(
+        normal_reward=normal_reward,
+        normal_response_mask=batch.batch["response_mask"],
+        correct_reward_threshold=threshold,
+    )
+
+    diagnostic_batch = None
+    if plan.probe_indices.numel():
+        diagnostic_prompts = _build_adaptive_triprompt_generation_batch(
+            batch=batch,
+            plan=plan,
+            tokenizer=tokenizer,
+            max_prompt_length=max_prompt_length,
+            truncation=truncation,
+            max_response_length=max_response_length,
+            temperature=float(triprompt_config.get("temperature", 1.0)),
+            top_p=float(triprompt_config.get("top_p", 1.0)),
+            apply_chat_template_kwargs=apply_chat_template_kwargs,
+        )
+        with marked_timer("concise_probe", timing_raw, color="magenta"):
+            diagnostic_batch = actor_rollout_wg.generate_sequences(diagnostic_prompts)
+            diagnostic_batch.meta_info.pop("timing", None)
+        if "response_mask" not in diagnostic_batch.batch.keys():
+            diagnostic_batch.batch["response_mask"] = compute_response_mask(diagnostic_batch)
+        with marked_timer("concise_reward", timing_raw, color="yellow"):
+            concise_reward, _ = compute_reward(diagnostic_batch, reward_fn)
+        concise_texts = tokenizer.batch_decode(
+            diagnostic_batch.batch["responses"], skip_special_tokens=True
+        )
+        concise_original_indices = diagnostic_batch.non_tensor_batch.get(
+            "adaptive_triprompt_original_row"
+        )
+        if concise_original_indices is None:
+            raise ValueError("adaptive tri-prompt diagnostic output lost original-row mapping")
+        concise_response_mask = diagnostic_batch.batch["response_mask"]
+        concise_response_ids = diagnostic_batch.batch["responses"]
+    else:
+        normal_device = batch.batch["response_mask"].device
+        concise_reward = torch.zeros((0, 0), device=normal_device)
+        concise_response_mask = torch.zeros(
+            (0, 0), device=normal_device, dtype=batch.batch["response_mask"].dtype
+        )
+        concise_response_ids = torch.zeros(
+            (0, 0), device=normal_device, dtype=batch.batch["responses"].dtype
+        )
+        concise_original_indices = np.array([], dtype=np.int64)
+        concise_texts = []
+        timing_raw["concise_probe"] = 0.0
+        timing_raw["concise_reward"] = 0.0
+
+    with marked_timer("triprompt_routing", timing_raw, color="orange"):
+        result = finalize_adaptive_triprompt_routing(
+            plan=plan,
+            concise_reward=concise_reward,
+            concise_response_mask=concise_response_mask,
+            concise_original_indices=concise_original_indices,
+            concise_texts=concise_texts,
+            correct_reward_threshold=threshold,
+            max_response_length=max_response_length,
+        )
+        _apply_adaptive_triprompt_teacher_prompts(
+            batch=batch,
+            result=result,
+            teacher_prompt_key=str(
+                triprompt_config.get("teacher_prompt_key", "teacher_prompt")
+            ),
+        )
+        verify_primary_tensor_contract(
+            snapshot=snapshot,
+            batch=batch,
+            reward_tensor=normal_reward,
+        )
+
+    metrics = summarize_adaptive_triprompt_routing(result)
+    normal_endpoint_metrics = summarize_response_endpoints(
+        response_ids=batch.batch["responses"],
+        response_mask=batch.batch["response_mask"],
+        eos_token_id=int(tokenizer.eos_token_id),
+        max_response_length=max_response_length,
+        metric_prefix="adaptive_triprompt_opd/normal",
+    )
+    concise_endpoint_metrics = summarize_response_endpoints(
+        response_ids=concise_response_ids,
+        response_mask=concise_response_mask,
+        eos_token_id=int(tokenizer.eos_token_id),
+        max_response_length=max_response_length,
+        metric_prefix="adaptive_triprompt_opd/concise",
+    )
+    for key, value in (*normal_endpoint_metrics.items(), *concise_endpoint_metrics.items()):
+        if key in metrics and metrics[key] != value:
+            raise ValueError(f"adaptive tri-prompt metric collision for {key}")
+        metrics[key] = value
+
+    if diagnostic_batch is not None:
+        del diagnostic_batch
+    return batch, normal_reward, result, metrics
 
 
 def _build_online_tale_budget_generation_batch(
