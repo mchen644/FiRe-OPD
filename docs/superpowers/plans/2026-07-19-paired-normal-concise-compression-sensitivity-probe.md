@@ -1,5 +1,7 @@
 # Paired Normal/Concise Compression-Sensitivity Probe Implementation Plan
 
+> **Runtime amendment:** Task 2's independent relaxed resampling is superseded by `2026-07-19-paired-normal-concise-forced-prefix-remediation.md` after TP=4 vLLM disproved the assumed same-seed prefix identity.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build and run a reproducible paired normal/concise training-distribution probe on the base Qwen3-4B and completed adaptive step-50 checkpoint, including all four correctness quadrants and same-seed relaxed-budget counterfactuals.

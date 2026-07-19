@@ -49,6 +49,16 @@ def test_validate_run_accepts_complete_independently_recomputed_artifacts(tmp_pa
         ("cap", "concise cap"),
         ("seed", "sample"),
         ("prefix", "prefix"),
+        ("counterfactual_mode", "counterfactual mode"),
+        ("forced_prefix_length", "prefix length"),
+        ("continuation_seed", "continuation seed"),
+        ("continuation_max_tokens", "remaining budget"),
+        ("continuation_length", "continuation length"),
+        ("continuation_token", "combined token IDs"),
+        ("continuation_prompt_token", "prompt capped suffix"),
+        ("continuation_prompt_length", "prompt length"),
+        ("manifest_mode", "manifest counterfactual mode"),
+        ("generation_mode", "generation counterfactual mode"),
         ("route", "quadrant"),
         ("summary", "summary"),
         ("order", "sample identities"),
@@ -73,6 +83,49 @@ def test_validate_run_rejects_semantic_tampering(
         records[1]["relaxed_concise"]["token_ids"][0] = 999
         _write_jsonl(records_path, records)
         _rehash(run_dir, "base/records.jsonl")
+    elif mutation == "counterfactual_mode":
+        records[1]["relaxed_concise"]["counterfactual_mode"] = "independent_resample"
+        _write_jsonl(records_path, records)
+        _rehash(run_dir, "base/records.jsonl")
+    elif mutation == "forced_prefix_length":
+        records[1]["relaxed_concise"]["forced_prefix_length"] -= 1
+        _write_jsonl(records_path, records)
+        _rehash(run_dir, "base/records.jsonl")
+    elif mutation == "continuation_seed":
+        records[1]["relaxed_concise"]["continuation_seed"] += 1
+        _write_jsonl(records_path, records)
+        _rehash(run_dir, "base/records.jsonl")
+    elif mutation == "continuation_max_tokens":
+        records[1]["relaxed_concise"]["continuation_max_tokens"] += 1
+        _write_jsonl(records_path, records)
+        _rehash(run_dir, "base/records.jsonl")
+    elif mutation == "continuation_length":
+        records[1]["relaxed_concise"]["continuation_length"] += 1
+        _write_jsonl(records_path, records)
+        _rehash(run_dir, "base/records.jsonl")
+    elif mutation == "continuation_token":
+        records[1]["relaxed_concise"]["continuation_token_ids"][0] = 999
+        _write_jsonl(records_path, records)
+        _rehash(run_dir, "base/records.jsonl")
+    elif mutation == "continuation_prompt_token":
+        records[1]["relaxed_concise"]["continuation_prompt_token_ids"][-1] = 999
+        _write_jsonl(records_path, records)
+        _rehash(run_dir, "base/records.jsonl")
+    elif mutation == "continuation_prompt_length":
+        records[1]["relaxed_concise"]["continuation_prompt_length"] -= 1
+        _write_jsonl(records_path, records)
+        _rehash(run_dir, "base/records.jsonl")
+    elif mutation == "manifest_mode":
+        manifest_path = run_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["protocol"]["relaxed_counterfactual_mode"] = "independent_resample"
+        manifest_path.write_text(json.dumps(manifest))
+    elif mutation == "generation_mode":
+        generation_path = run_dir / "base" / "generation.json"
+        generation = json.loads(generation_path.read_text())
+        generation["relaxed_counterfactual_mode"] = "independent_resample"
+        generation_path.write_text(json.dumps(generation))
+        _rehash(run_dir, "base/generation.json")
     elif mutation == "route":
         records[0]["quadrant"] = "both_wrong"
         _write_jsonl(records_path, records)

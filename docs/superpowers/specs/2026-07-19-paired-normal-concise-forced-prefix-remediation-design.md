@@ -59,6 +59,7 @@ Every non-null `relaxed_concise` response must contain:
 - `continuation_seed`, equal to the row request seed;
 - `continuation_max_tokens`, equal to normal length minus capped length;
 - `continuation_token_ids` and `continuation_length`;
+- `continuation_prompt_token_ids` and `continuation_prompt_length`, whose exact suffix is the capped response;
 - combined `token_ids`, `length`, decoded text, correctness, parseability, finish reason, and cap-hit status.
 
 The combined token IDs must equal:

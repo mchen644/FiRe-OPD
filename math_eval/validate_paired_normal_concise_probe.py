@@ -129,6 +129,40 @@ def _independent_summary(records: Sequence[Mapping], *, label: str, expected_cou
                 raise ValueError(f"{label} relaxed max_tokens does not match normal length")
             if relaxed_length < concise_length or relaxed["token_ids"][:concise_length] != concise["token_ids"]:
                 raise ValueError(f"{label} relaxed response does not preserve capped prefix")
+            if relaxed.get("counterfactual_mode") != "forced_prefix_continuation":
+                raise ValueError(f"{label} relaxed counterfactual mode is invalid")
+            if relaxed.get("forced_prefix_length") != concise_length:
+                raise ValueError(f"{label} relaxed forced prefix length is invalid")
+            if relaxed.get("continuation_seed") != record.get("request_seed"):
+                raise ValueError(f"{label} relaxed continuation seed is invalid")
+            expected_remaining = normal_length - concise_length
+            if relaxed.get("continuation_max_tokens") != expected_remaining:
+                raise ValueError(f"{label} relaxed remaining budget is invalid")
+            continuation_ids = relaxed.get("continuation_token_ids")
+            if not isinstance(continuation_ids, list) or not all(
+                isinstance(token_id, int) and not isinstance(token_id, bool)
+                for token_id in continuation_ids
+            ):
+                raise ValueError(f"{label} relaxed continuation token IDs are invalid")
+            if relaxed.get("continuation_length") != len(continuation_ids):
+                raise ValueError(f"{label} relaxed continuation length is invalid")
+            if len(continuation_ids) > expected_remaining:
+                raise ValueError(f"{label} relaxed continuation exceeds its remaining budget")
+            if relaxed["token_ids"] != concise["token_ids"] + continuation_ids:
+                raise ValueError(f"{label} relaxed combined token IDs are invalid")
+            continuation_prompt_ids = relaxed.get("continuation_prompt_token_ids")
+            if not isinstance(continuation_prompt_ids, list) or not all(
+                isinstance(token_id, int) and not isinstance(token_id, bool)
+                for token_id in continuation_prompt_ids
+            ):
+                raise ValueError(f"{label} relaxed continuation prompt token IDs are invalid")
+            if (
+                len(continuation_prompt_ids) <= concise_length
+                or continuation_prompt_ids[-concise_length:] != concise["token_ids"]
+            ):
+                raise ValueError(f"{label} relaxed continuation prompt capped suffix is invalid")
+            if relaxed.get("continuation_prompt_length") != len(continuation_prompt_ids):
+                raise ValueError(f"{label} relaxed continuation prompt length is invalid")
             expected_class = (
                 "budget_limited_recovered"
                 if relaxed_correct
@@ -225,6 +259,12 @@ def validate_run(*, run_dir: str | Path, expected_count: int) -> dict:
         raise ValueError("manifest sample size does not match expected count")
     if manifest.get("sample_sha256") != _sha256(sample_path):
         raise ValueError("sample SHA256 does not match manifest")
+    protocol = manifest.get("protocol")
+    if (
+        not isinstance(protocol, Mapping)
+        or protocol.get("relaxed_counterfactual_mode") != "forced_prefix_continuation"
+    ):
+        raise ValueError("manifest counterfactual mode is invalid")
 
     sample = _read_jsonl(sample_path)
     if len(sample) != expected_count:
@@ -249,8 +289,21 @@ def validate_run(*, run_dir: str | Path, expected_count: int) -> dict:
     for label in ("base", "adaptive_step50"):
         records_path = root / label / "records.jsonl"
         summary_path = root / label / "summary.json"
-        if not records_path.is_file() or not summary_path.is_file():
-            raise FileNotFoundError(f"missing {label} records or summary")
+        generation_path = root / label / "generation.json"
+        if (
+            not records_path.is_file()
+            or not summary_path.is_file()
+            or not generation_path.is_file()
+        ):
+            raise FileNotFoundError(f"missing {label} records, summary, or generation metadata")
+        generation = json.loads(generation_path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(generation, Mapping)
+            or generation.get("model_label") != label
+            or generation.get("relaxed_counterfactual_mode")
+            != "forced_prefix_continuation"
+        ):
+            raise ValueError(f"{label} generation counterfactual mode is invalid")
         records = _read_jsonl(records_path)
         record_keys = [
             (

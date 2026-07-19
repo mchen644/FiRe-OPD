@@ -1,5 +1,7 @@
 # Paired Normal/Concise Compression-Sensitivity Probe Design
 
+> **Runtime amendment:** The independent same-seed relaxed resampling in Section 6 proved not to preserve token prefixes under dynamically batched TP=4 vLLM. It is superseded by `2026-07-19-paired-normal-concise-forced-prefix-remediation-design.md`, which continues from the exact observed capped token prefix. All other frozen protocol sections remain in force.
+
 ## 1. Goal
 
 Run a small, reproducible, inference-only audit on training-distribution questions to determine why a student can solve a question under the normal prompt but fail under the concise prompt. Compare both:

@@ -16,7 +16,9 @@ from math_eval.paired_normal_concise_probe import (
     concise_cap,
     concise_messages,
     ensure_generation_destinations,
+    forced_prefix_continuation_prompt,
     normal_messages,
+    normalize_forced_prefix_continuation,
     normalize_request_output,
     prepare_sample,
     quadrant,
@@ -128,22 +130,173 @@ def test_validate_relaxed_prefix_accepts_only_exact_token_prefix() -> None:
         validate_relaxed_prefix([], [1])
 
 
+def test_forced_prefix_continuation_prompt_uses_exact_vllm_prompt_and_capped_ids() -> None:
+    request_output = SimpleNamespace(prompt_token_ids=[10, 11])
+    capped_ids = [20, 21]
+
+    continuation_prompt = forced_prefix_continuation_prompt(request_output, capped_ids)
+
+    assert continuation_prompt == {"prompt_token_ids": [10, 11, 20, 21]}
+    assert request_output.prompt_token_ids == [10, 11]
+    assert capped_ids == [20, 21]
+
+
+@pytest.mark.parametrize(
+    ("request_output", "capped_ids", "match"),
+    [
+        (SimpleNamespace(prompt_token_ids=[]), [20], "prompt token IDs"),
+        (SimpleNamespace(prompt_token_ids=[10, True]), [20], "prompt token IDs"),
+        (SimpleNamespace(prompt_token_ids=[10]), [], "capped token IDs"),
+        (SimpleNamespace(prompt_token_ids=[10]), [20, False], "capped token IDs"),
+    ],
+)
+def test_forced_prefix_continuation_prompt_rejects_invalid_ids(
+    request_output: SimpleNamespace, capped_ids: list[int], match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        forced_prefix_continuation_prompt(request_output, capped_ids)
+
+
+class _ContinuationTokenizer:
+    def decode(self, token_ids, *, skip_special_tokens, clean_up_tokenization_spaces):
+        assert token_ids == [20, 21, 30, 31]
+        assert skip_special_tokens is True
+        assert clean_up_tokenization_spaces is False
+        return r"Continued work. \\boxed{2}"
+
+
+def test_normalize_forced_prefix_continuation_combines_and_scores_suffix() -> None:
+    capped = {
+        "text": "Continued work.",
+        "token_ids": [20, 21],
+        "length": 2,
+        "max_tokens": 2,
+    }
+    output = SimpleNamespace(
+        prompt_token_ids=[10, 11, 20, 21],
+        outputs=[
+            SimpleNamespace(
+                text=r" \\boxed{2}",
+                token_ids=[30, 31],
+                finish_reason="stop",
+                stop_reason=151645,
+            )
+        ]
+    )
+
+    response = normalize_forced_prefix_continuation(
+        output,
+        capped_response=capped,
+        tokenizer=_ContinuationTokenizer(),
+        ground_truth="2",
+        total_max_tokens=4,
+        rendered_prompt="concise prompt",
+        continuation_seed=123,
+        continuation_prompt={"prompt_token_ids": [10, 11, 20, 21]},
+    )
+
+    assert response == {
+        "text": r"Continued work. \\boxed{2}",
+        "token_ids": [20, 21, 30, 31],
+        "length": 4,
+        "finish_reason": "stop",
+        "stop_reason": 151645,
+        "boxed_answer": "2",
+        "parseable": True,
+        "correct": True,
+        "max_tokens": 4,
+        "cap_hit": True,
+        "rendered_prompt_sha256": hashlib.sha256(b"concise prompt").hexdigest(),
+        "counterfactual_mode": "forced_prefix_continuation",
+        "forced_prefix_length": 2,
+        "continuation_seed": 123,
+        "continuation_max_tokens": 2,
+        "continuation_token_ids": [30, 31],
+        "continuation_length": 2,
+        "continuation_prompt_token_ids": [10, 11, 20, 21],
+        "continuation_prompt_length": 4,
+    }
+
+
+def test_normalize_forced_prefix_continuation_handles_zero_remaining_budget() -> None:
+    capped = {
+        "text": "unfinished",
+        "token_ids": [20],
+        "length": 1,
+        "finish_reason": "length",
+        "stop_reason": None,
+        "boxed_answer": None,
+        "parseable": False,
+        "correct": False,
+        "max_tokens": 1,
+        "cap_hit": True,
+        "rendered_prompt_sha256": hashlib.sha256(b"concise prompt").hexdigest(),
+    }
+
+    response = normalize_forced_prefix_continuation(
+        None,
+        capped_response=capped,
+        tokenizer=SimpleNamespace(),
+        ground_truth="2",
+        total_max_tokens=1,
+        rendered_prompt="concise prompt",
+        continuation_seed=123,
+        continuation_prompt={"prompt_token_ids": [10, 20]},
+    )
+
+    assert response["token_ids"] == [20]
+    assert response["text"] == "unfinished"
+    assert response["continuation_max_tokens"] == 0
+    assert response["continuation_token_ids"] == []
+    assert response["continuation_length"] == 0
+    assert response["continuation_prompt_token_ids"] == [10, 20]
+    assert response["continuation_prompt_length"] == 2
+    assert response["counterfactual_mode"] == "forced_prefix_continuation"
+    assert response["correct"] is False
+
+
 @pytest.mark.parametrize(
     ("record", "expected"),
     [
         (
             {
+                "request_seed": 17,
                 "quadrant": "compression_sensitive",
                 "concise": {"cap_hit": True, "correct": False, "token_ids": [1, 2]},
-                "relaxed_concise": {"correct": True, "token_ids": [1, 2, 3]},
+                "relaxed_concise": {
+                    "correct": True,
+                    "token_ids": [1, 2, 3],
+                    "max_tokens": 3,
+                    "counterfactual_mode": "forced_prefix_continuation",
+                    "forced_prefix_length": 2,
+                    "continuation_seed": 17,
+                    "continuation_max_tokens": 1,
+                    "continuation_token_ids": [3],
+                    "continuation_length": 1,
+                    "continuation_prompt_token_ids": [10, 1, 2],
+                    "continuation_prompt_length": 3,
+                },
             },
             "budget_limited_recovered",
         ),
         (
             {
+                "request_seed": 18,
                 "quadrant": "compression_sensitive",
                 "concise": {"cap_hit": True, "correct": False, "token_ids": [1, 2]},
-                "relaxed_concise": {"correct": False, "token_ids": [1, 2, 4]},
+                "relaxed_concise": {
+                    "correct": False,
+                    "token_ids": [1, 2, 4],
+                    "max_tokens": 3,
+                    "counterfactual_mode": "forced_prefix_continuation",
+                    "forced_prefix_length": 2,
+                    "continuation_seed": 18,
+                    "continuation_max_tokens": 1,
+                    "continuation_token_ids": [4],
+                    "continuation_length": 1,
+                    "continuation_prompt_token_ids": [10, 1, 2],
+                    "continuation_prompt_length": 3,
+                },
             },
             "budget_limited_unrecovered",
         ),
@@ -179,6 +332,57 @@ def test_classify_compression_sensitive_requires_relaxed_cap_hit_result() -> Non
         classify_compression_sensitive(record)
 
 
+def _forced_prefix_record() -> dict:
+    return {
+        "request_seed": 17,
+        "quadrant": "compression_sensitive",
+        "concise": {
+            "cap_hit": True,
+            "correct": False,
+            "token_ids": [1, 2],
+            "length": 2,
+            "max_tokens": 2,
+        },
+        "relaxed_concise": {
+            "correct": True,
+            "token_ids": [1, 2, 3],
+            "length": 3,
+            "max_tokens": 3,
+            "counterfactual_mode": "forced_prefix_continuation",
+            "forced_prefix_length": 2,
+            "continuation_seed": 17,
+            "continuation_max_tokens": 1,
+            "continuation_token_ids": [3],
+            "continuation_length": 1,
+            "continuation_prompt_token_ids": [10, 1, 2],
+            "continuation_prompt_length": 3,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        ("counterfactual_mode", "independent_resample", "mode"),
+        ("forced_prefix_length", 1, "prefix length"),
+        ("continuation_seed", 18, "seed"),
+        ("continuation_max_tokens", 2, "remaining budget"),
+        ("continuation_token_ids", [4], "combined token IDs"),
+        ("continuation_length", 2, "continuation length"),
+        ("continuation_prompt_token_ids", [10, 1, 9], "prompt capped suffix"),
+        ("continuation_prompt_length", 2, "prompt length"),
+    ],
+)
+def test_classify_compression_sensitive_rejects_invalid_forced_prefix_provenance(
+    field: str, value, match: str
+) -> None:
+    record = _forced_prefix_record()
+    record["relaxed_concise"][field] = value
+
+    with pytest.raises(ValueError, match=match):
+        classify_compression_sensitive(record)
+
+
 def _write_parquet(path: Path, rows: list[dict] | None = None) -> str:
     pq.write_table(pa.Table.from_pylist(_rows() if rows is None else rows), path)
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -210,6 +414,10 @@ def test_prepare_sample_writes_immutable_sample_and_manifest(tmp_path: Path) -> 
     assert manifest["sample_sha256"] == hashlib.sha256(sample_file.read_bytes()).hexdigest()
     assert manifest["protocol"]["normal_max_tokens"] == 16384
     assert manifest["protocol"]["concise_cap_ratio"] == 0.5
+    assert (
+        manifest["protocol"]["relaxed_counterfactual_mode"]
+        == "forced_prefix_continuation"
+    )
 
     with pytest.raises(FileExistsError, match="refusing to overwrite"):
         prepare_sample(
@@ -351,7 +559,17 @@ def _summary_records() -> list[dict]:
             "normal": _response(length=100, correct=True, max_tokens=16384),
             "concise": _response(length=50, correct=False, max_tokens=50),
             "quadrant": "compression_sensitive",
-            "relaxed_concise": _response(length=80, correct=True, max_tokens=100),
+            "relaxed_concise": {
+                **_response(length=80, correct=True, max_tokens=100),
+                "counterfactual_mode": "forced_prefix_continuation",
+                "forced_prefix_length": 50,
+                "continuation_seed": 53,
+                "continuation_max_tokens": 50,
+                "continuation_token_ids": list(range(50, 80)),
+                "continuation_length": 30,
+                "continuation_prompt_token_ids": [999] + list(range(50)),
+                "continuation_prompt_length": 51,
+            },
             "compression_sensitive_class": "budget_limited_recovered",
         },
         {
@@ -421,6 +639,16 @@ def test_summarize_records_rejects_tampered_route_or_count() -> None:
         summarize_records(_summary_records(), expected_count=5)
 
 
+def test_summarize_records_rejects_counterfactual_on_nonsensitive_row() -> None:
+    records = _summary_records()
+    records[0]["relaxed_concise"] = _response(
+        length=30, correct=True, max_tokens=100
+    )
+
+    with pytest.raises(ValueError, match="nonsensitive"):
+        summarize_records(records, expected_count=4)
+
+
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(json.dumps(row) + "\n" for row in rows))
@@ -449,7 +677,11 @@ def _complete_analyzable_run(run_dir: Path) -> None:
         "sample_size": 4,
         "seed": 42,
         "source_commit": "abc123",
-        "protocol": {"normal_max_tokens": 16384, "concise_cap_ratio": 0.5},
+        "protocol": {
+            "normal_max_tokens": 16384,
+            "concise_cap_ratio": 0.5,
+            "relaxed_counterfactual_mode": "forced_prefix_continuation",
+        },
         "artifacts": {},
     }
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -466,6 +698,14 @@ def _complete_analyzable_run(run_dir: Path) -> None:
                 {"role": "user", "content": f"Question {record['sample_ordinal']} concise"}
             ]
         _write_jsonl(run_dir / label / "records.jsonl", records)
+        (run_dir / label / "generation.json").write_text(
+            json.dumps(
+                {
+                    "model_label": label,
+                    "relaxed_counterfactual_mode": "forced_prefix_continuation",
+                }
+            )
+        )
 
 
 def test_analyze_run_writes_model_reports_comparison_and_hash_manifest(tmp_path: Path) -> None:

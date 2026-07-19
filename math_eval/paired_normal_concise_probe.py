@@ -138,7 +138,7 @@ def quadrant(normal_correct: bool, concise_correct: bool) -> str:
 
 
 def validate_relaxed_prefix(capped_ids: Sequence[int], relaxed_ids: Sequence[int]) -> None:
-    """Require a same-seed relaxed response to preserve the capped token prefix."""
+    """Require a relaxed response to preserve the capped token prefix."""
 
     capped = list(capped_ids)
     relaxed = list(relaxed_ids)
@@ -146,6 +146,30 @@ def validate_relaxed_prefix(capped_ids: Sequence[int], relaxed_ids: Sequence[int
         raise ValueError("capped and relaxed token sequences must be nonempty")
     if len(relaxed) < len(capped) or relaxed[: len(capped)] != capped:
         raise ValueError("relaxed concise response does not preserve the capped token prefix")
+
+
+def _validated_token_ids(value, *, name: str, allow_empty: bool = False) -> list[int]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise ValueError(f"{name} must be an integer sequence")
+    token_ids = list(value)
+    if (not allow_empty and not token_ids) or not all(
+        isinstance(token_id, int) and not isinstance(token_id, bool) for token_id in token_ids
+    ):
+        qualifier = "possibly empty " if allow_empty else "nonempty "
+        raise ValueError(f"{name} must be a {qualifier}integer sequence")
+    return token_ids
+
+
+def forced_prefix_continuation_prompt(
+    request_output, capped_ids: Sequence[int]
+) -> dict[str, list[int]]:
+    """Build a vLLM token prompt ending in the exact observed capped response."""
+
+    prompt_ids = _validated_token_ids(
+        getattr(request_output, "prompt_token_ids", None), name="prompt token IDs"
+    )
+    capped = _validated_token_ids(capped_ids, name="capped token IDs")
+    return {"prompt_token_ids": prompt_ids + capped}
 
 
 def sha256_file(path: str | Path) -> str:
@@ -237,6 +261,7 @@ def prepare_sample(
         "protocol": {
             "normal_max_tokens": 16384,
             "concise_cap_ratio": 0.5,
+            "relaxed_counterfactual_mode": "forced_prefix_continuation",
             "temperature": 1.0,
             "top_p": 1.0,
             "enable_thinking": False,
@@ -301,6 +326,110 @@ def normalize_request_output(
     }
 
 
+def normalize_forced_prefix_continuation(
+    request_output,
+    *,
+    capped_response: Mapping,
+    tokenizer,
+    ground_truth: str,
+    total_max_tokens: int,
+    rendered_prompt: str,
+    continuation_seed: int,
+    continuation_prompt: Mapping,
+) -> dict:
+    """Normalize a generated suffix combined with an exact capped-response prefix."""
+
+    if isinstance(total_max_tokens, bool) or not isinstance(total_max_tokens, int) or total_max_tokens <= 0:
+        raise ValueError("total_max_tokens must be a positive integer")
+    if isinstance(continuation_seed, bool) or not isinstance(continuation_seed, int) or continuation_seed < 0:
+        raise ValueError("continuation_seed must be a nonnegative integer")
+    capped_ids = _validated_token_ids(
+        capped_response.get("token_ids"), name="capped token IDs"
+    )
+    capped_length = capped_response.get("length")
+    if (
+        isinstance(capped_length, bool)
+        or not isinstance(capped_length, int)
+        or capped_length != len(capped_ids)
+    ):
+        raise ValueError("capped response length does not match its token IDs")
+    if capped_length > total_max_tokens:
+        raise ValueError("capped response exceeds the relaxed total budget")
+    if not isinstance(continuation_prompt, Mapping):
+        raise ValueError("continuation prompt must be a token-prompt mapping")
+    continuation_prompt_ids = _validated_token_ids(
+        continuation_prompt.get("prompt_token_ids"), name="continuation prompt token IDs"
+    )
+    if (
+        len(continuation_prompt_ids) <= capped_length
+        or continuation_prompt_ids[-capped_length:] != capped_ids
+    ):
+        raise ValueError("continuation prompt does not preserve the exact capped suffix")
+
+    continuation_max_tokens = total_max_tokens - capped_length
+    if continuation_max_tokens == 0:
+        if request_output is not None:
+            raise ValueError("zero remaining budget must not have a continuation output")
+        continuation_ids: list[int] = []
+        combined_text = str(capped_response.get("text", ""))
+        finish_reason = capped_response.get("finish_reason")
+        stop_reason = capped_response.get("stop_reason")
+    else:
+        actual_prompt_ids = _validated_token_ids(
+            getattr(request_output, "prompt_token_ids", None),
+            name="generated continuation prompt token IDs",
+        )
+        if actual_prompt_ids != continuation_prompt_ids:
+            raise ValueError("generated continuation prompt token IDs changed")
+        outputs = getattr(request_output, "outputs", None)
+        if not isinstance(outputs, list) or len(outputs) != 1:
+            raise ValueError("each continuation request must return exactly one generation")
+        output = outputs[0]
+        continuation_ids = _validated_token_ids(
+            getattr(output, "token_ids", None), name="continuation token IDs"
+        )
+        if len(continuation_ids) > continuation_max_tokens:
+            raise ValueError("continuation exceeds its remaining token budget")
+        combined_ids_for_decode = capped_ids + continuation_ids
+        combined_text = str(
+            tokenizer.decode(
+                combined_ids_for_decode,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )
+        )
+        finish_reason = getattr(output, "finish_reason", None)
+        stop_reason = getattr(output, "stop_reason", None)
+
+    combined_ids = capped_ids + continuation_ids
+    if finish_reason is not None:
+        finish_reason = str(finish_reason)
+    if stop_reason is not None and not isinstance(stop_reason, (str, int, float, bool)):
+        stop_reason = str(stop_reason)
+    boxed_answer = _boxed_answer(combined_text)
+    return {
+        "text": combined_text,
+        "token_ids": combined_ids,
+        "length": len(combined_ids),
+        "finish_reason": finish_reason,
+        "stop_reason": stop_reason,
+        "boxed_answer": boxed_answer,
+        "parseable": boxed_answer is not None,
+        "correct": bool(compute_score(combined_text, str(ground_truth)) > 0.5),
+        "max_tokens": total_max_tokens,
+        "cap_hit": len(combined_ids) == total_max_tokens,
+        "rendered_prompt_sha256": hashlib.sha256(rendered_prompt.encode("utf-8")).hexdigest(),
+        "counterfactual_mode": "forced_prefix_continuation",
+        "forced_prefix_length": capped_length,
+        "continuation_seed": continuation_seed,
+        "continuation_max_tokens": continuation_max_tokens,
+        "continuation_token_ids": continuation_ids,
+        "continuation_length": len(continuation_ids),
+        "continuation_prompt_token_ids": continuation_prompt_ids,
+        "continuation_prompt_length": len(continuation_prompt_ids),
+    }
+
+
 def ensure_generation_destinations(*, model_path: str | Path, output_dir: str | Path) -> None:
     model = Path(model_path)
     output = Path(output_dir)
@@ -308,6 +437,56 @@ def ensure_generation_destinations(*, model_path: str | Path, output_dir: str | 
         raise FileNotFoundError(f"model directory does not exist: {model}")
     if output.exists():
         raise FileExistsError(f"output directory already exists: {output}")
+
+
+def _validate_forced_prefix_counterfactual(
+    record: Mapping, *, concise: Mapping, relaxed: Mapping
+) -> None:
+    if relaxed.get("counterfactual_mode") != "forced_prefix_continuation":
+        raise ValueError("relaxed concise counterfactual mode is invalid")
+    capped_ids = _validated_token_ids(concise.get("token_ids"), name="capped token IDs")
+    relaxed_ids = _validated_token_ids(relaxed.get("token_ids"), name="relaxed token IDs")
+    validate_relaxed_prefix(capped_ids, relaxed_ids)
+    if relaxed.get("forced_prefix_length") != len(capped_ids):
+        raise ValueError("relaxed concise forced prefix length is invalid")
+
+    request_seed = record.get("request_seed")
+    if (
+        isinstance(request_seed, bool)
+        or not isinstance(request_seed, int)
+        or relaxed.get("continuation_seed") != request_seed
+    ):
+        raise ValueError("relaxed concise continuation seed is invalid")
+    relaxed_max_tokens = relaxed.get("max_tokens")
+    if isinstance(relaxed_max_tokens, bool) or not isinstance(relaxed_max_tokens, int):
+        raise ValueError("relaxed concise max_tokens must be an integer")
+    expected_remaining = relaxed_max_tokens - len(capped_ids)
+    if expected_remaining < 0 or relaxed.get("continuation_max_tokens") != expected_remaining:
+        raise ValueError("relaxed concise remaining budget is invalid")
+
+    continuation_ids = _validated_token_ids(
+        relaxed.get("continuation_token_ids"),
+        name="continuation token IDs",
+        allow_empty=True,
+    )
+    if relaxed.get("continuation_length") != len(continuation_ids):
+        raise ValueError("relaxed concise continuation length is invalid")
+    if len(continuation_ids) > expected_remaining:
+        raise ValueError("relaxed concise continuation exceeds its remaining budget")
+    if relaxed_ids != capped_ids + continuation_ids:
+        raise ValueError("relaxed concise combined token IDs are invalid")
+
+    continuation_prompt_ids = _validated_token_ids(
+        relaxed.get("continuation_prompt_token_ids"),
+        name="continuation prompt token IDs",
+    )
+    if (
+        len(continuation_prompt_ids) <= len(capped_ids)
+        or continuation_prompt_ids[-len(capped_ids):] != capped_ids
+    ):
+        raise ValueError("relaxed concise continuation prompt capped suffix is invalid")
+    if relaxed.get("continuation_prompt_length") != len(continuation_prompt_ids):
+        raise ValueError("relaxed concise continuation prompt length is invalid")
 
 
 def classify_compression_sensitive(record: Mapping) -> str | None:
@@ -328,7 +507,7 @@ def classify_compression_sensitive(record: Mapping) -> str | None:
     relaxed = record.get("relaxed_concise")
     if not isinstance(relaxed, Mapping):
         raise ValueError("cap-hit compression-sensitive records require a relaxed result")
-    validate_relaxed_prefix(concise.get("token_ids", []), relaxed.get("token_ids", []))
+    _validate_forced_prefix_counterfactual(record, concise=concise, relaxed=relaxed)
     if not isinstance(relaxed.get("correct"), bool):
         raise ValueError("relaxed concise correctness must be boolean")
     if relaxed["correct"]:
@@ -406,10 +585,12 @@ def summarize_records(records: Sequence[Mapping], *, expected_count: int) -> dic
         expected_route = quadrant(normal["correct"], concise["correct"])
         if record.get("quadrant") != expected_route:
             raise ValueError("persisted quadrant does not match response correctness")
+        relaxed = record.get("relaxed_concise")
+        if expected_route != "compression_sensitive" and relaxed is not None:
+            raise ValueError("nonsensitive rows must not have a relaxed counterfactual")
         expected_class = classify_compression_sensitive(record)
         if record.get("compression_sensitive_class") != expected_class:
             raise ValueError("persisted compression-sensitive class does not recompute")
-        relaxed = record.get("relaxed_concise")
         if relaxed is not None:
             if not isinstance(relaxed, Mapping):
                 raise ValueError("relaxed concise response must be an object or null")
@@ -829,22 +1010,46 @@ def generate_model_records(
         if record["quadrant"] == "compression_sensitive" and record["concise"]["cap_hit"]
     ]
     if relaxed_indices:
-        relaxed_outputs = _generate_batch(
-            llm,
-            prompts=[rendered_concise[index] for index in relaxed_indices],
-            seeds=[seeds[index] for index in relaxed_indices],
-            caps=[normal_responses[index]["length"] for index in relaxed_indices],
-        )
-        if len(relaxed_outputs) != len(relaxed_indices):
-            raise ValueError("relaxed concise generation output count mismatch")
-        for index, output in zip(relaxed_indices, relaxed_outputs, strict=True):
-            relaxed = normalize_request_output(
-                output,
-                ground_truth=str(sample[index]["ground_truth"]),
-                max_tokens=normal_responses[index]["length"],
-                rendered_prompt=rendered_concise[index],
+        generated_indices: list[int] = []
+        continuation_prompts: list[dict[str, list[int]]] = []
+        continuation_prompt_by_index: dict[int, dict[str, list[int]]] = {}
+        continuation_seeds: list[int] = []
+        continuation_caps: list[int] = []
+        for index in relaxed_indices:
+            remaining = normal_responses[index]["length"] - concise_responses[index]["length"]
+            if remaining < 0:
+                raise ValueError("concise response exceeds the relaxed total budget")
+            continuation_prompt = forced_prefix_continuation_prompt(
+                concise_outputs[index], concise_responses[index]["token_ids"]
             )
-            validate_relaxed_prefix(records[index]["concise"]["token_ids"], relaxed["token_ids"])
+            continuation_prompt_by_index[index] = continuation_prompt
+            if remaining == 0:
+                continue
+            generated_indices.append(index)
+            continuation_prompts.append(continuation_prompt)
+            continuation_seeds.append(seeds[index])
+            continuation_caps.append(remaining)
+
+        continuation_outputs = _generate_batch(
+            llm,
+            prompts=continuation_prompts,
+            seeds=continuation_seeds,
+            caps=continuation_caps,
+        )
+        if len(continuation_outputs) != len(generated_indices):
+            raise ValueError("forced-prefix continuation output count mismatch")
+        output_by_index = dict(zip(generated_indices, continuation_outputs, strict=True))
+        for index in relaxed_indices:
+            relaxed = normalize_forced_prefix_continuation(
+                output_by_index.get(index),
+                capped_response=concise_responses[index],
+                tokenizer=tokenizer,
+                ground_truth=str(sample[index]["ground_truth"]),
+                total_max_tokens=normal_responses[index]["length"],
+                rendered_prompt=rendered_concise[index],
+                continuation_seed=seeds[index],
+                continuation_prompt=continuation_prompt_by_index[index],
+            )
             records[index]["relaxed_concise"] = relaxed
 
     for record in records:
@@ -863,6 +1068,7 @@ def generate_model_records(
             "max_model_len": max_model_len,
             "max_num_seqs": max_num_seqs,
             "gpu_memory_utilization": gpu_memory_utilization,
+            "relaxed_counterfactual_mode": "forced_prefix_continuation",
         },
     )
     return records_path
