@@ -48,6 +48,7 @@ def test_launcher_dry_run_pins_two_model_sequential_probe_contract(tmp_path: Pat
         "paired_normal_concise_probe.py analyze",
         "validate_paired_normal_concise_probe.py",
         "CUDA_VISIBLE_DEVICES=0,1,2,3",
+        "VLLM_WORKER_MULTIPROC_METHOD=spawn",
         "PAIRED_NORMAL_CONCISE_PROBE_DONE_test-dry-run:0",
     ]
     for token in required:

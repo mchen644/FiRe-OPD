@@ -69,7 +69,7 @@ PREPARE_COMMAND=(
   --expected-dataset-sha256 "$DATASET_SHA256"
 )
 BASE_COMMAND=(
-  env "PYTHONPATH=${WORKTREE}/verl:${WORKTREE}"
+  env "PYTHONPATH=${WORKTREE}/verl:${WORKTREE}" VLLM_WORKER_MULTIPROC_METHOD=spawn
   "$GPU_PYTHON" "${WORKTREE}/math_eval/paired_normal_concise_probe.py" generate
   --sample-file "$SAMPLE_FILE"
   --model-path "$BASE_MODEL"
@@ -82,7 +82,7 @@ BASE_COMMAND=(
   --gpu-memory-utilization 0.90
 )
 ADAPTIVE_COMMAND=(
-  env "PYTHONPATH=${WORKTREE}/verl:${WORKTREE}"
+  env "PYTHONPATH=${WORKTREE}/verl:${WORKTREE}" VLLM_WORKER_MULTIPROC_METHOD=spawn
   "$GPU_PYTHON" "${WORKTREE}/math_eval/paired_normal_concise_probe.py" generate
   --sample-file "$SAMPLE_FILE"
   --model-path "$ADAPTIVE_MODEL"
