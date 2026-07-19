@@ -1,15 +1,25 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
+from pathlib import Path
+from types import SimpleNamespace
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from math_eval.paired_normal_concise_probe import (
     classify_compression_sensitive,
     concise_cap,
     concise_messages,
+    ensure_generation_destinations,
     normal_messages,
+    normalize_request_output,
+    prepare_sample,
     quadrant,
+    read_jsonl,
     select_probe_rows,
     validate_relaxed_prefix,
 )
@@ -165,3 +175,134 @@ def test_classify_compression_sensitive_requires_relaxed_cap_hit_result() -> Non
     }
     with pytest.raises(ValueError, match="relaxed"):
         classify_compression_sensitive(record)
+
+
+def _write_parquet(path: Path, rows: list[dict] | None = None) -> str:
+    pq.write_table(pa.Table.from_pylist(_rows() if rows is None else rows), path)
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_prepare_sample_writes_immutable_sample_and_manifest(tmp_path: Path) -> None:
+    dataset = tmp_path / "train.parquet"
+    dataset_sha = _write_parquet(dataset)
+    sample_file = tmp_path / "sample.jsonl"
+    manifest_file = tmp_path / "manifest.json"
+
+    manifest = prepare_sample(
+        dataset_path=dataset,
+        sample_file=sample_file,
+        manifest_file=manifest_file,
+        sample_size=4,
+        seed=42,
+        source_commit="abc123",
+        expected_dataset_sha256=dataset_sha,
+    )
+
+    sample = read_jsonl(sample_file)
+    persisted_manifest = json.loads(manifest_file.read_text())
+    assert len(sample) == 4
+    assert manifest == persisted_manifest
+    assert manifest["dataset_sha256"] == dataset_sha
+    assert manifest["source_commit"] == "abc123"
+    assert manifest["sample_size"] == 4
+    assert manifest["sample_sha256"] == hashlib.sha256(sample_file.read_bytes()).hexdigest()
+    assert manifest["protocol"]["normal_max_tokens"] == 16384
+    assert manifest["protocol"]["concise_cap_ratio"] == 0.5
+
+    with pytest.raises(FileExistsError, match="refusing to overwrite"):
+        prepare_sample(
+            dataset_path=dataset,
+            sample_file=sample_file,
+            manifest_file=manifest_file,
+            sample_size=4,
+            seed=42,
+            source_commit="abc123",
+            expected_dataset_sha256=dataset_sha,
+        )
+
+
+def test_prepare_sample_rejects_wrong_dataset_hash_without_outputs(tmp_path: Path) -> None:
+    dataset = tmp_path / "train.parquet"
+    _write_parquet(dataset)
+    sample_file = tmp_path / "sample.jsonl"
+    manifest_file = tmp_path / "manifest.json"
+
+    with pytest.raises(ValueError, match="dataset SHA256"):
+        prepare_sample(
+            dataset_path=dataset,
+            sample_file=sample_file,
+            manifest_file=manifest_file,
+            sample_size=4,
+            seed=42,
+            source_commit="abc123",
+            expected_dataset_sha256="0" * 64,
+        )
+    assert not sample_file.exists()
+    assert not manifest_file.exists()
+
+
+def test_normalize_request_output_uses_generated_ids_and_training_math_reward() -> None:
+    request_output = SimpleNamespace(
+        outputs=[
+            SimpleNamespace(
+                text=r"Reasoning. Therefore \\boxed{2}",
+                token_ids=[11, 12, 13],
+                finish_reason="stop",
+                stop_reason=151645,
+            )
+        ]
+    )
+
+    response = normalize_request_output(
+        request_output,
+        ground_truth="2",
+        max_tokens=7,
+        rendered_prompt="rendered prompt",
+    )
+
+    assert response == {
+        "text": r"Reasoning. Therefore \\boxed{2}",
+        "token_ids": [11, 12, 13],
+        "length": 3,
+        "finish_reason": "stop",
+        "stop_reason": 151645,
+        "boxed_answer": "2",
+        "parseable": True,
+        "correct": True,
+        "max_tokens": 7,
+        "cap_hit": False,
+        "rendered_prompt_sha256": hashlib.sha256(b"rendered prompt").hexdigest(),
+    }
+
+
+def test_normalize_request_output_rejects_multiple_or_over_cap_outputs() -> None:
+    completion = SimpleNamespace(
+        text=r"\\boxed{1}", token_ids=[1, 2], finish_reason="length", stop_reason=None
+    )
+    with pytest.raises(ValueError, match="exactly one"):
+        normalize_request_output(
+            SimpleNamespace(outputs=[completion, completion]),
+            ground_truth="1",
+            max_tokens=2,
+            rendered_prompt="x",
+        )
+    with pytest.raises(ValueError, match="exceeds"):
+        normalize_request_output(
+            SimpleNamespace(outputs=[completion]),
+            ground_truth="1",
+            max_tokens=1,
+            rendered_prompt="x",
+        )
+
+
+def test_generation_destinations_fail_closed(tmp_path: Path) -> None:
+    model = tmp_path / "model"
+    model.mkdir()
+    output = tmp_path / "output"
+    ensure_generation_destinations(model_path=model, output_dir=output)
+
+    output.mkdir()
+    with pytest.raises(FileExistsError, match="output directory"):
+        ensure_generation_destinations(model_path=model, output_dir=output)
+    with pytest.raises(FileNotFoundError, match="model directory"):
+        ensure_generation_destinations(model_path=tmp_path / "missing", output_dir=tmp_path / "fresh")
