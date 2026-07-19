@@ -7,6 +7,8 @@ import copy
 import hashlib
 import json
 import os
+import statistics
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -334,6 +336,349 @@ def classify_compression_sensitive(record: Mapping) -> str | None:
     return "budget_limited_unrecovered"
 
 
+def _validate_response_payload(response: Mapping, *, name: str) -> None:
+    token_ids = response.get("token_ids")
+    length = response.get("length")
+    max_tokens = response.get("max_tokens")
+    if not isinstance(token_ids, list) or not token_ids or not all(
+        isinstance(token_id, int) and not isinstance(token_id, bool) for token_id in token_ids
+    ):
+        raise ValueError(f"{name} token_ids must be a nonempty integer list")
+    if isinstance(length, bool) or not isinstance(length, int) or length != len(token_ids):
+        raise ValueError(f"{name} length does not match token_ids")
+    if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens <= 0:
+        raise ValueError(f"{name} max_tokens must be a positive integer")
+    if length > max_tokens:
+        raise ValueError(f"{name} length exceeds max_tokens")
+    if response.get("cap_hit") is not (length == max_tokens):
+        raise ValueError(f"{name} cap_hit does not match its length")
+    if not isinstance(response.get("correct"), bool):
+        raise ValueError(f"{name} correctness must be boolean")
+    if not isinstance(response.get("parseable"), bool):
+        raise ValueError(f"{name} parseable must be boolean")
+    if response.get("parseable") is not (response.get("boxed_answer") is not None):
+        raise ValueError(f"{name} parseable flag does not match boxed_answer")
+
+
+def summarize_records(records: Sequence[Mapping], *, expected_count: int) -> dict:
+    """Validate and summarize one model's complete paired probe records."""
+
+    if len(records) != expected_count:
+        raise ValueError(f"records must contain exactly {expected_count} rows")
+    if expected_count <= 0:
+        raise ValueError("expected_count must be positive")
+    ordinals = [record.get("sample_ordinal") for record in records]
+    if ordinals != list(range(expected_count)):
+        raise ValueError("record sample ordinals are incomplete or out of order")
+    question_ids = [record.get("question_id") for record in records]
+    if len(set(question_ids)) != expected_count:
+        raise ValueError("record question identities must be distinct")
+    model_labels = {record.get("model_label") for record in records}
+    if len(model_labels) != 1 or not isinstance(next(iter(model_labels)), str):
+        raise ValueError("records must share one nonempty model label")
+    model_label = next(iter(model_labels))
+    if not model_label:
+        raise ValueError("records must share one nonempty model label")
+
+    route_counts: Counter[str] = Counter()
+    class_counts: Counter[str] = Counter()
+    cap_hits_by_quadrant: Counter[str] = Counter()
+    normal_lengths: list[int] = []
+    concise_lengths: list[int] = []
+    ratios: list[float] = []
+    normal_correct = 0
+    concise_correct = 0
+    normal_parse_failures = 0
+    concise_parse_failures = 0
+
+    for record in records:
+        normal = record.get("normal")
+        concise = record.get("concise")
+        if not isinstance(normal, Mapping) or not isinstance(concise, Mapping):
+            raise ValueError("each record requires normal and concise response objects")
+        _validate_response_payload(normal, name="normal")
+        _validate_response_payload(concise, name="concise")
+        if normal["max_tokens"] != 16384:
+            raise ValueError("normal max_tokens must equal 16384")
+        expected_cap = concise_cap(normal["length"])
+        if concise["max_tokens"] != expected_cap:
+            raise ValueError("concise max_tokens does not match the normal-length cap")
+        expected_route = quadrant(normal["correct"], concise["correct"])
+        if record.get("quadrant") != expected_route:
+            raise ValueError("persisted quadrant does not match response correctness")
+        expected_class = classify_compression_sensitive(record)
+        if record.get("compression_sensitive_class") != expected_class:
+            raise ValueError("persisted compression-sensitive class does not recompute")
+        relaxed = record.get("relaxed_concise")
+        if relaxed is not None:
+            if not isinstance(relaxed, Mapping):
+                raise ValueError("relaxed concise response must be an object or null")
+            _validate_response_payload(relaxed, name="relaxed concise")
+            if relaxed["max_tokens"] != normal["length"]:
+                raise ValueError("relaxed concise max_tokens must equal normal length")
+
+        route_counts[expected_route] += 1
+        if expected_class is not None:
+            class_counts[expected_class] += 1
+        if concise["cap_hit"]:
+            cap_hits_by_quadrant[expected_route] += 1
+        normal_lengths.append(normal["length"])
+        concise_lengths.append(concise["length"])
+        ratios.append(concise["length"] / normal["length"])
+        normal_correct += int(normal["correct"])
+        concise_correct += int(concise["correct"])
+        normal_parse_failures += int(not normal["parseable"])
+        concise_parse_failures += int(not concise["parseable"])
+
+    route_names = [
+        "compression_safe",
+        "compression_sensitive",
+        "concise_rescued",
+        "both_wrong",
+    ]
+    class_names = [
+        "budget_limited_recovered",
+        "budget_limited_unrecovered",
+        "prompt_or_sampling_failure",
+    ]
+    summary = {
+        "model_label": model_label,
+        "record_count": expected_count,
+        "quadrant_counts": {name: route_counts[name] for name in route_names},
+        "quadrant_ratios": {name: route_counts[name] / expected_count for name in route_names},
+        "normal_accuracy": normal_correct / expected_count,
+        "concise_accuracy": concise_correct / expected_count,
+        "concise_minus_normal_accuracy": (concise_correct - normal_correct) / expected_count,
+        "normal_length_mean": statistics.fmean(normal_lengths),
+        "normal_length_median": statistics.median(normal_lengths),
+        "concise_length_mean": statistics.fmean(concise_lengths),
+        "concise_length_median": statistics.median(concise_lengths),
+        "concise_to_normal_ratio_mean": statistics.fmean(ratios),
+        "concise_to_normal_ratio_median": statistics.median(ratios),
+        "concise_cap_hit_count": sum(cap_hits_by_quadrant.values()),
+        "concise_cap_hit_ratio": sum(cap_hits_by_quadrant.values()) / expected_count,
+        "concise_cap_hits_by_quadrant": {
+            name: cap_hits_by_quadrant[name] for name in route_names
+        },
+        "normal_parse_failure_count": normal_parse_failures,
+        "concise_parse_failure_count": concise_parse_failures,
+        "compression_sensitive_class_counts": {
+            name: class_counts[name] for name in class_names
+        },
+    }
+    for key, value in summary.items():
+        if isinstance(value, float) and not np.isfinite(value):
+            raise ValueError(f"summary metric {key} is non-finite")
+    return summary
+
+
+def _response_excerpt(text: str, *, head: int = 1200, tail: int = 600) -> str:
+    normalized = str(text).strip()
+    if len(normalized) <= head + tail:
+        return normalized
+    return normalized[:head] + "\n...[excerpt truncated]...\n" + normalized[-tail:]
+
+
+def _compression_sensitive_markdown(*, model_label: str, records: Sequence[Mapping]) -> str:
+    cases = [record for record in records if record.get("quadrant") == "compression_sensitive"]
+    lines = [
+        f"# Compression-sensitive cases: {model_label}",
+        "",
+        f"Total cases: {len(cases)}",
+        "",
+    ]
+    for case_number, record in enumerate(cases, start=1):
+        normal = record["normal"]
+        concise = record["concise"]
+        relaxed = record.get("relaxed_concise")
+        lines.extend(
+            [
+                f"## Case {case_number}: question_id={record['question_id']}",
+                "",
+                f"- source_row_index: {record['source_row_index']}",
+                f"- request_seed: {record['request_seed']}",
+                f"- failure_class: {record['compression_sensitive_class']}",
+                f"- normal: length={normal['length']}, finish={normal['finish_reason']}, "
+                f"boxed={normal['boxed_answer']!r}, correct={normal['correct']}",
+                f"- concise: length={concise['length']}/{concise['max_tokens']}, "
+                f"finish={concise['finish_reason']}, cap_hit={concise['cap_hit']}, "
+                f"boxed={concise['boxed_answer']!r}, correct={concise['correct']}",
+            ]
+        )
+        if relaxed is not None:
+            lines.append(
+                f"- relaxed concise: length={relaxed['length']}/{relaxed['max_tokens']}, "
+                f"finish={relaxed['finish_reason']}, boxed={relaxed['boxed_answer']!r}, "
+                f"correct={relaxed['correct']}"
+            )
+        lines.extend(
+            [
+                "",
+                "### Normal excerpt",
+                "",
+                "```text",
+                _response_excerpt(normal["text"]),
+                "```",
+                "",
+                "### Capped concise excerpt",
+                "",
+                "```text",
+                _response_excerpt(concise["text"]),
+                "```",
+                "",
+            ]
+        )
+        if relaxed is not None:
+            lines.extend(
+                [
+                    "### Relaxed concise excerpt",
+                    "",
+                    "```text",
+                    _response_excerpt(relaxed["text"]),
+                    "```",
+                    "",
+                ]
+            )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _comparison_markdown(comparison: Mapping) -> str:
+    base = comparison["models"]["base"]
+    adaptive = comparison["models"]["adaptive_step50"]
+    lines = [
+        "# Paired normal/concise probe comparison",
+        "",
+        "| Model | Normal accuracy | Concise accuracy | Safe | Sensitive | Rescued | Both wrong | Normal mean length | Concise mean length |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for label, summary in (("base", base), ("adaptive_step50", adaptive)):
+        counts = summary["quadrant_counts"]
+        lines.append(
+            f"| {label} | {summary['normal_accuracy']:.4f} | {summary['concise_accuracy']:.4f} "
+            f"| {counts['compression_safe']} | {counts['compression_sensitive']} "
+            f"| {counts['concise_rescued']} | {counts['both_wrong']} "
+            f"| {summary['normal_length_mean']:.2f} | {summary['concise_length_mean']:.2f} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Adaptive minus base quadrant-count deltas",
+            "",
+        ]
+    )
+    for name, value in comparison["quadrant_count_delta_adaptive_minus_base"].items():
+        lines.append(f"- {name}: {value:+d}")
+    return "\n".join(lines) + "\n"
+
+
+def analyze_run(*, run_dir: str | Path, expected_count: int) -> dict:
+    """Write immutable per-model summaries and a cross-model comparison."""
+
+    root = Path(run_dir)
+    manifest_path = root / "manifest.json"
+    sample_path = root / "sample.jsonl"
+    if not manifest_path.is_file() or not sample_path.is_file():
+        raise FileNotFoundError("run directory is missing manifest.json or sample.jsonl")
+    outputs = [
+        root / "base" / "summary.json",
+        root / "base" / "compression_sensitive_cases.md",
+        root / "adaptive_step50" / "summary.json",
+        root / "adaptive_step50" / "compression_sensitive_cases.md",
+        root / "comparison.json",
+        root / "comparison.md",
+    ]
+    existing = [str(path) for path in outputs if path.exists()]
+    if existing:
+        raise FileExistsError(f"refusing to overwrite existing analysis output: {existing[0]}")
+
+    model_records: dict[str, list[dict]] = {}
+    summaries: dict[str, dict] = {}
+    for label in ("base", "adaptive_step50"):
+        records_path = root / label / "records.jsonl"
+        if not records_path.is_file():
+            raise FileNotFoundError(f"missing model records: {records_path}")
+        records = read_jsonl(records_path)
+        summary = summarize_records(records, expected_count=expected_count)
+        if summary["model_label"] != label:
+            raise ValueError(f"model records under {label} have label {summary['model_label']!r}")
+        model_records[label] = records
+        summaries[label] = summary
+
+    sample = read_jsonl(sample_path)
+    if len(sample) != expected_count:
+        raise ValueError(f"sample must contain exactly {expected_count} rows")
+    expected_keys = [
+        (row.get("sample_ordinal"), row.get("source_row_index"), row.get("question_id"), row.get("request_seed"))
+        for row in sample
+    ]
+    for label, records in model_records.items():
+        actual_keys = [
+            (record.get("sample_ordinal"), record.get("source_row_index"), record.get("question_id"), record.get("request_seed"))
+            for record in records
+        ]
+        if actual_keys != expected_keys:
+            raise ValueError(f"{label} record identities do not match the persisted sample")
+
+    route_names = [
+        "compression_safe",
+        "compression_sensitive",
+        "concise_rescued",
+        "both_wrong",
+    ]
+    comparison = {
+        "record_count_per_model": expected_count,
+        "models": summaries,
+        "quadrant_count_delta_adaptive_minus_base": {
+            name: summaries["adaptive_step50"]["quadrant_counts"][name]
+            - summaries["base"]["quadrant_counts"][name]
+            for name in route_names
+        },
+        "metric_delta_adaptive_minus_base": {
+            name: summaries["adaptive_step50"][name] - summaries["base"][name]
+            for name in (
+                "normal_accuracy",
+                "concise_accuracy",
+                "concise_minus_normal_accuracy",
+                "normal_length_mean",
+                "concise_length_mean",
+                "concise_to_normal_ratio_mean",
+                "concise_cap_hit_ratio",
+            )
+        },
+    }
+
+    for label in ("base", "adaptive_step50"):
+        _atomic_write_json(root / label / "summary.json", summaries[label])
+        _atomic_write_text(
+            root / label / "compression_sensitive_cases.md",
+            _compression_sensitive_markdown(model_label=label, records=model_records[label]),
+        )
+    _atomic_write_json(root / "comparison.json", comparison)
+    _atomic_write_text(root / "comparison.md", _comparison_markdown(comparison))
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise ValueError("manifest.json must contain an object")
+    artifact_paths = [sample_path]
+    for label in ("base", "adaptive_step50"):
+        artifact_paths.extend(
+            [
+                root / label / "records.jsonl",
+                root / label / "summary.json",
+                root / label / "compression_sensitive_cases.md",
+            ]
+        )
+        generation_path = root / label / "generation.json"
+        if generation_path.is_file():
+            artifact_paths.append(generation_path)
+    artifact_paths.extend([root / "comparison.json", root / "comparison.md"])
+    manifest["artifacts"] = {
+        str(path.relative_to(root)): sha256_file(path) for path in artifact_paths
+    }
+    _atomic_write_json(manifest_path, manifest)
+    return comparison
+
+
 def _render_messages(tokenizer, messages: list[dict[str, str]]) -> str:
     return tokenizer.apply_chat_template(
         messages,
@@ -546,6 +891,10 @@ def _build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--max-model-len", type=int, default=40960)
     generate.add_argument("--max-num-seqs", type=int, default=128)
     generate.add_argument("--gpu-memory-utilization", type=float, default=0.90)
+
+    analyze = subparsers.add_parser("analyze")
+    analyze.add_argument("--run-dir", required=True)
+    analyze.add_argument("--expected-count", type=int, default=128)
     return parser
 
 
@@ -576,6 +925,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             gpu_memory_utilization=args.gpu_memory_utilization,
         )
         print(f"records_file={records_path}")
+        return
+    if args.command == "analyze":
+        comparison = analyze_run(run_dir=args.run_dir, expected_count=args.expected_count)
+        print(json.dumps(comparison, indent=2, sort_keys=True))
         return
     raise AssertionError(f"unhandled command: {args.command}")
 

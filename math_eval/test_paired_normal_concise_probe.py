@@ -11,6 +11,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from math_eval.paired_normal_concise_probe import (
+    analyze_run,
     classify_compression_sensitive,
     concise_cap,
     concise_messages,
@@ -21,6 +22,7 @@ from math_eval.paired_normal_concise_probe import (
     quadrant,
     read_jsonl,
     select_probe_rows,
+    summarize_records,
     validate_relaxed_prefix,
 )
 
@@ -306,3 +308,205 @@ def test_generation_destinations_fail_closed(tmp_path: Path) -> None:
         ensure_generation_destinations(model_path=model, output_dir=output)
     with pytest.raises(FileNotFoundError, match="model directory"):
         ensure_generation_destinations(model_path=tmp_path / "missing", output_dir=tmp_path / "fresh")
+
+
+def _response(
+    *, length: int, correct: bool, max_tokens: int, parseable: bool = True
+) -> dict:
+    return {
+        "text": r"Work. \\boxed{1}" if parseable else "unfinished work",
+        "token_ids": list(range(length)),
+        "length": length,
+        "finish_reason": "length" if length == max_tokens else "stop",
+        "stop_reason": None,
+        "boxed_answer": "1" if parseable else None,
+        "parseable": parseable,
+        "correct": correct,
+        "max_tokens": max_tokens,
+        "cap_hit": length == max_tokens,
+        "rendered_prompt_sha256": "a" * 64,
+    }
+
+
+def _summary_records() -> list[dict]:
+    records = [
+        {
+            "sample_ordinal": 0,
+            "source_row_index": 10,
+            "question_id": 110,
+            "request_seed": 52,
+            "model_label": "test",
+            "normal": _response(length=100, correct=True, max_tokens=16384),
+            "concise": _response(length=20, correct=True, max_tokens=50),
+            "quadrant": "compression_safe",
+            "relaxed_concise": None,
+            "compression_sensitive_class": None,
+        },
+        {
+            "sample_ordinal": 1,
+            "source_row_index": 11,
+            "question_id": 111,
+            "request_seed": 53,
+            "model_label": "test",
+            "normal": _response(length=100, correct=True, max_tokens=16384),
+            "concise": _response(length=50, correct=False, max_tokens=50),
+            "quadrant": "compression_sensitive",
+            "relaxed_concise": _response(length=80, correct=True, max_tokens=100),
+            "compression_sensitive_class": "budget_limited_recovered",
+        },
+        {
+            "sample_ordinal": 2,
+            "source_row_index": 12,
+            "question_id": 112,
+            "request_seed": 54,
+            "model_label": "test",
+            "normal": _response(length=120, correct=False, max_tokens=16384),
+            "concise": _response(length=30, correct=True, max_tokens=60),
+            "quadrant": "concise_rescued",
+            "relaxed_concise": None,
+            "compression_sensitive_class": None,
+        },
+        {
+            "sample_ordinal": 3,
+            "source_row_index": 13,
+            "question_id": 113,
+            "request_seed": 55,
+            "model_label": "test",
+            "normal": _response(length=80, correct=False, max_tokens=16384),
+            "concise": _response(
+                length=40, correct=False, max_tokens=40, parseable=False
+            ),
+            "quadrant": "both_wrong",
+            "relaxed_concise": None,
+            "compression_sensitive_class": None,
+        },
+    ]
+    return records
+
+
+def test_summarize_records_recomputes_quadrants_lengths_and_failure_classes() -> None:
+    summary = summarize_records(_summary_records(), expected_count=4)
+
+    assert summary["model_label"] == "test"
+    assert summary["record_count"] == 4
+    assert summary["quadrant_counts"] == {
+        "compression_safe": 1,
+        "compression_sensitive": 1,
+        "concise_rescued": 1,
+        "both_wrong": 1,
+    }
+    assert summary["normal_accuracy"] == pytest.approx(0.5)
+    assert summary["concise_accuracy"] == pytest.approx(0.5)
+    assert summary["concise_minus_normal_accuracy"] == pytest.approx(0.0)
+    assert summary["normal_length_mean"] == pytest.approx(100.0)
+    assert summary["normal_length_median"] == pytest.approx(100.0)
+    assert summary["concise_length_mean"] == pytest.approx(35.0)
+    assert summary["concise_length_median"] == pytest.approx(35.0)
+    assert summary["concise_to_normal_ratio_mean"] == pytest.approx(0.3625)
+    assert summary["concise_cap_hit_count"] == 2
+    assert summary["concise_parse_failure_count"] == 1
+    assert summary["compression_sensitive_class_counts"] == {
+        "budget_limited_recovered": 1,
+        "budget_limited_unrecovered": 0,
+        "prompt_or_sampling_failure": 0,
+    }
+
+
+def test_summarize_records_rejects_tampered_route_or_count() -> None:
+    records = _summary_records()
+    records[0]["quadrant"] = "both_wrong"
+    with pytest.raises(ValueError, match="quadrant"):
+        summarize_records(records, expected_count=4)
+    with pytest.raises(ValueError, match="exactly 5"):
+        summarize_records(_summary_records(), expected_count=5)
+
+
+def _write_jsonl(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+
+def _complete_analyzable_run(run_dir: Path) -> None:
+    sample = []
+    for ordinal, record in enumerate(_summary_records()):
+        sample.append(
+            {
+                "sample_ordinal": ordinal,
+                "source_row_index": record["source_row_index"],
+                "question_id": record["question_id"],
+                "request_seed": record["request_seed"],
+                "prompt": [{"role": "user", "content": f"Question {ordinal}"}],
+                "ground_truth": "1",
+            }
+        )
+    _write_jsonl(run_dir / "sample.jsonl", sample)
+    manifest = {
+        "artifact_type": "paired_normal_concise_compression_sensitivity_probe",
+        "dataset_path": "/dataset.parquet",
+        "dataset_sha256": "d" * 64,
+        "sample_file": str((run_dir / "sample.jsonl").resolve()),
+        "sample_sha256": hashlib.sha256((run_dir / "sample.jsonl").read_bytes()).hexdigest(),
+        "sample_size": 4,
+        "seed": 42,
+        "source_commit": "abc123",
+        "protocol": {"normal_max_tokens": 16384, "concise_cap_ratio": 0.5},
+        "artifacts": {},
+    }
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "manifest.json").write_text(json.dumps(manifest))
+    for label in ("base", "adaptive_step50"):
+        records = copy.deepcopy(_summary_records())
+        for record, sample_row in zip(records, sample, strict=True):
+            record["model_label"] = label
+            record["model_path"] = f"/{label}"
+            record["prompt"] = sample_row["prompt"]
+            record["ground_truth"] = sample_row["ground_truth"]
+            record["normal_prompt"] = sample_row["prompt"]
+            record["concise_prompt"] = [
+                {"role": "user", "content": f"Question {record['sample_ordinal']} concise"}
+            ]
+        _write_jsonl(run_dir / label / "records.jsonl", records)
+
+
+def test_analyze_run_writes_model_reports_comparison_and_hash_manifest(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    _complete_analyzable_run(run_dir)
+
+    comparison = analyze_run(run_dir=run_dir, expected_count=4)
+
+    assert comparison["record_count_per_model"] == 4
+    assert comparison["quadrant_count_delta_adaptive_minus_base"] == {
+        "compression_safe": 0,
+        "compression_sensitive": 0,
+        "concise_rescued": 0,
+        "both_wrong": 0,
+    }
+    for relative in (
+        "base/summary.json",
+        "base/compression_sensitive_cases.md",
+        "adaptive_step50/summary.json",
+        "adaptive_step50/compression_sensitive_cases.md",
+        "comparison.json",
+        "comparison.md",
+    ):
+        assert (run_dir / relative).is_file()
+    case_text = (run_dir / "base/compression_sensitive_cases.md").read_text()
+    assert "budget_limited_recovered" in case_text
+    assert "source_row_index: 11" in case_text
+
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    assert manifest["artifacts"]["base/records.jsonl"] == hashlib.sha256(
+        (run_dir / "base/records.jsonl").read_bytes()
+    ).hexdigest()
+    assert manifest["artifacts"]["comparison.json"] == hashlib.sha256(
+        (run_dir / "comparison.json").read_bytes()
+    ).hexdigest()
+
+
+def test_analyze_run_refuses_to_overwrite_reports(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    _complete_analyzable_run(run_dir)
+    analyze_run(run_dir=run_dir, expected_count=4)
+
+    with pytest.raises(FileExistsError, match="analysis output"):
+        analyze_run(run_dir=run_dir, expected_count=4)
