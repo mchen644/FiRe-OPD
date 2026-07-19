@@ -8,6 +8,7 @@ from verl.trainer.ppo.adaptive_triprompt_opd import (
     finalize_adaptive_triprompt_routing,
     plan_adaptive_triprompt_probes,
     summarize_adaptive_triprompt_routing,
+    summarize_adaptive_triprompt_token_statistics,
     summarize_response_endpoints,
     update_adaptive_triprompt_cumulative_counts,
     verify_primary_tensor_contract,
@@ -206,6 +207,56 @@ def test_route_metrics_preserve_all_normal_tokens_and_unit_weights() -> None:
     assert metrics["adaptive_triprompt_opd/sensitive_budget_max"] == 7.0
 
 
+def test_token_statistics_are_finite_and_route_specific_on_full_responses() -> None:
+    result = _three_route_result()
+    response_mask = _mask([8, 7, 6], width=8)
+    old_log_probs = torch.tensor([[-1.0] * 8, [-2.0] * 8, [-3.0] * 8])
+    ref_log_probs = torch.tensor([[-1.5] * 8, [-2.5] * 8, [-3.5] * 8])
+    actor_entropies = torch.tensor([[0.1] * 8, [0.2] * 8, [0.3] * 8])
+
+    metrics = summarize_adaptive_triprompt_token_statistics(
+        result=result,
+        response_mask=response_mask,
+        old_log_probs=old_log_probs,
+        ref_log_probs=ref_log_probs,
+        actor_entropies=actor_entropies,
+    )
+
+    assert metrics["adaptive_triprompt_opd/hard_old_log_prob_mean"] == pytest.approx(-1.0)
+    assert metrics["adaptive_triprompt_opd/sensitive_old_log_prob_mean"] == pytest.approx(-2.0)
+    assert metrics["adaptive_triprompt_opd/easy_old_log_prob_mean"] == pytest.approx(-3.0)
+    assert metrics["adaptive_triprompt_opd/easy_ref_log_prob_mean"] == pytest.approx(-3.5)
+    assert metrics["adaptive_triprompt_opd/sensitive_actor_entropy_mean"] == pytest.approx(0.2)
+    assert metrics["adaptive_triprompt_opd/ref_minus_old_log_prob_mean"] == pytest.approx(-0.5)
+    assert metrics["adaptive_triprompt_opd/old_log_prob_mean"] == pytest.approx(-40.0 / 21.0)
+
+
+def test_token_statistics_reject_nonfinite_valid_tokens_but_ignore_padding() -> None:
+    result = _three_route_result()
+    response_mask = _mask([8, 7, 6], width=8)
+    finite = torch.zeros(3, 8)
+    padded_nan = finite.clone()
+    padded_nan[1, 7] = torch.nan
+    summarize_adaptive_triprompt_token_statistics(
+        result=result,
+        response_mask=response_mask,
+        old_log_probs=padded_nan,
+        ref_log_probs=finite,
+        actor_entropies=finite,
+    )
+
+    valid_nan = finite.clone()
+    valid_nan[1, 6] = torch.nan
+    with pytest.raises(ValueError, match="finite"):
+        summarize_adaptive_triprompt_token_statistics(
+            result=result,
+            response_mask=response_mask,
+            old_log_probs=valid_nan,
+            ref_log_probs=finite,
+            actor_entropies=finite,
+        )
+
+
 def test_cumulative_counts_are_immutable_and_preserve_route_identities() -> None:
     original = {
         "total_questions": 10,
@@ -248,6 +299,19 @@ def test_endpoint_metrics_count_natural_eos_and_global_cap_independently() -> No
     assert metrics["adaptive_triprompt_opd/normal_cap_hit_count"] == 1.0
     assert metrics["adaptive_triprompt_opd/normal_cap_hit_ratio"] == 0.5
     assert metrics["adaptive_triprompt_opd/normal_response_length_mean"] == 3.5
+
+
+def test_endpoint_metrics_accept_all_configured_qwen_eos_ids() -> None:
+    metrics = summarize_response_endpoints(
+        response_ids=torch.tensor([[10, 151645], [20, 151643]]),
+        response_mask=torch.ones(2, 2, dtype=torch.long),
+        eos_token_id=[151645, 151643],
+        max_response_length=4,
+        metric_prefix="qwen",
+    )
+
+    assert metrics["qwen_eos_count"] == 2.0
+    assert metrics["qwen_eos_ratio"] == 1.0
 
 
 def test_endpoint_metrics_reject_eos_before_later_valid_tokens() -> None:

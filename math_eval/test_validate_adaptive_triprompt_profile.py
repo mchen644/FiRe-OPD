@@ -58,6 +58,23 @@ def _metrics() -> dict[str, float]:
         "adaptive_triprompt_opd/easy_count_cumulative": 4.0,
         "adaptive_triprompt_opd/sensitive_count_cumulative": 2.0,
         "adaptive_triprompt_opd/hard_count_cumulative": 4.0,
+        "adaptive_triprompt_opd/old_log_prob_mean": -2.0,
+        "adaptive_triprompt_opd/ref_log_prob_mean": -2.5,
+        "adaptive_triprompt_opd/actor_entropy_mean": 0.2,
+        "adaptive_triprompt_opd/ref_minus_old_log_prob_mean": -0.5,
+        "adaptive_triprompt_opd/easy_old_log_prob_mean": -1.0,
+        "adaptive_triprompt_opd/easy_ref_log_prob_mean": -1.5,
+        "adaptive_triprompt_opd/easy_actor_entropy_mean": 0.1,
+        "adaptive_triprompt_opd/easy_ref_minus_old_log_prob_mean": -0.5,
+        "adaptive_triprompt_opd/sensitive_old_log_prob_mean": -2.0,
+        "adaptive_triprompt_opd/sensitive_ref_log_prob_mean": -2.5,
+        "adaptive_triprompt_opd/sensitive_actor_entropy_mean": 0.2,
+        "adaptive_triprompt_opd/sensitive_ref_minus_old_log_prob_mean": -0.5,
+        "adaptive_triprompt_opd/hard_old_log_prob_mean": -3.0,
+        "adaptive_triprompt_opd/hard_ref_log_prob_mean": -3.5,
+        "adaptive_triprompt_opd/hard_actor_entropy_mean": 0.3,
+        "adaptive_triprompt_opd/hard_ref_minus_old_log_prob_mean": -0.5,
+        "actor/entropy": 0.2,
         "actor/pg_loss": 0.01,
         "actor/grad_norm": 2.0,
         "rollout_corr/rollout_is_max": 2.5,
@@ -146,6 +163,9 @@ def test_validator_accepts_route_endpoint_supervision_and_health_contract(tmp_pa
         "concise_cap_hit": 1,
         "concise_parse_fail": 1,
     }
+    assert report["token_statistics"]["old_log_prob_mean"] == -2.0
+    assert report["token_statistics"]["ref_log_prob_mean"] == -2.5
+    assert report["token_statistics"]["actor_entropy_mean"] == 0.2
     assert report["projected_50_step_train_hours"] == pytest.approx(1000 * 50 / 3600)
     assert report["train_data_sha256"] == dataset_hash
     assert len(report["log_sha256"]) == 64
@@ -163,6 +183,7 @@ def test_validator_accepts_route_endpoint_supervision_and_health_contract(tmp_pa
         ({"adaptive_triprompt_opd/route_weight_min": 0.5}, "route weight"),
         ({"adaptive_triprompt_opd/normal_eos_count": 11.0}, "endpoint"),
         ({"adaptive_triprompt_opd/concise_missing_box_count": 2.0}, "parse"),
+        ({"actor/entropy": float("nan")}, "actor/entropy"),
         ({"actor/grad_norm": 0.0}, "grad_norm"),
         ({"rollout_corr/rollout_is_max": 5.1}, "rollout_is_max"),
         ({"perf/max_memory_allocated_gb": 141.0}, "memory"),

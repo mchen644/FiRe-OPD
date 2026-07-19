@@ -312,6 +312,72 @@ def summarize_adaptive_triprompt_routing(
     }
 
 
+def summarize_adaptive_triprompt_token_statistics(
+    *,
+    result: AdaptiveTriPromptRoutingResult,
+    response_mask: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    ref_log_probs: torch.Tensor,
+    actor_entropies: torch.Tensor,
+) -> dict[str, float]:
+    """Validate and summarize full-response actor/ref statistics by route."""
+
+    _require_binary_mask(response_mask, name="response_mask")
+    expected_shape = response_mask.shape
+    if expected_shape[0] != result.normal_lengths.numel():
+        raise ValueError("token statistics must align with tri-prompt routing rows")
+    values_by_name = {
+        "old_log_prob": old_log_probs,
+        "ref_log_prob": ref_log_probs,
+        "actor_entropy": actor_entropies,
+    }
+    valid_tokens = response_mask.bool()
+    for name, values in values_by_name.items():
+        if values.shape != expected_shape:
+            raise ValueError(f"{name} must align with the full primary response mask")
+        if not torch.isfinite(values[valid_tokens]).all():
+            raise ValueError(f"{name} must be finite on every valid primary response token")
+
+    route_masks = {
+        "easy": result.easy,
+        "sensitive": result.sensitive,
+        "hard": result.hard,
+    }
+    route_partition = sum(mask.to(dtype=torch.long) for mask in route_masks.values())
+    if route_partition.shape != (expected_shape[0],) or not torch.all(route_partition == 1):
+        raise ValueError("token statistics require an exhaustive disjoint route partition")
+
+    metrics: dict[str, float] = {}
+    for name, values in values_by_name.items():
+        metrics[f"adaptive_triprompt_opd/{name}_mean"] = float(
+            values[valid_tokens].float().mean().item()
+        )
+        for route, route_mask in route_masks.items():
+            route_valid_tokens = valid_tokens & route_mask.to(
+                device=valid_tokens.device, dtype=torch.bool
+            ).unsqueeze(-1)
+            metrics[f"adaptive_triprompt_opd/{route}_{name}_mean"] = (
+                float(values[route_valid_tokens].float().mean().item())
+                if torch.any(route_valid_tokens)
+                else 0.0
+            )
+
+    log_prob_delta = ref_log_probs - old_log_probs
+    metrics["adaptive_triprompt_opd/ref_minus_old_log_prob_mean"] = float(
+        log_prob_delta[valid_tokens].float().mean().item()
+    )
+    for route, route_mask in route_masks.items():
+        route_valid_tokens = valid_tokens & route_mask.to(
+            device=valid_tokens.device, dtype=torch.bool
+        ).unsqueeze(-1)
+        metrics[f"adaptive_triprompt_opd/{route}_ref_minus_old_log_prob_mean"] = (
+            float(log_prob_delta[route_valid_tokens].float().mean().item())
+            if torch.any(route_valid_tokens)
+            else 0.0
+        )
+    return metrics
+
+
 def update_adaptive_triprompt_cumulative_counts(
     cumulative: Mapping[str, int],
     result: AdaptiveTriPromptRoutingResult,
@@ -349,7 +415,7 @@ def summarize_response_endpoints(
     *,
     response_ids: torch.Tensor,
     response_mask: torch.Tensor,
-    eos_token_id: int,
+    eos_token_id: int | Sequence[int],
     max_response_length: int,
     metric_prefix: str,
 ) -> dict[str, float]:
@@ -362,6 +428,17 @@ def summarize_response_endpoints(
         raise ValueError("max_response_length must be a positive integer")
     if not isinstance(metric_prefix, str) or not metric_prefix:
         raise ValueError("metric_prefix must be nonempty")
+    if isinstance(eos_token_id, bool):
+        raise ValueError("eos_token_id must contain one or more integer token IDs")
+    if isinstance(eos_token_id, int):
+        eos_token_ids = [eos_token_id]
+    else:
+        eos_token_ids = list(eos_token_id)
+    if not eos_token_ids or any(
+        isinstance(token_id, bool) or not isinstance(token_id, int)
+        for token_id in eos_token_ids
+    ):
+        raise ValueError("eos_token_id must contain one or more integer token IDs")
 
     lengths = response_mask.to(dtype=torch.long).sum(dim=-1)
     if torch.any(lengths <= 0) or torch.any(lengths > int(max_response_length)):
@@ -377,7 +454,10 @@ def summarize_response_endpoints(
             f"{metric_prefix}_response_tokens": 0.0,
         }
 
-    valid_eos = (response_ids == int(eos_token_id)) & response_mask.bool()
+    eos_ids = torch.tensor(
+        sorted(set(eos_token_ids)), device=response_ids.device, dtype=response_ids.dtype
+    )
+    valid_eos = torch.isin(response_ids, eos_ids) & response_mask.bool()
     eos_per_row = valid_eos.to(dtype=torch.long).sum(dim=-1)
     if torch.any(eos_per_row > 1):
         raise ValueError("a response may contain at most one valid EOS token")

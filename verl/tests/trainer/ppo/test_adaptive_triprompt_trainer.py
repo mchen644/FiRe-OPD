@@ -156,7 +156,7 @@ def _routing_result():
     )
 
 
-def test_build_diagnostic_batch_uses_one_global_full_cap_without_row_caps() -> None:
+def test_build_diagnostic_batch_uses_one_global_full_cap_for_every_row() -> None:
     batch = _normal_batch()
     tokenizer = FakeTriPromptTokenizer()
 
@@ -179,11 +179,12 @@ def test_build_diagnostic_batch_uses_one_global_full_cap_without_row_caps() -> N
     assert [row["index"] for row in diagnostic.non_tensor_batch["extra_info"]] == [11, 12]
     assert diagnostic.meta_info["response_length"] == 16384
     assert diagnostic.meta_info["generation_kwargs"] == {
+        "max_tokens_by_row": [16384, 16384],
         "disable_rollout_log_probs": True,
         "temperature": 1.0,
         "top_p": 1.0,
     }
-    assert "max_tokens_by_row" not in diagnostic.meta_info["generation_kwargs"]
+    assert set(diagnostic.meta_info["generation_kwargs"]["max_tokens_by_row"]) == {16384}
     assert len(tokenizer.seen_messages) == 2
     assert "Solve concisely. Avoid unnecessary explanation." in tokenizer.seen_messages[0][0]["content"]
     assert diagnostic.non_tensor_batch["adaptive_triprompt_prompt"].tolist() == tokenizer.seen_messages
@@ -234,6 +235,13 @@ def test_apply_teacher_prompts_routes_normal_budget_and_concise_only() -> None:
             lambda result: replace(
                 result,
                 teacher_prompt_styles=np.array(["normal", "bad", "concise", "normal"]),
+            ),
+            "styles",
+        ),
+        (
+            lambda result: replace(
+                result,
+                teacher_prompt_styles=np.array(["normal", "concise", "budget", "normal"]),
             ),
             "styles",
         ),
@@ -343,6 +351,44 @@ def test_apply_triprompt_opd_keeps_full_primary_batch_and_discards_diagnostics()
     assert timing_raw["triprompt_routing"] >= 0.0
 
 
+def test_apply_triprompt_opd_all_normal_wrong_skips_diagnostic_generation() -> None:
+    batch = _normal_batch()
+    reward = torch.zeros(4, 4)
+    worker = FakeTriPromptRolloutWorker()
+    timing_raw = {}
+
+    routed_batch, routed_reward, result, metrics = _apply_adaptive_triprompt_opd(
+        batch=batch,
+        normal_reward=reward,
+        actor_rollout_wg=worker,
+        reward_fn=FakeTriPromptRewardManager(),
+        tokenizer=FakeTriPromptTokenizer(),
+        triprompt_config=AdaptiveTriPromptOpdConfig(
+            enabled=True,
+            diagnostic_max_response_length=4,
+            expected_questions_per_step=4,
+        ),
+        max_prompt_length=512,
+        truncation="error",
+        apply_chat_template_kwargs={"enable_thinking": False},
+        timing_raw=timing_raw,
+    )
+
+    assert routed_batch is batch
+    assert routed_reward is reward
+    assert worker.calls == []
+    assert result.hard.tolist() == [True, True, True, True]
+    assert result.probe_indices.numel() == 0
+    assert routed_batch.non_tensor_batch["teacher_prompt"].tolist() == [
+        list(prompt) for prompt in routed_batch.non_tensor_batch["raw_prompt"]
+    ]
+    assert metrics["adaptive_triprompt_opd/concise_probe_count"] == 0.0
+    assert metrics["adaptive_triprompt_opd/concise_response_tokens"] == 0.0
+    assert metrics["adaptive_triprompt_opd/concise_eos_count"] == 0.0
+    assert timing_raw["concise_probe"] == 0.0
+    assert timing_raw["concise_reward"] == 0.0
+
+
 def test_apply_triprompt_opd_rejects_duplicate_question_indices() -> None:
     batch = _normal_batch()
     batch.non_tensor_batch["extra_info"][3] = {"index": 12, "split": "train"}
@@ -383,6 +429,7 @@ def test_fit_source_routes_before_post_rollout_model_forwards() -> None:
     leak_guard_call = "_assert_no_adaptive_triprompt_diagnostic_keys(batch)"
     old_log_prob_call = "compute_log_prob(batch)"
     ref_prepare_call = "prepare_ref_model_inputs("
+    token_statistics_call = "summarize_adaptive_triprompt_token_statistics("
     actor_update_call = "update_actor(batch)"
 
     assert triprompt_call in source
@@ -390,6 +437,8 @@ def test_fit_source_routes_before_post_rollout_model_forwards() -> None:
     assert source.index(leak_guard_call) < source.index(old_log_prob_call)
     assert source.index(triprompt_call) < source.index(ref_prepare_call)
     assert source.index(triprompt_call) < source.index(actor_update_call)
+    assert source.index(token_statistics_call) < source.index(actor_update_call)
+    assert "triprompt_actor_entropies" in source
     assert "adaptive_triprompt_cumulative" in source
     assert "triprompt_routing_result" in source
     assert "adaptive_triprompt_seqlen" not in source

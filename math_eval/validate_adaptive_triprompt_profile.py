@@ -17,6 +17,23 @@ _STEP_RE = re.compile(r"(?:^|\s)step:([0-9]+)\s+-")
 _SOURCE_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_TOKEN_STATISTIC_STEMS = (
+    "old_log_prob_mean",
+    "ref_log_prob_mean",
+    "actor_entropy_mean",
+    "ref_minus_old_log_prob_mean",
+)
+_TOKEN_STATISTIC_KEYS = (
+    *(
+        f"adaptive_triprompt_opd/{stem}"
+        for stem in _TOKEN_STATISTIC_STEMS
+    ),
+    *(
+        f"adaptive_triprompt_opd/{route}_{stem}"
+        for route in ("easy", "sensitive", "hard")
+        for stem in _TOKEN_STATISTIC_STEMS
+    ),
+)
 _REQUIRED_TIMINGS = (
     "timing_s/normal_rollout",
     "timing_s/normal_reward",
@@ -67,6 +84,8 @@ _REQUIRED_METRICS = (
     "adaptive_triprompt_opd/easy_count_cumulative",
     "adaptive_triprompt_opd/sensitive_count_cumulative",
     "adaptive_triprompt_opd/hard_count_cumulative",
+    *_TOKEN_STATISTIC_KEYS,
+    "actor/entropy",
     "actor/pg_loss",
     "actor/grad_norm",
     "rollout_corr/rollout_is_max",
@@ -403,6 +422,38 @@ def validate_adaptive_triprompt_profile(
         message="concise cap endpoint ratio mismatch",
     )
 
+    token_statistics = {
+        key.removeprefix("adaptive_triprompt_opd/"): _require_metric(metrics, key)
+        for key in _TOKEN_STATISTIC_KEYS
+    }
+    actor_entropy = _require_metric(metrics, "actor/entropy")
+    if actor_entropy < 0.0:
+        raise ValueError(f"actor/entropy must be nonnegative, got {actor_entropy}")
+    if not math.isclose(
+        actor_entropy,
+        token_statistics["actor_entropy_mean"],
+        rel_tol=1e-5,
+        abs_tol=1e-5,
+    ):
+        raise ValueError("actor/entropy disagrees with full-response token telemetry")
+    for prefix, route_count in (("easy_", easy), ("sensitive_", sensitive), ("hard_", hard)):
+        if route_count and token_statistics[f"{prefix}actor_entropy_mean"] < 0.0:
+            raise ValueError(f"{prefix}actor entropy must be nonnegative")
+    for prefix in ("", "easy_", "sensitive_", "hard_"):
+        if prefix and not {"easy_": easy, "sensitive_": sensitive, "hard_": hard}[prefix]:
+            continue
+        expected_delta = (
+            token_statistics[f"{prefix}ref_log_prob_mean"]
+            - token_statistics[f"{prefix}old_log_prob_mean"]
+        )
+        if not math.isclose(
+            token_statistics[f"{prefix}ref_minus_old_log_prob_mean"],
+            expected_delta,
+            rel_tol=1e-5,
+            abs_tol=1e-5,
+        ):
+            raise ValueError(f"{prefix}old/ref log-prob telemetry identity failed")
+
     pg_loss = _require_metric(metrics, "actor/pg_loss")
     grad_norm = _require_metric(metrics, "actor/grad_norm")
     if grad_norm <= 0.0:
@@ -490,6 +541,8 @@ def validate_adaptive_triprompt_profile(
             "concise_cap_hit": concise_cap,
             "concise_parse_fail": parse_fail,
         },
+        "token_statistics": token_statistics,
+        "actor_entropy": actor_entropy,
         "actor_pg_loss": pg_loss,
         "actor_grad_norm": grad_norm,
         "rollout_is_max": rollout_is_max,

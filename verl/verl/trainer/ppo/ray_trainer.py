@@ -68,6 +68,7 @@ from verl.trainer.ppo.adaptive_triprompt_opd import (
     finalize_adaptive_triprompt_routing,
     plan_adaptive_triprompt_probes,
     summarize_adaptive_triprompt_routing,
+    summarize_adaptive_triprompt_token_statistics,
     summarize_response_endpoints,
     update_adaptive_triprompt_cumulative_counts,
     verify_primary_tensor_contract,
@@ -676,6 +677,9 @@ def _build_adaptive_triprompt_generation_batch(
             "eos_token_id": tokenizer.eos_token_id,
             "pad_token_id": pad_token_id,
             "generation_kwargs": {
+                # vLLM requires this transport field to disable diagnostic log probs;
+                # every row receives the same global cap, never an L_n-derived cap.
+                "max_tokens_by_row": [int(max_response_length)] * len(probe_indices),
                 "disable_rollout_log_probs": True,
                 "temperature": float(temperature),
                 "top_p": float(top_p),
@@ -702,6 +706,11 @@ def _apply_adaptive_triprompt_teacher_prompts(
         or any(str(style) not in {"normal", "budget", "concise"} for style in styles.tolist())
     ):
         raise ValueError("adaptive tri-prompt styles must align and be normal, budget, or concise")
+    expected_styles = np.full(len(batch), "normal", dtype=object)
+    expected_styles[result.sensitive.detach().cpu().numpy()] = "budget"
+    expected_styles[result.easy.detach().cpu().numpy()] = "concise"
+    if not np.array_equal(styles, expected_styles):
+        raise ValueError("adaptive tri-prompt styles do not match easy/sensitive/hard routes")
     if result.budgets.dim() != 1 or result.budgets.shape[0] != len(batch):
         raise ValueError("adaptive tri-prompt budgets must align with the primary batch")
     if not torch.equal(result.budgets[result.sensitive], result.normal_lengths[result.sensitive]):
@@ -840,17 +849,22 @@ def _apply_adaptive_triprompt_opd(
         )
 
     metrics = summarize_adaptive_triprompt_routing(result)
+    # The fixed Qwen generation config stops on both its tokenizer EOS and pad
+    # token IDs; padded positions remain excluded by response_mask.
+    configured_eos_token_ids = {int(tokenizer.eos_token_id)}
+    if tokenizer.pad_token_id is not None:
+        configured_eos_token_ids.add(int(tokenizer.pad_token_id))
     normal_endpoint_metrics = summarize_response_endpoints(
         response_ids=batch.batch["responses"],
         response_mask=batch.batch["response_mask"],
-        eos_token_id=int(tokenizer.eos_token_id),
+        eos_token_id=sorted(configured_eos_token_ids),
         max_response_length=max_response_length,
         metric_prefix="adaptive_triprompt_opd/normal",
     )
     concise_endpoint_metrics = summarize_response_endpoints(
         response_ids=concise_response_ids,
         response_mask=concise_response_mask,
-        eos_token_id=int(tokenizer.eos_token_id),
+        eos_token_id=sorted(configured_eos_token_ids),
         max_response_length=max_response_length,
         metric_prefix="adaptive_triprompt_opd/concise",
     )
@@ -2668,6 +2682,7 @@ class RayPPOTrainer:
                 timing_raw = {}
                 adaptive_routing_result: AdaptiveConciseRoutingResult | None = None
                 triprompt_routing_result: AdaptiveTriPromptRoutingResult | None = None
+                triprompt_actor_entropies: torch.Tensor | None = None
 
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
@@ -2840,6 +2855,8 @@ class RayPPOTrainer:
                             _set_rethinking_probe_meta(batch, self.config)
                             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                             entropys = old_log_prob.batch["entropys"]
+                            if triprompt_routing_result is not None:
+                                triprompt_actor_entropies = entropys
                             response_masks = batch.batch["response_mask"]
                             loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
                             entropy_agg = agg_loss(
@@ -3002,6 +3019,21 @@ class RayPPOTrainer:
                                 )
                                 if tale_budget_hard_truncated:
                                     drop_ref_retokenization_tensors(batch)
+
+                    if triprompt_routing_result is not None:
+                        if triprompt_actor_entropies is None:
+                            raise ValueError("adaptive tri-prompt actor entropies are missing")
+                        if "ref_log_prob" not in batch.batch.keys():
+                            raise ValueError("adaptive tri-prompt reference log probabilities are missing")
+                        metrics.update(
+                            summarize_adaptive_triprompt_token_statistics(
+                                result=triprompt_routing_result,
+                                response_mask=batch.batch["response_mask"],
+                                old_log_probs=batch.batch["old_log_probs"],
+                                ref_log_probs=batch.batch["ref_log_prob"],
+                                actor_entropies=triprompt_actor_entropies,
+                            )
+                        )
 
                     # Compute code teacher log probs (and entropy) for multi-teacher distillation
                     if self.use_base_models:
