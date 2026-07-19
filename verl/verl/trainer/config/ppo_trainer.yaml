@@ -267,6 +267,34 @@ algorithm:
     # Required distinct primary questions and final actor rows per step
     expected_questions_per_step: 1024
 
+  # Endpoint-preserving adaptive tri-prompt OPD
+  adaptive_triprompt_opd:
+
+    # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+    _target_: verl.trainer.config.AdaptiveTriPromptOpdConfig
+
+    # Disabled unless launched through the pinned tri-prompt experiment contract
+    enabled: False
+
+    # Sequence reward threshold above which a normal or concise rollout is correct
+    correct_reward_threshold: 0.5
+
+    # Global response-token safety bound for concise routing diagnostics
+    diagnostic_max_response_length: 16384
+
+    # Sensitive teacher budget = round(alpha * normal valid response length)
+    budget_alpha: 1.0
+
+    # Non-tensor batch key consumed by reference-model re-tokenization
+    teacher_prompt_key: teacher_prompt
+
+    # Concise diagnostic sampling parameters
+    temperature: 1.0
+    top_p: 1.0
+
+    # Required distinct primary questions and final actor rows per step
+    expected_questions_per_step: 1024
+
   # Training-time current-batch Rethinking OPD diagnostics
   rethinking_opd_probe:
 

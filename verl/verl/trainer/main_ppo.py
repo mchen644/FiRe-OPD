@@ -183,6 +183,89 @@ def validate_adaptive_concise_runtime_config(config) -> dict[str, object] | None
     }
 
 
+def validate_adaptive_triprompt_runtime_config(config) -> dict[str, object] | None:
+    """Fail closed unless the endpoint-preserving tri-prompt contract is active."""
+
+    triprompt_config = OmegaConf.select(config, "algorithm.adaptive_triprompt_opd")
+    if triprompt_config is None or not triprompt_config.get("enabled", False):
+        return None
+
+    exact_values = {
+        "algorithm.adaptive_triprompt_opd.correct_reward_threshold": 0.5,
+        "algorithm.adaptive_triprompt_opd.diagnostic_max_response_length": 16384,
+        "algorithm.adaptive_triprompt_opd.budget_alpha": 1.0,
+        "algorithm.adaptive_triprompt_opd.teacher_prompt_key": "teacher_prompt",
+        "algorithm.adaptive_triprompt_opd.temperature": 1.0,
+        "algorithm.adaptive_triprompt_opd.top_p": 1.0,
+        "algorithm.adaptive_triprompt_opd.expected_questions_per_step": 1024,
+        "algorithm.rollout_correction.rollout_is": "token",
+        "algorithm.rollout_correction.rollout_is_threshold": 5.0,
+        "algorithm.rollout_correction.rollout_rs": None,
+        "algorithm.rollout_correction.bypass_mode": False,
+        "algorithm.use_kl_in_reward": False,
+        "data.train_batch_size": 1024,
+        "data.max_prompt_length": 2048,
+        "data.max_response_length": 16384,
+        "data.shuffle": True,
+        "data.truncation": "error",
+        "data.seed": 42,
+        "data.return_raw_chat": True,
+        "data.ref_raw_prompt_key": "teacher_prompt",
+        "data.apply_chat_template_kwargs.enable_thinking": False,
+        "actor_rollout_ref.model.path": "/home/mchen/FiRe-OPD/models/Qwen3-4B",
+        "actor_rollout_ref.ref.model.path": "/home/mchen/FiRe-OPD/models/Qwen3-30B-A3B-Instruct-2507",
+        "actor_rollout_ref.rollout.name": "vllm",
+        "actor_rollout_ref.rollout.mode": "sync",
+        "actor_rollout_ref.rollout.n": 1,
+        "actor_rollout_ref.rollout.calculate_log_probs": True,
+        "actor_rollout_ref.rollout.tensor_model_parallel_size": 4,
+        "actor_rollout_ref.rollout.temperature": 1.0,
+        "actor_rollout_ref.rollout.top_p": 1.0,
+        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu": 4,
+        "actor_rollout_ref.actor.optim.lr": 1e-6,
+        "actor_rollout_ref.actor.optim.lr_warmup_steps_ratio": 0.0,
+        "actor_rollout_ref.actor.ppo_mini_batch_size": 1024,
+        "actor_rollout_ref.actor.policy_loss.only_reverse_kl_advantages": True,
+        "actor_rollout_ref.actor.policy_loss.length_aware_opd": False,
+        "actor_rollout_ref.actor.policy_loss.entropy_aware_distill": False,
+        "actor_rollout_ref.actor.loss_agg_mode": "token-mean",
+        "actor_rollout_ref.actor.entropy_coeff": 0.0,
+        "actor_rollout_ref.actor.entropy_from_logits_with_chunking": True,
+        "actor_rollout_ref.actor.use_kl_loss": True,
+        "actor_rollout_ref.actor.kl_loss_coef": 0.0,
+        "reward_model.reward_manager": "naive",
+        "reward_model.launch_reward_fn_async": False,
+        "trainer.n_gpus_per_node": 4,
+        "trainer.nnodes": 1,
+        "trainer.resume_mode": "disable",
+    }
+    for path, expected in exact_values.items():
+        actual = OmegaConf.select(config, path)
+        if actual != expected:
+            raise ValueError(
+                f"adaptive tri-prompt OPD requires {path}={expected!r}, got {actual!r}"
+            )
+
+    for path in (
+        "algorithm.adaptive_concise_opd.enabled",
+        "algorithm.tale_budget.enabled",
+        "algorithm.difficulty_aware_opd.enabled",
+        "algorithm.candidate_selection.enabled",
+        "algorithm.rethinking_opd_probe.enabled",
+        "algorithm.opd_proxy_verify_capture.enabled",
+    ):
+        if OmegaConf.select(config, path, default=False):
+            raise ValueError(f"adaptive tri-prompt OPD forbids {path}")
+
+    return {
+        "correct_reward_threshold": 0.5,
+        "diagnostic_max_response_length": 16384,
+        "budget_alpha": 1.0,
+        "teacher_prompt_key": "teacher_prompt",
+        "expected_questions_per_step": 1024,
+    }
+
+
 # Define a function to run the PPO-like training process
 def run_ppo(config, task_runner_class=None) -> None:
     """Initialize Ray cluster and run distributed PPO training process.
@@ -401,6 +484,7 @@ class TaskRunner:
         capture_contract = validate_opd_proxy_capture_runtime_config(config)
         capture_enabled = capture_contract is not None
         validate_adaptive_concise_runtime_config(config)
+        validate_adaptive_triprompt_runtime_config(config)
 
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
         if not capture_enabled:

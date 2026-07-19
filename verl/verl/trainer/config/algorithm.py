@@ -19,6 +19,7 @@ from verl.base_config import BaseConfig
 
 __all__ = [
     "AdaptiveConciseOpdConfig",
+    "AdaptiveTriPromptOpdConfig",
     "AlgoConfig",
     "CandidateSelectionConfig",
     "DifficultyAwareOpdConfig",
@@ -389,6 +390,20 @@ class AdaptiveConciseOpdConfig(BaseConfig):
 
 
 @dataclass
+class AdaptiveTriPromptOpdConfig(BaseConfig):
+    """Endpoint-preserving tri-prompt OPD configuration."""
+
+    enabled: bool = False
+    correct_reward_threshold: float = 0.5
+    diagnostic_max_response_length: int = 16384
+    budget_alpha: float = 1.0
+    teacher_prompt_key: str = "teacher_prompt"
+    temperature: float = 1.0
+    top_p: float = 1.0
+    expected_questions_per_step: int = 1024
+
+
+@dataclass
 class RethinkingOpdProbeConfig(BaseConfig):
     """Training-time current-batch Rethinking OPD diagnostics."""
 
@@ -487,6 +502,7 @@ class AlgoConfig(BaseConfig):
     filter_groups: Optional[FilterGroupsConfig] = None
     candidate_selection: Optional[CandidateSelectionConfig] = field(default_factory=CandidateSelectionConfig)
     adaptive_concise_opd: AdaptiveConciseOpdConfig = field(default_factory=AdaptiveConciseOpdConfig)
+    adaptive_triprompt_opd: AdaptiveTriPromptOpdConfig = field(default_factory=AdaptiveTriPromptOpdConfig)
     tale_budget: TaleBudgetConfig = field(default_factory=TaleBudgetConfig)
     rethinking_opd_probe: RethinkingOpdProbeConfig = field(default_factory=RethinkingOpdProbeConfig)
     difficulty_aware_opd: DifficultyAwareOpdConfig = field(default_factory=DifficultyAwareOpdConfig)

@@ -20,7 +20,10 @@ import torch
 from omegaconf import OmegaConf
 
 from verl.trainer.config import AlgoConfig, KLControlConfig
-from verl.trainer.config.algorithm import OpdProxyVerifyCaptureConfig
+from verl.trainer.config.algorithm import (
+    AdaptiveTriPromptOpdConfig,
+    OpdProxyVerifyCaptureConfig,
+)
 from verl.trainer.ppo.core_algos import (
     compute_gae_advantage_return,
     compute_grpo_outcome_advantage,
@@ -262,6 +265,48 @@ class TestAlgoConfig(unittest.TestCase):
         assert adaptive.concise_cap_ratio == 0.5
         assert adaptive.teacher_prompt_key == "teacher_prompt"
         assert adaptive.expected_questions_per_step == 1024
+
+    def test_yaml_accepts_adaptive_triprompt_opd_overrides(self):
+        import os
+
+        from hydra import compose, initialize_config_dir
+        from hydra.core.global_hydra import GlobalHydra
+
+        GlobalHydra.instance().clear()
+        try:
+            config_dir = os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "..", "..", "..", "verl", "trainer", "config")
+            )
+            with initialize_config_dir(config_dir=config_dir, version_base=None):
+                config = omega_conf_to_dataclass(
+                    compose(
+                        config_name="ppo_trainer",
+                        overrides=[
+                            "algorithm.adaptive_triprompt_opd.enabled=True",
+                            "algorithm.adaptive_triprompt_opd.correct_reward_threshold=0.5",
+                            "algorithm.adaptive_triprompt_opd.diagnostic_max_response_length=16384",
+                            "algorithm.adaptive_triprompt_opd.budget_alpha=1.0",
+                            "algorithm.adaptive_triprompt_opd.teacher_prompt_key=teacher_prompt",
+                            "algorithm.adaptive_triprompt_opd.temperature=1.0",
+                            "algorithm.adaptive_triprompt_opd.top_p=1.0",
+                            "algorithm.adaptive_triprompt_opd.expected_questions_per_step=1024",
+                        ],
+                    ).algorithm
+                )
+        finally:
+            GlobalHydra.instance().clear()
+
+        routed = config.adaptive_triprompt_opd
+        assert isinstance(routed, AdaptiveTriPromptOpdConfig)
+        assert routed.enabled is True
+        assert routed.correct_reward_threshold == 0.5
+        assert routed.diagnostic_max_response_length == 16384
+        assert routed.budget_alpha == 1.0
+        assert routed.teacher_prompt_key == "teacher_prompt"
+        assert routed.temperature == 1.0
+        assert routed.top_p == 1.0
+        assert routed.expected_questions_per_step == 1024
+        assert AlgoConfig().adaptive_triprompt_opd.enabled is False
 
     def test_yaml_accepts_difficulty_aware_opd_overrides(self):
         config = None
