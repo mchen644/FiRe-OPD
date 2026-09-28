@@ -66,6 +66,28 @@ class TestReduceMetrics(unittest.TestCase):
 
         self.assertEqual(result["single"], 5.0)
 
+    def test_reduce_metrics_ragged_worker_lists(self):
+        """Test that reduce_metrics handles worker metric lists with different lengths."""
+        metrics = {
+            "rollout_corr/kl": [[1.0, 2.0], [3.0], [], [4.0, 5.0, 6.0]],
+        }
+        result = reduce_metrics(metrics)
+
+        self.assertEqual(result["rollout_corr/kl"], 3.5)
+
+    def test_reduce_metrics_ignores_nan_padding(self):
+        """Test that reduce_metrics ignores NaN padding values when reducing."""
+        metrics = {
+            "rollout_corr/kl": [[1.0, np.nan], [3.0]],
+            "rollout_corr/log_ppl_diff_max": [[1.0, np.nan], [5.0]],
+            "rollout_corr/log_ppl_diff_min": [[1.0, np.nan], [-2.0]],
+        }
+        result = reduce_metrics(metrics)
+
+        self.assertEqual(result["rollout_corr/kl"], 2.0)
+        self.assertEqual(result["rollout_corr/log_ppl_diff_max"], 5.0)
+        self.assertEqual(result["rollout_corr/log_ppl_diff_min"], -2.0)
+
 
 class TestComputeDataMetrics(unittest.TestCase):
     """Tests for the compute_data_metrics function."""

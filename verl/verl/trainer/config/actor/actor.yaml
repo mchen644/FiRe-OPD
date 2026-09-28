@@ -74,7 +74,7 @@ policy_loss:
   # Coefficient for the broadcast sequence-level length penalty
   length_penalty_coef: 0.0
 
-  # Length penalty shape; currently supports log_batch_median
+  # Length penalty shape; supports log_batch_median and log_length_teacher_confidence
   length_penalty_type: log_batch_median
 
   # Length penalty gate: incorrect, low_teacher, or incorrect_or_low_teacher
@@ -85,6 +85,9 @@ policy_loss:
 
   # Bottom percentile of normalized teacher log-prob to reject
   length_teacher_reject_percentile: 20.0
+
+  # Temperature for teacher-confidence weighting in log_length_teacher_confidence
+  length_confidence_temperature: 0.1
 
   # Whether to use multi-teacher distillation
   # If false, uses single-teacher distillation path

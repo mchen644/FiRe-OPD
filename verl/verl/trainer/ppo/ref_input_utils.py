@@ -37,6 +37,7 @@ def prepare_ref_model_inputs(
     batch: DataProto,
     ref_tokenizer,
     apply_chat_template_kwargs: Optional[dict] = None,
+    raw_prompt_key: str = "raw_prompt",
 ) -> DataProto:
     """Prepare input_ids, attention_mask, position_ids for reference model.
     
@@ -46,11 +47,12 @@ def prepare_ref_model_inputs(
     
     Args:
         batch (DataProto): The data batch containing:
-            - raw_prompt (in non_tensor_batch): The original messages list (if return_raw_chat=True)
+            - raw_prompt_key (in non_tensor_batch): Messages to condition the ref model on
             - responses: The generated response token ids from rollout
             - input_ids, attention_mask, position_ids: Actor model inputs
         ref_tokenizer: The tokenizer used by the reference model (for encoding new prompts)
         apply_chat_template_kwargs (dict, optional): Additional kwargs for apply_chat_template
+        raw_prompt_key: non_tensor_batch key containing ref/teacher prompt messages
         
     Returns:
         DataProto: Updated batch with ref_input_ids, ref_attention_mask, ref_position_ids added
@@ -58,15 +60,15 @@ def prepare_ref_model_inputs(
     if apply_chat_template_kwargs is None:
         apply_chat_template_kwargs = {}
     
-    # Check if raw_prompt is available
-    if "raw_prompt" not in batch.non_tensor_batch:
+    # Check if the requested prompt key is available
+    if raw_prompt_key not in batch.non_tensor_batch:
         raise ValueError(
-            "raw_prompt not found in batch.non_tensor_batch. "
-            "Please set data.return_raw_chat=True in config to enable re-tokenization for ref model."
+            f"{raw_prompt_key!r} not found in batch.non_tensor_batch. "
+            "Set data.return_raw_chat=True for raw_prompt, or provide a parquet column such as teacher_prompt."
         )
     
     batch_size = len(batch)
-    raw_prompts = batch.non_tensor_batch["raw_prompt"]  # List of messages
+    raw_prompts = batch.non_tensor_batch[raw_prompt_key]  # List of messages
     responses = batch.batch["responses"]  # (batch_size, response_length)
     response_length = responses.shape[1]
     
@@ -77,7 +79,7 @@ def prepare_ref_model_inputs(
         # Get the raw messages for this sample
         messages = raw_prompts[i]
         if not isinstance(messages, (list, np.ndarray)):
-            raise TypeError(f"raw_prompt must be a list or numpy array, got {type(messages)}")
+            raise TypeError(f"{raw_prompt_key} must be a list or numpy array, got {type(messages)}")
         messages = list(messages)
         
         # Apply chat template to get the prompt string using ref tokenizer

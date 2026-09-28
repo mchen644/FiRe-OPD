@@ -16,6 +16,7 @@ The main entry point to run the PPO algorithm
 """
 
 import datetime
+import inspect
 import logging
 import os
 import time
@@ -688,8 +689,17 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             loop.run_until_complete(self.rollout_mode())
             log_gpu_memory_usage("After switch to rollout mode", logger=logger)
 
+        generation_kwargs = prompts.meta_info.pop("generation_kwargs", {})
+        rollout_generate = self.rollout.generate_sequences
+        supports_generation_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in inspect.signature(rollout_generate).parameters.values()
+        )
         with simple_timer("generate_sequences", timing_generate):
-            output = self.rollout.generate_sequences(prompts=prompts)
+            if generation_kwargs and supports_generation_kwargs:
+                output = rollout_generate(prompts=prompts, **generation_kwargs)
+            else:
+                output = rollout_generate(prompts=prompts)
 
         if self._is_actor:
             loop.run_until_complete(self.trainer_mode())

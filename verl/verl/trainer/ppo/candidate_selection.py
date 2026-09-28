@@ -97,10 +97,10 @@ def _select_index_quality_gated_correct_compression(
         selected = _select_shortest_with_teacher_tiebreak(accepted_indices, response_len, normalized_teacher_logprob)
         return selected, True, False
 
-    if drop_rejected_no_correct:
-        return None, False, True
-
     selected = max(candidate_indices, key=lambda idx: float(normalized_teacher_logprob[idx].item()))
+    if drop_rejected_no_correct:
+        return selected, False, True
+
     return selected, True, False
 
 
@@ -147,6 +147,7 @@ def select_short_correct_candidates(batch: DataProto, selection_config) -> tuple
         uid_to_indices.setdefault(str(uid), []).append(idx)
 
     selected_indices: list[int] = []
+    selected_loss_masks: list[float] = []
     fallback_teacher_count = 0
     any_correct_count = 0
     no_correct_count = 0
@@ -185,9 +186,16 @@ def select_short_correct_candidates(batch: DataProto, selection_config) -> tuple
         dropped_uid_count += int(dropped)
         if selected is not None:
             selected_indices.append(selected)
+            selected_loss_masks.append(0.0 if dropped else 1.0)
 
     selected_index_tensor = torch.tensor(selected_indices, dtype=torch.long)
     selected = batch.select_idxs(selected_index_tensor)
+    selected_loss_mask_tensor = torch.tensor(
+        selected_loss_masks,
+        dtype=batch.batch["response_mask"].dtype,
+        device=batch.batch["response_mask"].device,
+    )
+    selected.batch["candidate_selection_loss_mask"] = selected_loss_mask_tensor
 
     selected_response_len = response_len[selected_index_tensor]
     selected_correct = correct[selected_index_tensor].float()
@@ -217,6 +225,7 @@ def select_short_correct_candidates(batch: DataProto, selection_config) -> tuple
         "candidate_selection/teacher_accept_ratio": teacher_accepted.float().mean().item(),
         "candidate_selection/no_correct_teacher_accept_ratio": float(no_correct_teacher_accept_count / max(groups, 1)),
         "candidate_selection/dropped_uid_ratio": float(dropped_uid_count / max(groups, 1)),
+        "candidate_selection/loss_mask_mean": _safe_mean(selected_loss_mask_tensor),
         "candidate_selection/selected_correct_len_mean": _safe_mean(selected_correct_len),
         "candidate_selection/selected_wrong_len_mean": _safe_mean(selected_wrong_len),
         "candidate_selection/correct_candidate_len_mean": _safe_mean(correct_candidate_len),

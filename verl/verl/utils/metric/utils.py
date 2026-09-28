@@ -20,6 +20,23 @@ from typing import Any
 import numpy as np
 
 
+def _flatten_metric_values(values: Any) -> np.ndarray:
+    """Flatten possibly ragged worker metric values into a numeric 1-D array."""
+    flat: list[Any] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                visit(item)
+        elif isinstance(value, np.ndarray):
+            flat.extend(np.asarray(value, dtype=float).reshape(-1).tolist())
+        else:
+            flat.append(value)
+
+    visit(values)
+    return np.asarray(flat, dtype=float)
+
+
 def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
     """
     Reduces a dictionary of metric lists by computing the mean, max, or min of each list.
@@ -45,10 +62,13 @@ def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
         {"loss": 2.0, "accuracy": 0.8, "max_reward": 8.0, "min_error": 0.05}
     """
     for key, val in metrics.items():
-        if "max" in key:
-            metrics[key] = np.max(val)
+        values = _flatten_metric_values(val)
+        if values.size == 0 or np.isnan(values).all():
+            metrics[key] = np.nan
+        elif "max" in key:
+            metrics[key] = np.nanmax(values)
         elif "min" in key:
-            metrics[key] = np.min(val)
+            metrics[key] = np.nanmin(values)
         else:
-            metrics[key] = np.mean(val)
+            metrics[key] = np.nanmean(values)
     return metrics

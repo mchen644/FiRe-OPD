@@ -4,18 +4,22 @@
 set -x
 
 export PYTHONUNBUFFERED=1
+export PYTHONPATH=/home/mchen/FiRe-OPD/verl:${PYTHONPATH:-}
 
-# ============ Data paths (modify to your setup) ============
-TRAIN_DATA=path/to/your/math_train.parquet
-VAL_DATA="['path/to/AIME2024/test.parquet', 'path/to/AIME2025/test.parquet']"
+# Use the last four visible system GPUs on this machine: physical GPU 6,7,8,9.
+export CUDA_VISIBLE_DEVICES=6,7,8,9
+
+# ============ Data paths ============
+TRAIN_DATA=/home/mchen/FiRe-OPD/data/g-opd/DeepMath-103K/train_filtered_level6.parquet
+VAL_DATA="['/home/mchen/FiRe-OPD/data/g-opd/AIME2024/test.parquet', '/home/mchen/FiRe-OPD/data/g-opd/AIME2025/test.parquet']"
 
 # ============ Model paths ============
-STUDENT_MODEL=Qwen/Qwen3-4B
-TEACHER_MODEL=path/to/Qwen3-30B-A3B-Instruct
+STUDENT_MODEL=/home/mchen/FiRe-OPD/models/Qwen3-4B
+TEACHER_MODEL=/home/mchen/FiRe-OPD/models/Qwen3-30B-A3B-Instruct-2507
 
 # ============ Output ============
 EXPERIMENT_NAME=fire-opd-single-teacher
-CHECKPOINT_DIR=./checkpoints/${EXPERIMENT_NAME}
+CHECKPOINT_DIR=/home/mchen/FiRe-OPD/checkpoints/${EXPERIMENT_NAME}
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
@@ -77,7 +81,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.log_val_generations=10 \
     trainer.project_name='fire-opd' \
     trainer.experiment_name=${EXPERIMENT_NAME} \
-    trainer.n_gpus_per_node=8 \
+    trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.save_freq=50 \
     trainer.default_local_dir=${CHECKPOINT_DIR} \

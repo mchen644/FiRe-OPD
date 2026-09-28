@@ -12,6 +12,7 @@ from math_eval.tale_budget_parquet import (
     normalize_budget,
     parse_budget,
     save_budget_records,
+    validate_budget_records_cover_rows,
 )
 
 
@@ -128,3 +129,10 @@ def test_budget_record_jsonl_roundtrip(tmp_path: Path):
     save_budget_records(records, path)
 
     assert load_budget_records(path) == records
+
+
+def test_validate_budget_records_cover_rows_rejects_partial_cache():
+    records = [{"index": 0, "estimate_text": "Budget: [[128]]", "raw_budget": 128}]
+
+    with pytest.raises(ValueError, match="Budget records missing 2 row indices"):
+        validate_budget_records_cover_rows(records, row_count=3)

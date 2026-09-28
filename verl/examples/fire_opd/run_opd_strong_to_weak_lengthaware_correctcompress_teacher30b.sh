@@ -25,13 +25,15 @@ PYTHON_BIN="${PYTHON_BIN:-/home/mchen/miniconda3/envs/verl/bin/python}"
 
 N_GPUS_PER_NODE="${N_GPUS_PER_NODE:-4}"
 ROLLOUT_TP_SIZE="${ROLLOUT_TP_SIZE:-4}"
-ROLLOUT_N="${ROLLOUT_N:-2}"
+ROLLOUT_N="${ROLLOUT_N:-1}"
 RAW_DATA_ROOT="${RAW_DATA_ROOT:-${REPO_DIR}/data/g-opd}"
 
-LENGTH_PENALTY_COEF="${LENGTH_PENALTY_COEF:-0.02}"
+LENGTH_PENALTY_COEF="${LENGTH_PENALTY_COEF:-0.05}"
+LENGTH_PENALTY_TYPE="${LENGTH_PENALTY_TYPE:-log_length_teacher_confidence}"
 LENGTH_PENALTY_GATE="${LENGTH_PENALTY_GATE:-correct}"
 LENGTH_CORRECT_REWARD_THRESHOLD="${LENGTH_CORRECT_REWARD_THRESHOLD:-0.5}"
 LENGTH_TEACHER_REJECT_PERCENTILE="${LENGTH_TEACHER_REJECT_PERCENTILE:-20.0}"
+LENGTH_CONFIDENCE_TEMPERATURE="${LENGTH_CONFIDENCE_TEMPERATURE:-0.1}"
 
 CANDIDATE_SELECTION_ENABLED="${CANDIDATE_SELECTION_ENABLED:-True}"
 CANDIDATE_SELECTION_METHOD="${CANDIDATE_SELECTION_METHOD:-quality_gated_correct_compression}"
@@ -46,7 +48,7 @@ VAL_DATA="${VAL_DATA:-['${RAW_DATA_ROOT}/AIME2024/test.parquet', '${RAW_DATA_ROO
 STUDENT_MODEL="${STUDENT_MODEL:-${REPO_DIR}/models/Qwen3-4B}"
 TEACHER_MODEL="${TEACHER_MODEL:-${REPO_DIR}/models/Qwen3-30B-A3B-Instruct-2507}"
 
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-opd-strong-to-weak-lengthaware-correctcompress-lambda${LENGTH_PENALTY_COEF}-selectn${ROLLOUT_N}-rawprompt-${N_GPUS_PER_NODE}gpu-tp${ROLLOUT_TP_SIZE}-refmb4-rollmb4}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-opd-strong-to-weak-lengthaware-correctcompress-${LENGTH_PENALTY_TYPE}-lambda${LENGTH_PENALTY_COEF}-selectn${ROLLOUT_N}-rawprompt-${N_GPUS_PER_NODE}gpu-tp${ROLLOUT_TP_SIZE}-refmb4-rollmb4}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-${REPO_DIR}/checkpoints/${EXPERIMENT_NAME}}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-2048}"
 
@@ -87,10 +89,11 @@ fi
     actor_rollout_ref.actor.policy_loss.only_reverse_kl_advantages=True \
     actor_rollout_ref.actor.policy_loss.length_aware_opd=True \
     actor_rollout_ref.actor.policy_loss.length_penalty_coef=${LENGTH_PENALTY_COEF} \
-    actor_rollout_ref.actor.policy_loss.length_penalty_type=log_batch_median \
+    actor_rollout_ref.actor.policy_loss.length_penalty_type=${LENGTH_PENALTY_TYPE} \
     actor_rollout_ref.actor.policy_loss.length_penalty_gate=${LENGTH_PENALTY_GATE} \
     actor_rollout_ref.actor.policy_loss.length_correct_reward_threshold=${LENGTH_CORRECT_REWARD_THRESHOLD} \
     actor_rollout_ref.actor.policy_loss.length_teacher_reject_percentile=${LENGTH_TEACHER_REJECT_PERCENTILE} \
+    actor_rollout_ref.actor.policy_loss.length_confidence_temperature=${LENGTH_CONFIDENCE_TEMPERATURE} \
     actor_rollout_ref.actor.loss_agg_mode=token-mean \
     actor_rollout_ref.actor.ppo_mini_batch_size=1024 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \

@@ -156,6 +156,17 @@ def save_budget_records(records: list[dict[str, Any]], path: str | Path) -> None
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def validate_budget_records_cover_rows(budget_records: Iterable[dict[str, Any]], row_count: int) -> None:
+    records = _records_by_index(budget_records)
+    missing = [idx for idx in range(row_count) if idx not in records]
+    if missing:
+        preview = ", ".join(str(idx) for idx in missing[:10])
+        raise ValueError(
+            f"Budget records missing {len(missing)} row indices for {row_count} rows; "
+            f"first missing: {preview}"
+        )
+
+
 def estimate_budgets_with_vllm(
     questions: list[str],
     *,
@@ -263,6 +274,7 @@ def main() -> None:
 
     if args.budget_records is not None:
         budget_records = load_budget_records(args.budget_records)
+        validate_budget_records_cover_rows(budget_records, len(dataframe))
     else:
         if args.student_model is None:
             raise ValueError("Set --student_model when --budget_records is not provided")

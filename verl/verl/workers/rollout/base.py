@@ -14,7 +14,7 @@
 
 import importlib
 from abc import ABC, abstractmethod
-from typing import Generator
+from typing import Any, Generator, Mapping
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
@@ -23,7 +23,44 @@ from verl import DataProto
 from verl.utils.config import omega_conf_to_dataclass
 from verl.workers.config import HFModelConfig, RolloutConfig
 
-__all__ = ["BaseRollout"]
+__all__ = ["BaseRollout", "resolve_response_padding_length"]
+
+
+def resolve_response_padding_length(
+    *,
+    config_response_length: int,
+    prompts_meta_info: Mapping[str, Any] | None = None,
+    generation_kwargs: Mapping[str, Any] | None = None,
+) -> int:
+    """Resolve response tensor padding length for a rollout generation call.
+
+    Some auxiliary generations, such as online TALE budget estimation, override
+    the sampling max tokens to a short length. Their returned tensors should be
+    padded to that per-call limit instead of the training rollout's global
+    response length.
+    """
+
+    if generation_kwargs is not None:
+        for key in ("max_tokens", "max_new_tokens"):
+            value = generation_kwargs.get(key)
+            if value is not None:
+                response_length = int(value)
+                if response_length <= 0:
+                    raise ValueError(f"{key} must be positive, got {value!r}")
+                return response_length
+
+    if prompts_meta_info is not None:
+        value = prompts_meta_info.get("response_length")
+        if value is not None:
+            response_length = int(value)
+            if response_length <= 0:
+                raise ValueError(f"response_length must be positive, got {value!r}")
+            return response_length
+
+    response_length = int(config_response_length)
+    if response_length <= 0:
+        raise ValueError(f"config_response_length must be positive, got {config_response_length!r}")
+    return response_length
 
 
 class BaseRollout(ABC):

@@ -46,7 +46,7 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
-_LENGTH_PENALTY_TYPES = {"log_batch_median"}
+_LENGTH_PENALTY_TYPES = {"log_batch_median", "log_length_teacher_confidence"}
 _LENGTH_PENALTY_GATES = {"incorrect", "low_teacher", "incorrect_or_low_teacher", "correct"}
 
 
@@ -82,7 +82,6 @@ def _compute_length_aware_opd_tensors(
     response_mask = response_mask.float()
     response_len = response_mask.sum(dim=-1).clamp(min=1.0)
     reference_len = response_len.median().clamp(min=1.0)
-    base_penalty = torch.log(response_len / reference_len).clamp(min=0.0)
 
     normalized_teacher_logprob = (ref_log_prob * response_mask).sum(dim=-1) / response_len
     teacher_reject_percentile = float(_policy_loss_get(policy_loss_config, "length_teacher_reject_percentile", 20.0))
@@ -95,6 +94,24 @@ def _compute_length_aware_opd_tensors(
     else:
         teacher_threshold = torch.quantile(normalized_teacher_logprob.float(), teacher_reject_percentile / 100.0)
         teacher_reject = normalized_teacher_logprob <= teacher_threshold
+
+    if penalty_type == "log_batch_median":
+        base_penalty = torch.log(response_len / reference_len).clamp(min=0.0)
+        confidence_weight = torch.ones_like(base_penalty)
+        confidence_temperature = torch.tensor(0.0, device=response_mask.device)
+    else:
+        confidence_temperature_value = float(_policy_loss_get(policy_loss_config, "length_confidence_temperature", 0.1))
+        if confidence_temperature_value <= 0.0:
+            raise ValueError("length_confidence_temperature must be positive")
+        confidence_temperature = torch.tensor(confidence_temperature_value, device=response_mask.device)
+        max_response_len = torch.tensor(float(response_mask.shape[-1]), device=response_mask.device).clamp(min=1.0)
+        base_penalty = torch.log1p(response_len) / torch.log1p(max_response_len)
+        if torch.isnan(teacher_threshold):
+            confidence_weight = torch.ones_like(base_penalty)
+        else:
+            confidence_weight = torch.sigmoid(
+                (normalized_teacher_logprob.float() - teacher_threshold.float()) / confidence_temperature
+            ).to(dtype=base_penalty.dtype)
 
     if token_level_scores is not None:
         seq_reward = (token_level_scores.float() * response_mask).sum(dim=-1)
@@ -113,7 +130,7 @@ def _compute_length_aware_opd_tensors(
     else:
         gate = incorrect | teacher_reject
 
-    applied_penalty = base_penalty * gate.float()
+    applied_penalty = base_penalty * confidence_weight * gate.float()
     coef = float(_policy_loss_get(policy_loss_config, "length_penalty_coef", 0.0))
     scaled_penalty = applied_penalty * coef
 
@@ -124,6 +141,8 @@ def _compute_length_aware_opd_tensors(
         "length_aware_opd_penalty_gate": gate.float().detach(),
         "length_aware_opd_correct_mask": correct.float().detach(),
         "length_aware_opd_teacher_reject": teacher_reject.float().detach(),
+        "length_aware_opd_confidence_weight": confidence_weight.detach(),
+        "length_aware_opd_confidence_temperature": confidence_temperature.detach().expand_as(response_len),
         "length_aware_opd_response_len": response_len.detach(),
         "length_aware_opd_reference_len": reference_len.detach().expand_as(response_len),
         "length_aware_opd_teacher_threshold": teacher_threshold.detach().expand_as(response_len),
@@ -140,7 +159,9 @@ def _summarize_length_aware_opd_tensors(tensors: dict[str, torch.Tensor], coef: 
     penalty_gate = tensors["length_aware_opd_penalty_gate"]
     correct_mask = tensors["length_aware_opd_correct_mask"]
     teacher_reject = tensors["length_aware_opd_teacher_reject"]
-    return {
+    confidence_weight = tensors.get("length_aware_opd_confidence_weight")
+    confidence_temperature = tensors.get("length_aware_opd_confidence_temperature")
+    metrics = {
         "length_aware_opd/mean_response_len": response_len.float().mean().item(),
         "length_aware_opd/median_response_len": reference_len.float().median().item(),
         "length_aware_opd/mean_base_penalty": base_penalty.float().mean().item(),
@@ -152,6 +173,18 @@ def _summarize_length_aware_opd_tensors(tensors: dict[str, torch.Tensor], coef: 
         "length_aware_opd/teacher_reject_ratio": teacher_reject.float().mean().item(),
         "length_aware_opd/coef": float(coef),
     }
+    if confidence_weight is not None:
+        confidence_weight = confidence_weight.float()
+        metrics["length_aware_opd/confidence_weight_mean"] = confidence_weight.mean().item()
+        correct_confidence_weight = confidence_weight[correct_mask.bool()]
+        if correct_confidence_weight.numel() > 0:
+            metrics["length_aware_opd/confidence_weight_correct_mean"] = correct_confidence_weight.mean().item()
+        penalized_confidence_weight = confidence_weight[applied_penalty.bool()]
+        if penalized_confidence_weight.numel() > 0:
+            metrics["length_aware_opd/confidence_weight_penalized_mean"] = penalized_confidence_weight.mean().item()
+    if confidence_temperature is not None:
+        metrics["length_aware_opd/confidence_temperature"] = confidence_temperature.float().median().item()
+    return metrics
 
 
 def _add_length_aware_opd_tensors(mini_batch: DataProto, policy_loss_config) -> dict[str, float]:
@@ -931,6 +964,10 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append("rollout_log_probs")
         if "difficulty_aware_entropy_weight" in data.batch.keys():
             select_keys.append("difficulty_aware_entropy_weight")
+        if "candidate_selection_loss_mask" in data.batch.keys():
+            select_keys.append("candidate_selection_loss_mask")
+        if "tale_budget_esr_loss_mask" in data.batch.keys():
+            select_keys.append("tale_budget_esr_loss_mask")
          # Include code teacher log probs for multi-teacher distillation
         if "base_ref_log_prob" in data.batch.keys():
             select_keys.append("base_ref_log_prob")
@@ -1002,6 +1039,11 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
                     response_mask = model_inputs["response_mask"]
+                    # FiRe-OPD-style filtering: keep the original response_mask for
+                    # diagnostics/rollout-correction metrics, and apply candidate
+                    # filtering only to actor-loss masks.
+                    loss_response_mask = _apply_candidate_selection_loss_mask(response_mask, model_inputs)
+                    loss_response_mask = _apply_tale_budget_esr_loss_mask(loss_response_mask, model_inputs)
                     old_log_prob = model_inputs["old_log_probs"]
                     advantages = model_inputs["advantages"]
 
@@ -1049,7 +1091,7 @@ class DataParallelPPOActor(BasePPOActor):
                             old_log_prob=old_log_prob,
                             log_prob=log_prob,
                             ref_log_prob=ref_log_prob,
-                            response_mask=response_mask,
+                            response_mask=loss_response_mask,
                             student_entropys=student_entropys,
                             ref_entropys=ref_entropys,
                             loss_agg_mode=loss_agg_mode,
@@ -1072,7 +1114,7 @@ class DataParallelPPOActor(BasePPOActor):
                             old_log_prob=old_log_prob,
                             log_prob=log_prob,
                             advantages=advantages,
-                            response_mask=response_mask,
+                            response_mask=loss_response_mask,
                             loss_agg_mode=loss_agg_mode,
                             config=self.config,
                             rollout_is_weights=rollout_is_weights,
@@ -1090,21 +1132,16 @@ class DataParallelPPOActor(BasePPOActor):
                         micro_batch_metrics.update(difficulty_entropy_metrics)
 
                     # Skip if using pure rollout correction mode (metrics already in pg_metrics)
-                    rollout_log_prob = model_inputs.get("rollout_log_probs", None)
-                    if loss_mode != "rollout_correction" and rollout_log_prob is not None:
-                        # Compute metrics using CURRENT policy π_θ vs π_rollout
-                        # Tracks evolving off-policy gap as π_θ updates during mini-batch training
-                        from verl.trainer.ppo.rollout_corr_helper import compute_rollout_corr_metrics_from_logprobs
-
-                        rollout_corr_metrics = compute_rollout_corr_metrics_from_logprobs(
-                            log_prob=log_prob,
-                            rollout_log_prob=rollout_log_prob,
-                            response_mask=response_mask,
-                        )
-                        micro_batch_metrics.update(rollout_corr_metrics)
+                    rollout_corr_metrics = _maybe_compute_rollout_corr_metrics(
+                        loss_mode=loss_mode,
+                        log_prob=log_prob,
+                        rollout_log_prob=model_inputs.get("rollout_log_probs", None),
+                        response_mask=response_mask,
+                    )
+                    micro_batch_metrics.update(rollout_corr_metrics)
 
                     if entropy_coeff != 0:
-                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=loss_response_mask, loss_agg_mode=loss_agg_mode)
 
                         # compute policy loss
                         policy_loss = pg_loss - entropy_loss * entropy_coeff
@@ -1117,7 +1154,7 @@ class DataParallelPPOActor(BasePPOActor):
                         kld = kl_penalty(
                             logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
                         )
-                        kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        kl_loss = agg_loss(loss_mat=kld, loss_mask=loss_response_mask, loss_agg_mode=loss_agg_mode)
 
                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                         micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item() * loss_scale_factor

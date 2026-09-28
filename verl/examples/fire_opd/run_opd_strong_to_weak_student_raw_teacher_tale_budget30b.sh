@@ -18,7 +18,12 @@ fi
 
 RAY_NUM_CPUS="${RAY_NUM_CPUS:-${SLURM_CPUS_PER_TASK:-16}}"
 TEACHER_PROMPT_KEY="${TEACHER_PROMPT_KEY:-teacher_prompt}"
-DATA_ROOT="${DATA_ROOT:-${REPO_DIR}/data/g-opd-student-raw-teacher-tale-budget}"
+TALE_BUDGET_SOURCE="${TALE_BUDGET_SOURCE:-rollout_length}"
+TALE_ROLLOUT_ALPHA="${TALE_ROLLOUT_ALPHA:-0.8}"
+TALE_ESR_BETA="${TALE_ESR_BETA:-1.0}"
+TALE_ROLLOUT_MAX_BUDGET="${TALE_ROLLOUT_MAX_BUDGET:-null}"
+TALE_TEACHER_PROMPT_STYLE="${TALE_TEACHER_PROMPT_STYLE:-auto}"
+DATA_ROOT="${DATA_ROOT:-${REPO_DIR}/data/g-opd}"
 N_GPUS_PER_NODE="${N_GPUS_PER_NODE:-4}"
 ROLLOUT_TP_SIZE="${ROLLOUT_TP_SIZE:-4}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-2048}"
@@ -28,12 +33,11 @@ TRAIN_DATA="${TRAIN_DATA:-${DATA_ROOT}/DeepMath-103K/train_filtered_level6.parqu
 VAL_DATA="${VAL_DATA:-['${DATA_ROOT}/AIME2024/test.parquet', '${DATA_ROOT}/AIME2025/test.parquet']}"
 STUDENT_MODEL="${STUDENT_MODEL:-${REPO_DIR}/models/Qwen3-4B}"
 TEACHER_MODEL="${TEACHER_MODEL:-${REPO_DIR}/models/Qwen3-30B-A3B-Instruct-2507}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-opd-strong-to-weak-studentraw-teachertale-budget-selectn${ROLLOUT_N}-${N_GPUS_PER_NODE}gpu-tp${ROLLOUT_TP_SIZE}-refmb4-rollmb4}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-opd-strong-to-weak-studentraw-teachertale-rolloutlen-a${TALE_ROLLOUT_ALPHA}-b${TALE_ESR_BETA}-selectn${ROLLOUT_N}-${N_GPUS_PER_NODE}gpu-tp${ROLLOUT_TP_SIZE}-refmb4-rollmb4}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-${REPO_DIR}/checkpoints/${EXPERIMENT_NAME}}"
 
 if [ ! -f "${TRAIN_DATA}" ]; then
   echo "ERROR: TRAIN_DATA not found: ${TRAIN_DATA}" >&2
-  echo "Run: bash ${REPO_DIR}/math_eval/prepare_g_opd_student_raw_teacher_tale_budget_data.sh" >&2
   exit 1
 fi
 
@@ -56,6 +60,13 @@ python3 -m verl.trainer.main_ppo \
     data.return_raw_chat=True \
     +data.ref_raw_prompt_key=${TEACHER_PROMPT_KEY} \
     +data.apply_chat_template_kwargs.enable_thinking=False \
+    algorithm.tale_budget.enabled=True \
+    algorithm.tale_budget.source=${TALE_BUDGET_SOURCE} \
+    algorithm.tale_budget.teacher_prompt_key=${TEACHER_PROMPT_KEY} \
+    algorithm.tale_budget.rollout_length_alpha=${TALE_ROLLOUT_ALPHA} \
+    algorithm.tale_budget.esr_beta=${TALE_ESR_BETA} \
+    algorithm.tale_budget.rollout_length_max_budget=${TALE_ROLLOUT_MAX_BUDGET} \
+    algorithm.tale_budget.teacher_prompt_style=${TALE_TEACHER_PROMPT_STYLE} \
     actor_rollout_ref.model.path=${STUDENT_MODEL} \
     +actor_rollout_ref.ref.model.path=${TEACHER_MODEL} \
     actor_rollout_ref.actor.optim.lr=1e-6 \
@@ -102,4 +113,5 @@ python3 -m verl.trainer.main_ppo \
     trainer.test_freq=10 \
     trainer.total_epochs=3 \
     trainer.resume_mode=auto \
-    ray_kwargs.ray_init.num_cpus=${RAY_NUM_CPUS}
+    ray_kwargs.ray_init.num_cpus=${RAY_NUM_CPUS} \
+    "$@"

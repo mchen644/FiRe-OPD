@@ -57,6 +57,7 @@ class PolicyLossConfig(BaseConfig):
     length_penalty_gate: str = "incorrect_or_low_teacher"
     length_correct_reward_threshold: float = 0.5
     length_teacher_reject_percentile: float = 20.0
+    length_confidence_temperature: float = 0.1
     multi_teacher_distill: bool = False
     # FiRe-OPD: Entropy-aware distillation config
     entropy_aware_distill: bool = False
